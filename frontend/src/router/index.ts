@@ -16,8 +16,14 @@ const routes: RouteRecordRaw[] = [
   {
     path: '/login',
     name: 'Login',
-    component: () => import('@/views/home/index.vue'), // 占位，后续替换
+    component: () => import('@/views/login/index.vue'),
     meta: { title: '登录', layout: 'blank' },
+  },
+  {
+    path: '/register',
+    name: 'Register',
+    component: () => import('@/views/register/index.vue'),
+    meta: { title: '注册', layout: 'blank' },
   },
   {
     path: '/:pathMatch(.*)*',
@@ -34,14 +40,43 @@ const router = createRouter({
 })
 
 // ============================================
-// 路由守卫：鉴权拦截
+// 路由守卫：鉴权拦截 + Token 过期检测
 // ============================================
 
+/** 解析 JWT payload（不验证签名，仅读取过期时间） */
+function parseJwtPayload(token: string): { exp?: number } | null {
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3) return null
+    const payload = parts[1]
+    const decoded = JSON.parse(atob(payload))
+    return { exp: decoded.exp }
+  } catch {
+    return null
+  }
+}
+
+/** 检查 Token 是否过期 */
+function isTokenExpired(token: string): boolean {
+  const claims = parseJwtPayload(token)
+  if (!claims?.exp) return true
+  const now = Math.floor(Date.now() / 1000)
+  // 预留 30 秒缓冲，避免边缘情况
+  return claims.exp - 30 <= now
+}
+
 router.beforeEach((to, _from, next) => {
-  // 设置页面标题
   document.title = `${to.meta.title || 'Axum Admin'}`
 
   const token = getToken()
+
+  // Token 存在但已过期 → 清除并重定向到登录页
+  if (token && isTokenExpired(token)) {
+    localStorage.clear()
+    if (to.path !== '/login') {
+      return next('/login')
+    }
+  }
 
   // 白名单路由（登录页、注册页）→ 直接放行
   if (WHITE_LIST.includes(to.path)) {
