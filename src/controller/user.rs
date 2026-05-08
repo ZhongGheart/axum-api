@@ -99,8 +99,10 @@ pub async fn update_user(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     Json(req): Json<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
+    // role 字段强制小写，避免 SQLx 编码歧义或前端传入大小写不一致
+    let role = req.role.to_lowercase();
     let user = state.auth_service.user_repo
-        .update(id, &req.username, &req.email, &req.role, req.is_active.unwrap_or(true))
+        .update(id, &req.username, &req.email, &role, req.is_active.unwrap_or(true))
         .await?;
 
     tracing::info!("管理员更新用户: {}", user.username);
