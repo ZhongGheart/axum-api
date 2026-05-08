@@ -62,10 +62,6 @@ http.interceptors.response.use(
     const { data } = response
 
     if (data.code !== 200) {
-      if (data.code === 401) {
-        removeToken()
-        window.location.href = '/login'
-      }
       return Promise.reject(new Error(data.message || '请求失败'))
     }
 
@@ -100,9 +96,8 @@ http.interceptors.response.use(
 
     switch (status) {
       case 401:
-        message = '未授权，请重新登录'
         removeToken()
-        window.location.href = '/login'
+        message = '未授权，请重新登录'
         break
       case 403:
         message = '权限不足'
