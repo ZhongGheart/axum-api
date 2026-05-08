@@ -35,3 +35,5 @@ Thumbs.db
 # SQLx 离线缓存
 # ==============================
 sqlx-data.json
+.pnpm-store/
+node_modules/.pnpm-store/
