@@ -1,11 +1,17 @@
+/**
+ * 路由配置
+ *
+ * 包含基础路由和动态加载的系统管理路由。
+ * 系统管理路由需要 admin 角色才能访问（路由守卫 + 路由元信息拦截）。
+ */
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { getToken } from '@/utils/storage'
 
-/** 无需登录的白名单路由 */
+/** 白名单路由（无需登录） */
 const WHITE_LIST = ['/login', '/register']
 
-/** 路由表 */
+/** 基础路由表 */
 const routes: RouteRecordRaw[] = [
   {
     path: '/',
@@ -25,6 +31,27 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/register/index.vue'),
     meta: { title: '注册', layout: 'blank' },
   },
+  // ── 系统管理（仅 admin 可访问） ──────────────────────────────
+  {
+    path: '/system',
+    name: 'System',
+    redirect: '/system/user',
+    meta: { title: '系统管理', roles: ['admin'] },
+    children: [
+      {
+        path: 'user',
+        name: 'SystemUser',
+        component: () => import('@/views/system/user/index.vue'),
+        meta: { title: '用户管理', roles: ['admin'] },
+      },
+      {
+        path: 'role',
+        name: 'SystemRole',
+        component: () => import('@/views/system/role/index.vue'),
+        meta: { title: '角色管理', roles: ['admin'] },
+      },
+    ],
+  },
   {
     path: '/:pathMatch(.*)*',
     name: 'NotFound',
@@ -40,17 +67,15 @@ const router = createRouter({
 })
 
 // ============================================
-// 路由守卫：鉴权拦截 + Token 过期检测
+// 路由守卫：鉴权 + Token 过期 + 角色检测
 // ============================================
 
-/** 解析 JWT payload（不验证签名，仅读取过期时间） */
-function parseJwtPayload(token: string): { exp?: number } | null {
+/** 解析 JWT payload */
+function parseJwtPayload(token: string): { exp?: number; roles?: string[]; role?: string } | null {
   try {
     const parts = token.split('.')
     if (parts.length !== 3) return null
-    const payload = parts[1]
-    const decoded = JSON.parse(atob(payload))
-    return { exp: decoded.exp }
+    return JSON.parse(atob(parts[1]))
   } catch {
     return null
   }
@@ -60,36 +85,37 @@ function parseJwtPayload(token: string): { exp?: number } | null {
 function isTokenExpired(token: string): boolean {
   const claims = parseJwtPayload(token)
   if (!claims?.exp) return true
-  const now = Math.floor(Date.now() / 1000)
-  // 预留 30 秒缓冲，避免边缘情况
-  return claims.exp - 30 <= now
+  return claims.exp - 30 <= Math.floor(Date.now() / 1000)
 }
 
 router.beforeEach((to, _from, next) => {
   document.title = `${to.meta.title || 'Axum Admin'}`
-
   const token = getToken()
 
-  // Token 存在但已过期 → 清除并重定向到登录页
+  // Token 过期检测
   if (token && isTokenExpired(token)) {
     localStorage.clear()
-    if (to.path !== '/login') {
-      return next('/login')
-    }
+    return next('/login')
   }
 
-  // 白名单路由（登录页、注册页）→ 直接放行
+  // 白名单放行
   if (WHITE_LIST.includes(to.path)) {
-    // 已登录用户访问登录页 → 跳转首页
-    if (token && to.path === '/login') {
-      return next('/')
-    }
+    if (token && to.path === '/login') return next('/')
     return next()
   }
 
-  // 非白名单路由 → 检查登录态
-  if (!token) {
-    return next('/login')
+  // 未登录拦截
+  if (!token) return next('/login')
+
+  // ── 角色权限检测 ───────────────────────────────────────────
+  const requiredRoles = to.meta.roles as string[] | undefined
+  if (requiredRoles && requiredRoles.length > 0) {
+    const claims = parseJwtPayload(token)
+    const userRoles = claims?.roles || (claims?.role ? [claims.role] : [])
+    const hasRole = requiredRoles.some((r) => userRoles.includes(r))
+    if (!hasRole) {
+      return next('/')
+    }
   }
 
   next()

@@ -2,6 +2,7 @@
  * 全局通用类型定义
  *
  * 复刻后端 Rust 统一返回结构体 ApiResponse<T>
+ * 全量类型对齐后端 model/*.rs 实体。
  */
 
 /** 后端统一返回结构体 */
@@ -30,12 +31,13 @@ export interface RegisterRequest {
   password: string
 }
 
-/** 用户信息（不包含密码） */
+/** 用户信息（不包含密码 + 包含角色列表） */
 export interface UserInfo {
   id: string
   username: string
   email: string
   role: 'admin' | 'user'
+  roles?: string[]
   is_active: boolean
   created_at: string
 }

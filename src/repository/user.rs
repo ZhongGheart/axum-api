@@ -95,6 +95,80 @@ impl UserRepository {
         .map_err(|e| AppError::InternalServerError(format!("查询用户失败: {e}")))
     }
 
+    /// 查询所有用户（分页）
+    pub async fn list_all(&self, page: i64, page_size: i64) -> Result<(Vec<User>, i64), AppError> {
+        let offset = (page - 1) * page_size;
+        let users = sqlx::query_as::<_, User>(
+            r#"
+            SELECT id, username, email, password_hash, role, is_active, created_at, updated_at
+            FROM users
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询用户列表失败: {e}")))?;
+
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("查询用户总数失败: {e}")))?;
+
+        Ok((users, total.0))
+    }
+
+    /// 更新用户信息（用户名、邮箱、是否激活）
+    pub async fn update(
+        &self,
+        id: Uuid,
+        username: &str,
+        email: &str,
+        role: &str,
+        is_active: bool,
+    ) -> Result<User, AppError> {
+        sqlx::query_as::<_, User>(
+            r#"
+            UPDATE users
+            SET username = $2, email = $3, role = $4, is_active = $5
+            WHERE id = $1
+            RETURNING id, username, email, password_hash, role, is_active, created_at, updated_at
+            "#,
+        )
+        .bind(id)
+        .bind(username)
+        .bind(email)
+        .bind(role)
+        .bind(is_active)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            if let Some(pg_err) = e.as_database_error() {
+                if let Some(constraint) = pg_err.constraint() {
+                    if constraint == "users_username_key" {
+                        return AppError::Conflict("用户名已被占用".to_string());
+                    }
+                    if constraint == "users_email_key" {
+                        return AppError::Conflict("邮箱已被占用".to_string());
+                    }
+                }
+            }
+            AppError::InternalServerError(format!("更新用户失败: {e}"))
+        })
+    }
+
+    /// 删除用户
+    pub async fn delete(&self, id: Uuid) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("删除用户失败: {e}")))?;
+        Ok(())
+    }
+
     /// 创建新用户
     ///
     /// # Arguments

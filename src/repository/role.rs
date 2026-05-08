@@ -3,6 +3,7 @@
 //! 封装对 `roles` 和 `user_roles` 表的数据库操作。
 //! 使用事务保证关联数据的一致性（建角色 + 分配用户 + 初始化种子数据）。
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -35,6 +36,34 @@ impl RoleRepository {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("查询角色失败: {e}")))
+    }
+
+    /// 查询所有角色（含用户数）
+    pub async fn list_all(&self) -> Result<Vec<(RoleRow, i64)>, AppError> {
+        let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, DateTime<Utc>, i64)>(
+            r#"
+            SELECT r.id, r.name, r.description, r.created_at,
+                   COALESCE(ur_cnt.cnt, 0) AS user_count
+            FROM roles r
+            LEFT JOIN (
+                SELECT role_id, COUNT(*) AS cnt FROM user_roles GROUP BY role_id
+            ) ur_cnt ON ur_cnt.role_id = r.id
+            ORDER BY r.created_at ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询角色列表失败: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, description, created_at, user_count)| {
+                (
+                    RoleRow { id, name, description, created_at },
+                    user_count,
+                )
+            })
+            .collect())
     }
 
     /// 查询用户拥有的所有角色
