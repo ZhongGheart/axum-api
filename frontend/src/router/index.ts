@@ -8,55 +8,81 @@ import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { getToken } from '@/utils/storage'
 
-/** 白名单路由（无需登录） */
+/** 白名单路由（无需登录 + 无侧栏） */
 const WHITE_LIST = ['/login', '/register']
 
 /** 基础路由表 */
 const routes: RouteRecordRaw[] = [
-  {
-    path: '/',
-    name: 'Home',
-    component: () => import('@/views/home/index.vue'),
-    meta: { title: '首页' },
-  },
+  // ── 白名单路由（BlankLayout） ──────────────────────────────
   {
     path: '/login',
     name: 'Login',
-    component: () => import('@/views/login/index.vue'),
-    meta: { title: '登录', layout: 'blank' },
+    component: () => import('@/layouts/BlankLayout.vue'),
+    children: [
+      {
+        path: '',
+        component: () => import('@/views/login/index.vue'),
+        meta: { title: '登录' },
+      },
+    ],
   },
   {
     path: '/register',
     name: 'Register',
-    component: () => import('@/views/register/index.vue'),
-    meta: { title: '注册', layout: 'blank' },
-  },
-  // ── 系统管理（仅 admin 可访问） ──────────────────────────────
-  {
-    path: '/system',
-    name: 'System',
-    redirect: '/system/user',
-    meta: { title: '系统管理', roles: ['admin'] },
+    component: () => import('@/layouts/BlankLayout.vue'),
     children: [
       {
-        path: 'user',
-        name: 'SystemUser',
-        component: () => import('@/views/system/user/index.vue'),
-        meta: { title: '用户管理', roles: ['admin'] },
-      },
-      {
-        path: 'role',
-        name: 'SystemRole',
-        component: () => import('@/views/system/role/index.vue'),
-        meta: { title: '角色管理', roles: ['admin'] },
+        path: '',
+        component: () => import('@/views/register/index.vue'),
+        meta: { title: '注册' },
       },
     ],
   },
   {
     path: '/:pathMatch(.*)*',
     name: 'NotFound',
-    component: () => import('@/views/error/NotFound.vue'),
-    meta: { title: '404 页面未找到', layout: 'blank' },
+    component: () => import('@/layouts/BlankLayout.vue'),
+    children: [
+      {
+        path: '',
+        component: () => import('@/views/error/NotFound.vue'),
+        meta: { title: '404 页面未找到' },
+      },
+    ],
+  },
+
+  // ── 需要登录的路由（MainLayout） ──────────────────────────
+  {
+    path: '/',
+    component: () => import('@/layouts/MainLayout.vue'),
+    children: [
+      {
+        path: '',
+        name: 'Home',
+        component: () => import('@/views/home/index.vue'),
+        meta: { title: '首页' },
+      },
+      {
+        path: 'system',
+        name: 'System',
+        redirect: '/system/user',
+        meta: { title: '系统管理', roles: ['admin'] },
+        children: [
+          {
+            path: 'user',
+            name: 'SystemUser',
+            component: () => import('@/views/system/user/index.vue'),
+            meta: { title: '用户管理', roles: ['admin'] },
+          },
+          {
+            path: 'role',
+            name: 'SystemRole',
+            component: () => import('@/views/system/role/index.vue'),
+            meta: { title: '角色管理', roles: ['admin'] },
+          },
+        ],
+      },
+    ],
   },
 ]
 
