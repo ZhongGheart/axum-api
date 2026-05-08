@@ -18,7 +18,6 @@
         label-placement="left"
         label-width="auto"
         size="large"
-        @submit.prevent="handleLogin"
       >
         <n-form-item label="用户名" path="username">
           <n-input
@@ -26,6 +25,7 @@
             placeholder="请输入用户名或邮箱"
             :maxlength="50"
             clearable
+            @keyup.enter="handleLogin"
           >
             <template #prefix>
               <n-icon><UserIcon /></n-icon>
@@ -41,6 +41,7 @@
             placeholder="请输入密码"
             :maxlength="128"
             clearable
+            @keyup.enter="handleLogin"
           >
             <template #prefix>
               <n-icon><LockIcon /></n-icon>
@@ -59,8 +60,8 @@
           block
           size="large"
           :loading="submitting"
-          attr-type="submit"
           class="login-btn"
+          @click="handleLogin"
         >
           登 录
         </n-button>
@@ -152,11 +153,17 @@ function saveRemembered(): void {
 // ── 登录提交 ────────────────────────────────────────────────────
 
 async function handleLogin(): Promise<void> {
+  if (submitting.value) return
+  submitting.value = true
+
   try {
     // 表单校验
-    await formRef.value?.validate()
-
-    submitting.value = true
+    try {
+      await formRef.value?.validate()
+    } catch {
+      submitting.value = false
+      return
+    }
 
     // 保存记住密码状态
     saveRemembered()
