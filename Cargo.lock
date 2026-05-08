@@ -108,7 +108,6 @@ dependencies = [
  "axum",
  "chrono",
  "dotenvy",
- "http",
  "jsonwebtoken",
  "serde",
  "serde_json",
@@ -1918,12 +1917,10 @@ version = "0.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68d6fdd9f81c2819c9a8b0e0cd91660e7746a8e6ea2ba7c6b2b057985f6bcb51"
 dependencies = [
- "base64",
  "bitflags",
  "bytes",
  "http",
  "http-body",
- "mime",
  "pin-project-lite",
  "tower-layer",
  "tower-service",

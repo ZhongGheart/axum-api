@@ -23,22 +23,52 @@ async fn main() -> anyhow::Result<()> {
     // ── 初始化 Tracing 日志系统 ─────────────────────────────────
     init_tracing();
 
+    // ── 从 .env 加载环境变量（若存在） ─────────────────────────
+    dotenvy::dotenv().ok();
+
     // ── 加载配置 ───────────────────────────────────────────────
     let config = config::Config::from_env();
-    tracing::info!("配置加载完成，监听地址: {}", config.server_addr);
+    let addr = config.server_addr;
+    tracing::info!("配置加载完成，监听地址: {addr}");
 
     // ── 构建路由 ───────────────────────────────────────────────
-    let app = create_router(config.clone())?;
+    let app = create_router(config).await?;
 
-    // ── 启动服务器 ─────────────────────────────────────────────
-    let addr = config.server_addr;
+    // ── 启动服务器（带优雅关闭） ────────────────────────────────
     tracing::info!("服务器启动中 → http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
 
     Ok(())
+}
+
+/// 监听 SIGTERM / SIGINT 信号，触发优雅关闭
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("无法注册 Ctrl+C 信号处理器");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("无法注册 SIGTERM 信号处理器")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("收到 Ctrl+C，开始优雅关闭..."),
+        _ = terminate => tracing::info!("收到 SIGTERM，开始优雅关闭..."),
+    }
 }
 
 /// 初始化 Tracing 日志系统

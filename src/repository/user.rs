@@ -48,10 +48,25 @@ impl UserRepository {
         .ok_or_else(|| AppError::NotFound("用户不存在".to_string()))
     }
 
-    /// 根据用户名查找用户
-    ///
-    /// 同时支持用户名和邮箱登录。
+    /// 根据用户名查找用户（精确匹配）
     pub async fn find_by_username(&self, username: &str) -> Result<Option<User>, AppError> {
+        sqlx::query_as::<_, User>(
+            r#"
+            SELECT id, username, email, password_hash, role, is_active, created_at, updated_at
+            FROM users
+            WHERE username = $1
+            "#,
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询用户失败: {e}")))
+    }
+
+    /// 根据用户名或邮箱查找用户（用于登录）
+    ///
+    /// 支持用户名或邮箱两种方式的登录查询。
+    pub async fn find_by_username_or_email(&self, input: &str) -> Result<Option<User>, AppError> {
         sqlx::query_as::<_, User>(
             r#"
             SELECT id, username, email, password_hash, role, is_active, created_at, updated_at
@@ -59,7 +74,7 @@ impl UserRepository {
             WHERE username = $1 OR email = $1
             "#,
         )
-        .bind(username)
+        .bind(input)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("查询用户失败: {e}")))

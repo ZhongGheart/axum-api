@@ -33,9 +33,10 @@ pub struct AppState {
 ///
 /// 1. 公开路由（无需认证）
 /// 2. 需要认证的路由（应用 JWT 中间件）
-pub fn create_router(config: Config) -> Result<Router, AppError> {
-    // ── 初始化数据库连接池 ──────────────────────────────────────
-    let pool = sqlx::PgPool::connect_lazy(&config.database_url)
+pub async fn create_router(config: Config) -> Result<Router, AppError> {
+    // ── 初始化数据库连接池（异步，启动时即检测连通性） ────────────
+    let pool = sqlx::PgPool::connect(&config.database_url)
+        .await
         .map_err(|e| AppError::InternalServerError(format!("数据库连接失败: {e}")))?;
 
     // ── 初始化各层 ──────────────────────────────────────────────
@@ -54,16 +55,29 @@ pub fn create_router(config: Config) -> Result<Router, AppError> {
     };
 
     // ── 配置 CORS ──────────────────────────────────────────────
-    let cors = CorsLayer::new()
-        .allow_origin(
-            config
-                .cors_allowed_origins
-                .iter()
-                .map(|origin| origin.parse().unwrap())
-                .collect::<Vec<_>>(),
-        )
+    let mut cors = CorsLayer::new()
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any);
+
+    // 安全处理 CORS 来源：跳过无效 origin，不 panic
+    let valid_origins: Vec<_> = config
+        .cors_allowed_origins
+        .iter()
+        .filter_map(|origin| {
+            if origin == "*" {
+                // 通配符直接用 Any，跳过具体 origin 配置
+                None
+            } else {
+                origin.parse::<axum::http::HeaderValue>().ok()
+            }
+        })
+        .collect();
+
+    if !valid_origins.is_empty() {
+        cors = cors.allow_origin(valid_origins);
+    } else if config.cors_allowed_origins.iter().any(|o| o == "*") {
+        cors = cors.allow_origin(tower_http::cors::Any);
+    }
 
     // ── 公开路由（无需认证） ─────────────────────────────────────
     let public_routes = Router::new()

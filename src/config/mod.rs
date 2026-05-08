@@ -1,7 +1,7 @@
 //! 应用配置管理模块
 //!
-//! 通过 dotenvy 从 .env 文件加载配置，提供统一的配置访问接口。
-//! 所有配置项都有默认值，确保在缺少部分环境变量时仍可运行。
+//! 提供统一的配置访问接口。
+//! `dotenvy::dotenv()` 应在 `main()` 中调用，不在本模块内调用。
 
 use std::env;
 use std::net::SocketAddr;
@@ -28,9 +28,6 @@ impl Config {
     ///
     /// 缺少必需的配置项（`DATABASE_URL`, `JWT_SECRET`）时会 panic。
     pub fn from_env() -> Self {
-        // 加载 .env 文件（如果存在）
-        dotenvy::dotenv().ok();
-
         let host = env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port: u16 = env::var("SERVER_PORT")
             .unwrap_or_else(|_| "8080".to_string())

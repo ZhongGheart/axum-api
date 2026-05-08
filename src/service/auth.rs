@@ -105,7 +105,7 @@ impl AuthService {
         // 查找用户（支持用户名或邮箱登录）
         let user = self
             .user_repo
-            .find_by_username(&req.username)
+            .find_by_username_or_email(&req.username)
             .await?
             .ok_or_else(|| AppError::ValidationFailed("用户名或密码错误".to_string()))?;
 
@@ -125,7 +125,7 @@ impl AuthService {
         // 签发 JWT 令牌
         let token = self
             .jwt_util
-            .sign(user.id, &user.role, self.jwt_expiration_seconds)
+            .sign(user.id, &user.role.to_string(), self.jwt_expiration_seconds)
             .map_err(|e| AppError::InternalServerError(format!("JWT 签发失败: {e}")))?;
 
         tracing::info!("用户登录成功: {}", user.username);

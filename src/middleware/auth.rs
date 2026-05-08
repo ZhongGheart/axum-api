@@ -19,6 +19,16 @@ use uuid::Uuid;
 use crate::router::AppState;
 use crate::utils::jwt::Claims;
 
+/// 快速构造 JSON 错误响应
+fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    let body = Json(json!({
+        "code": status.as_u16(),
+        "message": message.into(),
+        "data": null,
+    }));
+    (status, body).into_response()
+}
+
 /// 认证用户信息，通过中间件注入到请求扩展中
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthenticatedUser {
@@ -41,36 +51,23 @@ pub async fn auth_middleware(
         .headers()
         .get("Authorization")
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| {
-            let body = Json(json!({
-                "code": 401,
-                "message": "缺少 Authorization 请求头",
-                "data": null,
-            }));
-            (StatusCode::UNAUTHORIZED, body).into_response()
-        })?;
+        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "缺少 Authorization 请求头"))?;
 
     // 解析 Bearer Token
     let token = auth_header
         .strip_prefix("Bearer ")
         .ok_or_else(|| {
-            let body = Json(json!({
-                "code": 401,
-                "message": "Authorization 格式错误，请使用 Bearer <token>",
-                "data": null,
-            }));
-            (StatusCode::UNAUTHORIZED, body).into_response()
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                "Authorization 格式错误，请使用 Bearer <token>",
+            )
         })?;
 
     // 使用 AppState 中的 JwtUtil 验证令牌
-    let claims: Claims = state.jwt_util.verify(token).map_err(|_| {
-        let body = Json(json!({
-            "code": 401,
-            "message": "令牌无效或已过期",
-            "data": null,
-        }));
-        (StatusCode::UNAUTHORIZED, body).into_response()
-    })?;
+    let claims: Claims = state
+        .jwt_util
+        .verify(token)
+        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "令牌无效或已过期"))?;
 
     // 将认证用户信息注入请求扩展
     let authenticated_user = AuthenticatedUser {
@@ -97,14 +94,13 @@ where
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        parts.extensions.get::<AuthenticatedUser>().cloned().ok_or_else(|| {
-            let body = Json(json!({
-                "code": 401,
-                "message": "未认证，请先登录",
-                "data": null,
-            }));
-            (StatusCode::UNAUTHORIZED, body).into_response()
-        })
+        parts
+            .extensions
+            .get::<AuthenticatedUser>()
+            .cloned()
+            .ok_or_else(|| {
+                error_response(StatusCode::UNAUTHORIZED, "未认证，请先登录")
+            })
     }
 }
 
@@ -123,25 +119,15 @@ pub async fn require_role(
     req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, Response> {
-    let auth_user = req
-        .extensions()
-        .get::<AuthenticatedUser>()
-        .ok_or_else(|| {
-            let body = Json(json!({
-                "code": 401,
-                "message": "未认证",
-                "data": null,
-            }));
-            (StatusCode::UNAUTHORIZED, body).into_response()
-        })?;
+    let auth_user = req.extensions().get::<AuthenticatedUser>().ok_or_else(|| {
+        error_response(StatusCode::UNAUTHORIZED, "未认证")
+    })?;
 
     if auth_user.role != role {
-        let body = Json(json!({
-            "code": 403,
-            "message": format!("需要 {} 角色权限，当前角色: {}", role, auth_user.role),
-            "data": null,
-        }));
-        return Err((StatusCode::FORBIDDEN, body).into_response());
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            format!("需要 {role} 角色权限，当前角色: {}", auth_user.role),
+        ));
     }
 
     Ok(next.run(req).await)

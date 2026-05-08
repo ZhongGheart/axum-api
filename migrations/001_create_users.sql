@@ -1,14 +1,14 @@
 -- 创建用户表
 -- 使用 UUID 作为主键，支持分布式部署
--- 启用 uuid-ossp 扩展用于生成 UUID（如不支持可用纯 SQL 方式）
+-- 使用 pgcrypto 扩展的 gen_random_uuid()（现代 PostgreSQL 推荐方式）
 
--- 创建 uuid-ossp 扩展（如果尚未创建）
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- 创建 pgcrypto 扩展（如果尚未创建）
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- 创建用户表
 CREATE TABLE IF NOT EXISTS users (
-    -- 主键：UUID v4，自动生成
-    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    -- 主键：UUID v4，自动生成（pgcrypto → gen_random_uuid）
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     -- 用户名：唯一，3-50 个字符
     username    VARCHAR(50)  NOT NULL UNIQUE,
     -- 电子邮箱：唯一
@@ -42,8 +42,8 @@ CREATE TRIGGER set_users_updated_at
     EXECUTE FUNCTION update_updated_at_column();
 
 -- 索引：加速用户名和邮箱的查询
-CREATE INDEX idx_users_username ON users(username);
-CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 
 -- 创建测试数据（可选，默认注释掉）
 -- INSERT INTO users (username, email, password_hash, role)

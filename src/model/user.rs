@@ -6,6 +6,25 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// 用户角色枚举
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "varchar", rename_all = "lowercase")]
+pub enum Role {
+    /// 管理员
+    Admin,
+    /// 普通用户
+    User,
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Role::Admin => write!(f, "admin"),
+            Role::User => write!(f, "user"),
+        }
+    }
+}
+
 /// 用户数据库实体
 ///
 /// 映射 `users` 表的每一行记录。
@@ -20,7 +39,7 @@ pub struct User {
     /// 密码哈希值（Argon2 加密）
     pub password_hash: String,
     /// 用户角色：admin / user
-    pub role: String,
+    pub role: Role,
     /// 是否激活
     pub is_active: bool,
     /// 创建时间
@@ -68,7 +87,7 @@ pub struct UserInfo {
     /// 电子邮箱
     pub email: String,
     /// 用户角色
-    pub role: String,
+    pub role: Role,
     /// 是否激活
     pub is_active: bool,
     /// 创建时间

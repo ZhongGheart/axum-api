@@ -16,10 +16,10 @@ pub struct Claims {
     pub sub: Uuid,
     /// 用户角色（admin / user）
     pub role: String,
-    /// 签发时间（Unix 时间戳）
-    pub iat: usize,
-    /// 过期时间（Unix 时间戳）
-    pub exp: usize,
+    /// 签发时间（Unix 时间戳，JWT 标准要求 u64）
+    pub iat: u64,
+    /// 过期时间（Unix 时间戳，JWT 标准要求 u64）
+    pub exp: u64,
 }
 
 /// JWT 工具结构体
@@ -53,12 +53,12 @@ impl JwtUtil {
         role: &str,
         expiration_seconds: u64,
     ) -> Result<String, jsonwebtoken::errors::Error> {
-        let now = chrono::Utc::now().timestamp() as usize;
+        let now = chrono::Utc::now().timestamp() as u64;
         let claims = Claims {
             sub: user_id,
             role: role.to_string(),
             iat: now,
-            exp: now + expiration_seconds as usize,
+            exp: now + expiration_seconds,
         };
 
         encode(
@@ -78,10 +78,16 @@ impl JwtUtil {
     ///
     /// 验证通过返回 `Claims`，失败返回错误。
     pub fn verify(&self, token: &str) -> Result<Claims, jsonwebtoken::errors::Error> {
+        let mut validation = Validation::default();
+        // 显式设置为 HS256（与签发算法一致）
+        validation.algorithms = vec![jsonwebtoken::Algorithm::HS256];
+        // 不设置 leeway（默认60s），严格过期校验
+        validation.leeway = 0;
+
         let token_data = decode::<Claims>(
             token,
             &DecodingKey::from_secret(self.secret.as_bytes()),
-            &Validation::default(),
+            &validation,
         )?;
         Ok(token_data.claims)
     }
