@@ -96,7 +96,6 @@ http.interceptors.response.use(
 
     switch (status) {
       case 401:
-        removeToken()
         message = '未授权，请重新登录'
         break
       case 403:

@@ -38,9 +38,6 @@ export const useUserStore = defineStore('user', () => {
       setToken(data.token)
       isLoggedIn.value = true
 
-      // 登录后尝试获取用户信息（独立捕获，失败不影响登录状态）
-      fetchUserInfo().catch(() => {})
-
       return data
     } catch (error) {
       handleError(error)

@@ -99,6 +99,9 @@ const route = useRoute()
 const appStore = useAppStore()
 const userStore = useUserStore()
 
+// 挂载时尝试获取用户信息（不阻塞渲染，失败也无影响）
+userStore.fetchUserInfo().catch(() => {})
+
 /** 当前页面标题 */
 const currentTitle = computed(() => (route.meta?.title as string) || '首页')
 
