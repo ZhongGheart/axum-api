@@ -195,7 +195,7 @@ onMounted(() => {
 .login-card {
   width: 420px;
   padding: 40px;
-  background: #fff;
+  background: var(--bg-card, #ffffff);
   border-radius: 12px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
 }
@@ -220,12 +220,12 @@ onMounted(() => {
 .logo-text {
   font-size: 24px;
   font-weight: 700;
-  color: #1a1a2e;
+  color: var(--text-primary, #1a1a2e);
 }
 
 .login-subtitle {
   font-size: 14px;
-  color: #888;
+  color: var(--text-secondary, #888);
 }
 
 .login-options {

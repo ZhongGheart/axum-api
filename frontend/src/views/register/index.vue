@@ -204,7 +204,7 @@ async function handleRegister(): Promise<void> {
 .register-card {
   width: 440px;
   padding: 40px;
-  background: #fff;
+  background: var(--bg-card, #ffffff);
   border-radius: 12px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
 }
@@ -229,12 +229,12 @@ async function handleRegister(): Promise<void> {
 .logo-text {
   font-size: 24px;
   font-weight: 700;
-  color: #1a1a2e;
+  color: var(--text-primary, #1a1a2e);
 }
 
 .register-subtitle {
   font-size: 14px;
-  color: #888;
+  color: var(--text-secondary, #888);
 }
 
 .login-link-wrap {

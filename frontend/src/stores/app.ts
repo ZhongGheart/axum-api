@@ -30,7 +30,7 @@ export const useAppStore = defineStore('app', () => {
   /** 加载提示文字 */
   const loadingText = ref('加载中...')
 
-  // 监听主题变化同步 isDark
+  // 监听主题变化同步 isDark 和 data-theme 属性
   watch(theme, (val) => {
     isDark.value = val === 'dark'
     document.documentElement.setAttribute('data-theme', val)
@@ -62,21 +62,34 @@ export const useAppStore = defineStore('app', () => {
     if (val) loadingText.value = text
   }
 
-  /** 浅色主题自定义变量 */
+  /** 亮色主题覆盖 */
   const lightThemeOverrides: GlobalThemeOverrides = {
     common: {
       primaryColor: '#2080f0',
       primaryColorHover: '#4098fc',
       bodyColor: '#f5f7fa',
       cardColor: '#ffffff',
+      modalColor: '#ffffff',
+      popoverColor: '#ffffff',
+      inputColor: '#ffffff',
     },
   }
 
-  /** 深色主题自定义变量 */
+  /** 深色主题覆盖 */
   const darkThemeOverrides: GlobalThemeOverrides = {
     common: {
       primaryColor: '#70c0e8',
       primaryColorHover: '#8cd4f5',
+      bodyColor: '#101014',
+      cardColor: '#1e1e22',
+      modalColor: '#1e1e22',
+      popoverColor: '#1e1e22',
+      inputColor: '#2a2a30',
+      placeholderColor: '#666',
+      placeholderColorDisabled: '#444',
+      textColor1: '#e5e5e5',
+      textColor2: '#cccccc',
+      textColor3: '#999999',
     },
   }
 
