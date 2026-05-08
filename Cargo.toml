@@ -1,0 +1,51 @@
+[package]
+name = "axum-api"
+version = "0.1.0"
+edition = "2024"
+description = "Production-grade Rust backend API with Axum, SQLx, JWT auth"
+authors = ["dev"]
+
+[dependencies]
+# Web框架
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "auth"] }
+
+# 数据库
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "postgres",
+    "chrono",
+    "uuid",
+    "migrate",
+] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"
+
+# 日志与追踪
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# 配置管理
+dotenvy = "0.15"
+
+# 密码加密
+argon2 = "0.5"
+
+# JWT
+jsonwebtoken = "9"
+
+# 日期时间
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# HTTP 标头处理
+http = "1"
