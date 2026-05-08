@@ -141,6 +141,7 @@ impl AuthService {
     }
 
     /// 获取当前用户信息
+    #[allow(dead_code)]
     pub async fn get_current_user(&self, user_id: Uuid) -> Result<UserInfo, AppError> {
         let user = self.user_repo.find_by_id(user_id).await?;
         Ok(UserInfo::from(user))

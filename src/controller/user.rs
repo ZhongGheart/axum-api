@@ -40,7 +40,7 @@ pub struct UserListResponse {
 /// GET /api/admin/users — 用户列表（分页）
 pub async fn list_users(
     State(state): State<AppState>,
-    Json(params): Json<UserListParams>,
+    axum::extract::Query(params): axum::extract::Query<UserListParams>,
 ) -> Result<Json<ApiResponse<UserListResponse>>, AppError> {
     let page = params.page.unwrap_or(1).max(1);
     let page_size = params.page_size.unwrap_or(10).clamp(1, 100);

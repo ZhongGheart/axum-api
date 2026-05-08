@@ -88,6 +88,8 @@ pub struct UserInfo {
     pub email: String,
     /// 用户角色
     pub role: Role,
+    /// 用户拥有的所有角色标识列表（来自 user_roles 表）
+    pub roles: Vec<String>,
     /// 是否激活
     pub is_active: bool,
     /// 创建时间
@@ -96,13 +98,29 @@ pub struct UserInfo {
 
 impl From<User> for UserInfo {
     /// 从数据库实体转换为对外暴露的用户信息
-    /// 自动过滤掉密码哈希等敏感字段
+    /// 自动过滤掉密码哈希等敏感字段（不含角色列表）
     fn from(user: User) -> Self {
         Self {
             id: user.id,
             username: user.username,
             email: user.email,
             role: user.role,
+            roles: Vec::new(),
+            is_active: user.is_active,
+            created_at: user.created_at,
+        }
+    }
+}
+
+impl UserInfo {
+    /// 从用户实体 + 角色列表构造 UserInfo
+    pub fn with_roles(user: User, roles: Vec<String>) -> Self {
+        Self {
+            id: user.id,
+            username: user.username,
+            email: user.email,
+            role: user.role,
+            roles,
             is_active: user.is_active,
             created_at: user.created_at,
         }

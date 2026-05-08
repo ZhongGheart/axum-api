@@ -27,12 +27,14 @@ pub async fn login(
     Ok(Json(ApiResponse::success(login_resp)))
 }
 
-/// GET /api/auth/me — 获取当前用户信息
+/// GET /api/auth/me — 获取当前用户信息（含角色列表）
 pub async fn me(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
-    let user_info = state.auth_service.get_current_user(auth_user.user_id).await?;
+    let user = state.auth_service.user_repo.find_by_id(auth_user.user_id).await?;
+    let roles = state.auth_service.role_repo.find_roles_by_user_id(auth_user.user_id).await?;
+    let user_info = crate::model::UserInfo::with_roles(user, roles);
     Ok(Json(ApiResponse::success(user_info)))
 }
 

@@ -11,13 +11,13 @@ import type { UserInfo } from './types/response'
 export const userApi = {
   /** GET /api/admin/users?page=1&page_size=10 */
   list(params: { page?: number; page_size?: number }) {
-    return http.post<{
+    return http.get<{
       items: UserInfo[]
       total: number
       page: number
       page_size: number
       total_pages: number
-    }>('/admin/users', params)
+    }>('/admin/users', { params })
   },
 
   /** POST /api/admin/users */
