@@ -131,7 +131,13 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route("/api/admin/users/{id}/roles", get(role::get_user_roles).post(role::assign_user_role))
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
-        }));
+        }))
+        // auth_middleware 先运行（外层），解析 JWT 注入 AuthenticatedUser
+        // require_role 再运行（内层），读取 AuthenticatedUser 校验角色
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // ── 合并所有路由并应用全局中间件 ──────────────────────────
     let rate_limit_state = (Arc::clone(&redis_client), Arc::new(config.rate_limit));
