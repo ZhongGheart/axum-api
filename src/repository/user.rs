@@ -145,6 +145,7 @@ impl UserRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
+            tracing::error!(target: "repository", "更新用户失败 (id={}): {:?}", id, e);
             if let Some(pg_err) = e.as_database_error() {
                 if let Some(constraint) = pg_err.constraint() {
                     if constraint == "users_username_key" {
