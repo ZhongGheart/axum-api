@@ -41,6 +41,9 @@ http.interceptors.request.use(
     const token = getToken()
     if (token && config.headers) {
       config.headers.Authorization = `Bearer ${token}`
+      console.log('[Axios] token 已注入:', config.url, token.slice(0, 20) + '...')
+    } else {
+      console.warn('[Axios] 未找到 token，请求可能被拒:', config.url)
     }
     // 启动全局 loading bar
     window.$loadingBar?.start()
