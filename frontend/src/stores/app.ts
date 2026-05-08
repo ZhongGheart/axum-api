@@ -30,11 +30,11 @@ export const useAppStore = defineStore('app', () => {
   /** 加载提示文字 */
   const loadingText = ref('加载中...')
 
-  // 监听主题变化同步 isDark 和 data-theme 属性
+  // 监听主题变化同步 isDark 和 data-theme 属性（immediate 确保初始化时同步）
   watch(theme, (val) => {
     isDark.value = val === 'dark'
     document.documentElement.setAttribute('data-theme', val)
-  })
+  }, { immediate: true })
 
   // 监听系统主题变化
   watch(osTheme, (val) => {
