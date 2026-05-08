@@ -126,9 +126,9 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
     let admin_routes = Router::new()
         .route("/api/admin/test", get(rbac::admin_test))
         .route("/api/admin/users", get(user::list_users).post(user::create_user))
-        .route("/api/admin/users/:id", axum::routing::put(user::update_user).delete(user::delete_user))
+        .route("/api/admin/users/{id}", axum::routing::put(user::update_user).delete(user::delete_user))
         .route("/api/admin/roles", get(role::list_roles))
-        .route("/api/admin/users/:id/roles", get(role::get_user_roles).post(role::assign_user_role))
+        .route("/api/admin/users/{id}/roles", get(role::get_user_roles).post(role::assign_user_role))
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }));
