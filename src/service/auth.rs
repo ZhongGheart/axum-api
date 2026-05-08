@@ -96,8 +96,8 @@ impl AuthService {
         Ok(UserInfo::from(user))
     }
 
-    /// 用户登录
-    pub async fn login(&self, req: LoginRequest) -> Result<LoginResponse, AppError> {
+    /// 用户登录（成功后清除 Redis 黑名单，避免旧登出记录阻塞新 token）
+    pub async fn login(&self, req: LoginRequest, redis_client: &RedisClient) -> Result<LoginResponse, AppError> {
         let user = self
             .user_repo
             .find_by_username_or_email(&req.username)
@@ -131,6 +131,11 @@ impl AuthService {
                 self.jwt_expiration_seconds,
             )
             .map_err(|e| AppError::InternalServerError(format!("JWT 签发失败: {e}")))?;
+
+        // 清除 Redis 黑名单（如果存在旧登出记录，避免新 token 被阻塞）
+        let _ = redis_client
+            .remove_token_blacklist(&user.id.to_string())
+            .await;
 
         tracing::info!("用户登录成功: {}", user.username);
 

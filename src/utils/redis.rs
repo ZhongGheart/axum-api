@@ -89,6 +89,15 @@ impl RedisClient {
         Ok(())
     }
 
+    /// 从黑名单中移除（登录成功时调用，清除旧登出记录）
+    pub async fn remove_token_blacklist(&self, token_sub: &str) -> Result<()> {
+        let key = format!("{}{}", Self::TOKEN_BLACKLIST_PREFIX, token_sub);
+        let mut conn = self.conn.clone();
+        let _: () = conn.del(key).await
+            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 删除失败: {e}")))?;
+        Ok(())
+    }
+
     /// 检查 Token 是否在黑名单中
     pub async fn is_token_blacklisted(&self, token_sub: &str) -> Result<bool> {
         let key = format!("{}{}", Self::TOKEN_BLACKLIST_PREFIX, token_sub);

@@ -23,7 +23,7 @@ pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<ApiResponse<LoginResponse>>, AppError> {
-    let login_resp = state.auth_service.login(req).await?;
+    let login_resp = state.auth_service.login(req, &state.redis_client).await?;
     Ok(Json(ApiResponse::success(login_resp)))
 }
 
