@@ -1,10 +1,10 @@
 /**
  * 用户管理页面
  *
- * 仅 admin 角色可访问。提供用户列表、搜索、新建、编辑、删除功能。
+ * 仅 admin 角色可访问。使用 BaseTable 通用表格组件。
  */
 <template>
-  <div class="user-manage">
+  <div class="page-container">
     <n-page-header title="用户管理">
       <template #extra>
         <PermissionButton permission="admin" type="primary" @click="openCreate">
@@ -14,14 +14,19 @@
       </template>
     </n-page-header>
 
-    <!-- 用户表格 -->
-    <n-data-table
+    <!-- 搜索栏 -->
+    <SearchForm @search="onSearch" @clear="onSearchClear" />
+
+    <!-- 数据表格 -->
+    <BaseTable
       :columns="columns"
       :data="userList"
       :loading="loading"
-      :pagination="pagination"
-      :bordered="true"
-      class="user-table"
+      :total="total"
+      v-model:page="page"
+      v-model:page-size="pageSize"
+      @update:page="fetchUsers"
+      @update:page-size="onPageSizeChange"
     />
 
     <!-- 新建/编辑对话框 -->
@@ -60,13 +65,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, h } from 'vue'
-import { NButton, NTag, NSwitch } from 'naive-ui'
+import { ref, h, onMounted } from 'vue'
+import { NTag, NSwitch } from 'naive-ui'
 import { AddOutline as AddIcon } from '@vicons/ionicons5'
 import type { DataTableColumn, FormInst, FormRules } from 'naive-ui'
 import type { UserInfo } from '@/api/types/response'
 import { userApi } from '@/api/user'
 import { showSuccess, showConfirm } from '@/utils/message'
+import BaseTable from '@/components/common/BaseTable.vue'
+import SearchForm from '@/components/common/SearchForm.vue'
 import PermissionButton from '@/components/common/PermissionButton.vue'
 
 // ── 状态 ────────────────────────────────────────────────────────
@@ -76,25 +83,11 @@ const submitting = ref(false)
 const showModal = ref(false)
 const isEditing = ref(false)
 const editingId = ref('')
-const userList = ref<UserInfo[]>([])
+const userList = ref<Record<string, unknown>[]>([])
+const total = ref(0)
+const page = ref(1)
+const pageSize = ref(10)
 const formRef = ref<FormInst | null>(null)
-
-const pagination = reactive({
-  page: 1,
-  pageSize: 10,
-  pageCount: 1,
-  showSizePicker: true,
-  pageSizes: [10, 20, 50],
-  onChange: (page: number) => {
-    pagination.page = page
-    fetchUsers()
-  },
-  onUpdatePageSize: (size: number) => {
-    pagination.pageSize = size
-    pagination.page = 1
-    fetchUsers()
-  },
-})
 
 const roleOptions = [
   { label: '管理员', value: 'admin' },
@@ -109,7 +102,7 @@ interface UserForm {
   is_active: boolean
 }
 
-const formData = reactive<UserForm>({
+const formData = ref<UserForm>({
   username: '',
   email: '',
   password: '',
@@ -127,13 +120,11 @@ const formRules: FormRules = {
     { required: true, message: '请输入邮箱' },
     { type: 'email', message: '邮箱格式不正确' },
   ],
-  password: [
-    { min: 6, message: '密码至少 6 个字符', trigger: 'blur' },
-  ],
+  password: [{ min: 6, message: '密码至少 6 个字符', trigger: 'blur' }],
   role: [{ required: true, message: '请选择角色' }],
 }
 
-// ── 表格列定义 ──────────────────────────────────────────────────
+// ── 表格列 ──────────────────────────────────────────────────────
 
 const columns: DataTableColumn[] = [
   { title: '用户名', key: 'username', width: 150 },
@@ -175,11 +166,15 @@ const columns: DataTableColumn[] = [
 async function fetchUsers() {
   loading.value = true
   try {
-    const res = await userApi.list({ page: pagination.page, page_size: pagination.pageSize })
-    const data = res as unknown as { items: UserInfo[]; total: number; page: number; page_size: number; total_pages: number }
-    userList.value = data.items
-    pagination.pageCount = data.total_pages
-    pagination.page = data.page
+    const res = await userApi.list({ page: page.value, page_size: pageSize.value })
+    const data = res as unknown as {
+      items: UserInfo[]
+      total: number
+      page: number
+      page_size: number
+    }
+    userList.value = data.items as unknown as Record<string, unknown>[]
+    total.value = data.total
   } catch {
     // handled by interceptor
   } finally {
@@ -187,27 +182,42 @@ async function fetchUsers() {
   }
 }
 
+function onPageSizeChange(size: number) {
+  pageSize.value = size
+  page.value = 1
+  fetchUsers()
+}
+
+function onSearch(keyword: string) {
+  page.value = 1
+  // 搜索逻辑由具体业务实现
+  fetchUsers()
+}
+
+function onSearchClear() {
+  page.value = 1
+  fetchUsers()
+}
+
 // ── 新建/编辑 ───────────────────────────────────────────────────
 
 function openCreate() {
   isEditing.value = false
   editingId.value = ''
-  formData.username = ''
-  formData.email = ''
-  formData.password = ''
-  formData.role = 'user'
-  formData.is_active = true
+  formData.value = { username: '', email: '', password: '', role: 'user', is_active: true }
   showModal.value = true
 }
 
 function openEdit(user: UserInfo) {
   isEditing.value = true
   editingId.value = user.id
-  formData.username = user.username
-  formData.email = user.email
-  formData.password = ''
-  formData.role = user.role
-  formData.is_active = user.is_active
+  formData.value = {
+    username: user.username,
+    email: user.email,
+    password: '',
+    role: user.role,
+    is_active: user.is_active,
+  }
   showModal.value = true
 }
 
@@ -218,18 +228,18 @@ async function handleSubmit() {
 
     if (isEditing.value) {
       await userApi.update(editingId.value, {
-        username: formData.username,
-        email: formData.email,
-        role: formData.role,
-        is_active: formData.is_active,
+        username: formData.value.username,
+        email: formData.value.email,
+        role: formData.value.role,
+        is_active: formData.value.is_active,
       })
       showSuccess('用户更新成功')
     } else {
       await userApi.create({
-        username: formData.username,
-        email: formData.email,
-        password: formData.password || undefined,
-        role: formData.role,
+        username: formData.value.username,
+        email: formData.value.email,
+        password: formData.value.password || undefined,
+        role: formData.value.role,
       })
       showSuccess('用户创建成功')
     }
@@ -256,18 +266,7 @@ async function handleDelete(id: string) {
   }
 }
 
-// ── 初始化 ──────────────────────────────────────────────────────
-
 onMounted(() => {
   fetchUsers()
 })
 </script>
-
-<style scoped>
-.user-manage {
-  padding: 24px;
-}
-.user-table {
-  margin-top: 16px;
-}
-</style>
