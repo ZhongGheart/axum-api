@@ -9,6 +9,7 @@
       <n-dialog-provider>
         <n-message-provider>
           <n-notification-provider>
+            <GlobalApiRegister />
             <!-- 全局加载遮罩 -->
             <n-spin v-if="appStore.loading" :show="true" content-class="global-loading">
               <router-view />
@@ -29,23 +30,13 @@
  * 支持亮色/暗黑主题动态切换。
  */
 import { zhCN, dateZhCN, darkTheme } from 'naive-ui'
-import { useMessage, useDialog, useNotification, useLoadingBar } from 'naive-ui'
-import { registerGlobalApis } from '@/utils/message'
 import { useAppStore } from '@/stores/app'
+import GlobalApiRegister from './GlobalApiRegister.vue'
 
 const appStore = useAppStore()
-
-// 注入全局 loading bar
-const loadingBar = useLoadingBar()
-// 注入全局消息/弹窗/通知 API
-registerGlobalApis(useMessage(), useDialog(), useNotification())
-
-// 暴露 loadingBar 给全局使用
-window.$loadingBar = loadingBar
 </script>
 
 <style>
-/* 全局加载遮罩 */
 .global-loading {
   min-height: 100vh;
   display: flex;
