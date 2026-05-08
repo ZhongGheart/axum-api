@@ -79,6 +79,7 @@
 import { computed, h } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { NIcon } from 'naive-ui'
+import { getToken } from '@/utils/storage'
 import {
   MenuOutline as MenuIcon,
   SunnyOutline as SunnyIcon,
@@ -143,14 +144,33 @@ const menuOptions: MenuOption[] = [
   },
 ]
 
-/** 过滤菜单（根据用户角色） */
+/** 从 JWT 中提取用户角色列表（不依赖 fetchUserInfo） */
+function getUserRolesFromToken(): string[] {
+  const token = getToken()
+  if (!token) return []
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3) return []
+    const claims = JSON.parse(atob(parts[1]))
+    return claims?.roles || (claims?.role ? [claims.role] : [])
+  } catch {
+    return []
+  }
+}
+
+/** 过滤菜单（根据 JWT 中的用户角色） */
 function filterMenu(options: MenuOption[]): MenuOption[] {
+  let userRoles = getUserRolesFromToken()
+  if (userRoles.length === 0) {
+    // fallback: 尝试从 userStore 读取
+    const storeRoles =
+      userStore.userInfo?.roles || (userStore.userInfo?.role ? [userStore.userInfo.role] : [])
+    if (storeRoles.length > 0) userRoles = storeRoles
+  }
   return options
     .filter((item) => {
       const roles = (item as { roles?: string[] }).roles
       if (!roles || roles.length === 0) return true
-      const userRoles =
-        userStore.userInfo?.roles || (userStore.userInfo?.role ? [userStore.userInfo.role] : [])
       return roles.some((r) => userRoles.includes(r))
     })
     .map((item) => ({
