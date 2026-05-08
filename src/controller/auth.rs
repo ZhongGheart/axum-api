@@ -1,7 +1,6 @@
 //! 认证控制器
 //!
-//! 处理认证相关的 HTTP 请求，包括注册、登录、获取当前用户信息。
-//! 控制器通过 `State<AppState>` 获取服务层实例。
+//! 处理认证相关的 HTTP 请求，包括注册、登录、获取当前用户信息、登出。
 
 use axum::{extract::State, Json};
 
@@ -11,9 +10,6 @@ use crate::model::{ApiResponse, LoginRequest, LoginResponse, RegisterRequest, Us
 use crate::router::AppState;
 
 /// POST /api/auth/register — 用户注册
-///
-/// 请求体：`RegisterRequest`（username, email, password）
-/// 响应：用户信息（不含密码）
 pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
@@ -23,9 +19,6 @@ pub async fn register(
 }
 
 /// POST /api/auth/login — 用户登录
-///
-/// 请求体：`LoginRequest`（username, password）
-/// 响应：JWT 令牌
 pub async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
@@ -35,15 +28,24 @@ pub async fn login(
 }
 
 /// GET /api/auth/me — 获取当前用户信息
-///
-/// 需要 JWT 认证（通过中间件）。
-/// 从 `AuthenticatedUser` 提取器中自动获取当前用户信息。
 pub async fn me(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     let user_info = state.auth_service.get_current_user(auth_user.user_id).await?;
     Ok(Json(ApiResponse::success(user_info)))
+}
+
+/// POST /api/auth/logout — 用户登出（Token 加入 Redis 黑名单）
+pub async fn logout(
+    State(state): State<AppState>,
+    auth_user: AuthenticatedUser,
+) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    state
+        .auth_service
+        .logout(&state.redis_client, auth_user.user_id, auth_user.token_exp)
+        .await?;
+    Ok(Json(ApiResponse::success("登出成功")))
 }
 
 /// GET /api/health — 健康检查

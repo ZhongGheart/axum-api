@@ -35,6 +35,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # 配置管理
 dotenvy = "0.15"
 
+# Redis 异步客户端
+redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
+
 # 密码加密
 argon2 = "0.5"
 

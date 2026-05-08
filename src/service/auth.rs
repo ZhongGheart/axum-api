@@ -12,6 +12,7 @@ use crate::repository::role::RoleRepository;
 use crate::repository::user::UserRepository;
 use crate::utils::jwt::JwtUtil;
 use crate::utils::password::{hash_password, verify_password};
+use crate::utils::redis::RedisClient;
 
 /// 认证服务
 ///
@@ -45,15 +46,7 @@ impl AuthService {
     }
 
     /// 用户注册
-    ///
-    /// 1. 校验参数
-    /// 2. 检查用户名/邮箱是否已存在
-    /// 3. 对密码进行 Argon2 哈希
-    /// 4. 创建用户记录
-    /// 5. 分配默认 user 角色（事务保证）
-    /// 6. 返回用户信息（不含密码）
     pub async fn register(&self, req: RegisterRequest) -> Result<UserInfo, AppError> {
-        // 参数基本校验
         if req.username.len() < 3 || req.username.len() > 50 {
             return Err(AppError::BadRequest(
                 "用户名长度必须在 3-50 个字符之间".to_string(),
@@ -68,7 +61,6 @@ impl AuthService {
             return Err(AppError::BadRequest("邮箱格式不正确".to_string()));
         }
 
-        // 检查用户名是否已被注册
         if (self
             .user_repo
             .find_by_username(&req.username)
@@ -78,16 +70,13 @@ impl AuthService {
             return Err(AppError::Conflict("用户名已被注册".to_string()));
         }
 
-        // 检查邮箱是否已被注册
         if (self.user_repo.find_by_email(&req.email).await?).is_some() {
             return Err(AppError::Conflict("邮箱已被注册".to_string()));
         }
 
-        // 对密码进行 Argon2 哈希
         let password_hash =
             hash_password(&req.password).map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
-        // 创建用户
         let user = self
             .user_repo
             .create(
@@ -98,7 +87,6 @@ impl AuthService {
             )
             .await?;
 
-        // 为新用户分配默认 user 角色
         self.role_repo
             .assign_role_to_user(user.id, "user")
             .await?;
@@ -109,26 +97,17 @@ impl AuthService {
     }
 
     /// 用户登录
-    ///
-    /// 1. 通过用户名/邮箱查找用户
-    /// 2. 验证密码
-    /// 3. 查询用户所有角色（RBAC）
-    /// 4. 签发 JWT 令牌（含角色列表）
-    /// 5. 返回令牌
     pub async fn login(&self, req: LoginRequest) -> Result<LoginResponse, AppError> {
-        // 查找用户（支持用户名或邮箱登录）
         let user = self
             .user_repo
             .find_by_username_or_email(&req.username)
             .await?
             .ok_or_else(|| AppError::ValidationFailed("用户名或密码错误".to_string()))?;
 
-        // 检查用户是否激活
         if !user.is_active {
             return Err(AppError::Forbidden);
         }
 
-        // 验证密码
         let is_valid = verify_password(&req.password, &user.password_hash)
             .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
@@ -136,7 +115,6 @@ impl AuthService {
             return Err(AppError::ValidationFailed("用户名或密码错误".to_string()));
         }
 
-        // 查询用户所有角色（来自 user_roles 表）
         let roles = self
             .role_repo
             .find_roles_by_user_id(user.id)
@@ -144,7 +122,6 @@ impl AuthService {
 
         tracing::debug!("用户 {} 拥有的角色: {:?}", user.username, roles);
 
-        // 签发 JWT 令牌（包含角色列表）
         let token = self
             .jwt_util
             .sign(
@@ -167,5 +144,20 @@ impl AuthService {
     pub async fn get_current_user(&self, user_id: Uuid) -> Result<UserInfo, AppError> {
         let user = self.user_repo.find_by_id(user_id).await?;
         Ok(UserInfo::from(user))
+    }
+
+    /// 用户登出：将 Token 加入 Redis 黑名单
+    pub async fn logout(
+        &self,
+        redis_client: &RedisClient,
+        user_id: Uuid,
+        token_exp: u64,
+    ) -> Result<(), AppError> {
+        redis_client
+            .add_token_to_blacklist(&user_id.to_string(), token_exp)
+            .await?;
+
+        tracing::info!("用户登出成功: {}", user_id);
+        Ok(())
     }
 }

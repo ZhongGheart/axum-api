@@ -38,24 +38,27 @@ pub struct AuthenticatedUser {
     pub role: String,
     /// 用户拥有的所有角色标识列表
     pub roles: Vec<String>,
+    /// JWT 过期时间戳（用于黑名单校验）
+    pub token_exp: u64,
 }
 
 /// JWT 鉴权中间件
 ///
-/// 从请求头提取 Bearer Token，使用 AppState 中的 JwtUtil 验证其有效性。
+/// 1. 从请求头提取 Bearer Token
+/// 2. 验证 JWT 签名与有效期
+/// 3. 检查 Token 是否在 Redis 黑名单中（已下线）
+/// 4. 将用户信息注入请求扩展
 pub async fn auth_middleware(
     State(state): State<AppState>,
     mut req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, Response> {
-    // 获取 Authorization 头
     let auth_header = req
         .headers()
         .get("Authorization")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "缺少 Authorization 请求头"))?;
 
-    // 解析 Bearer Token
     let token = auth_header
         .strip_prefix("Bearer ")
         .ok_or_else(|| {
@@ -65,17 +68,26 @@ pub async fn auth_middleware(
             )
         })?;
 
-    // 使用 AppState 中的 JwtUtil 验证令牌
     let claims: Claims = state
         .jwt_util
         .verify(token)
         .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "令牌无效或已过期"))?;
 
-    // 将认证用户信息注入请求扩展（包含角色列表）
+    // 检查 Token 是否在黑名单中（已下线/登出）
+    if state
+        .redis_client
+        .is_token_blacklisted(&claims.sub.to_string())
+        .await
+        .unwrap_or(false)
+    {
+        return Err(error_response(StatusCode::UNAUTHORIZED, "令牌已被注销，请重新登录"));
+    }
+
     let authenticated_user = AuthenticatedUser {
         user_id: claims.sub,
         role: claims.role.clone(),
         roles: claims.roles.clone(),
+        token_exp: claims.exp,
     };
     req.extensions_mut().insert(authenticated_user);
 
@@ -86,10 +98,6 @@ pub async fn auth_middleware(
 // Extractor：在处理器中直接提取认证用户
 // ============================================
 
-/// 从请求中提取认证用户信息的 Axum Extractor
-///
-/// 在需要认证的路由处理器中，直接声明参数 `auth_user: AuthenticatedUser`
-/// 即可获取当前登录用户信息。
 impl<S> FromRequestParts<S> for AuthenticatedUser
 where
     S: Send + Sync,
@@ -108,15 +116,6 @@ where
 }
 
 /// 角色权限验证中间件
-///
-/// 检查当前用户是否拥有指定角色。
-/// 优先检查 `roles` 列表（RBAC），回退到 `role` 主角色字段。
-///
-/// # 示例
-///
-/// ```ignore
-/// .route_layer(middleware::from_fn(require_role("admin")))
-/// ```
 pub async fn require_role(
     role: &'static str,
     req: Request,
@@ -126,7 +125,6 @@ pub async fn require_role(
         error_response(StatusCode::UNAUTHORIZED, "未认证")
     })?;
 
-    // 先检查 roles 列表，再回退到 role 主字段
     let has_role = auth_user.roles.iter().any(|r| r == role)
         || auth_user.role == role;
 

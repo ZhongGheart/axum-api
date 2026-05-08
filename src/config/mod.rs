@@ -6,6 +6,36 @@
 use std::env;
 use std::net::SocketAddr;
 
+/// Redis 配置
+#[derive(Debug, Clone)]
+pub struct RedisConfig {
+    /// Redis 连接字符串
+    pub url: String,
+}
+
+/// 数据库连接池配置
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// 最大连接数
+    pub max_size: u32,
+    /// 连接超时（秒）
+    pub connect_timeout_seconds: u64,
+}
+
+/// 限流配置
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    /// 单个 IP 每分钟最大请求数
+    pub ip_max_requests: u64,
+    /// IP 限流时间窗口（秒）
+    pub ip_window_seconds: u64,
+    /// 单个用户每分钟最大请求数
+    pub user_max_requests: u64,
+    /// 用户限流时间窗口（秒）
+    pub user_window_seconds: u64,
+}
+
 /// 应用全局配置
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -19,14 +49,16 @@ pub struct Config {
     pub jwt_expiration_seconds: u64,
     /// CORS 允许的来源
     pub cors_allowed_origins: Vec<String>,
+    /// Redis 配置
+    pub redis: RedisConfig,
+    /// 数据库连接池配置
+    pub pool: PoolConfig,
+    /// 限流配置
+    pub rate_limit: RateLimitConfig,
 }
 
 impl Config {
     /// 从环境变量加载配置
-    ///
-    /// # Panics
-    ///
-    /// 缺少必需的配置项（`DATABASE_URL`, `JWT_SECRET`）时会 panic。
     pub fn from_env() -> Self {
         let host = env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port: u16 = env::var("SERVER_PORT")
@@ -45,7 +77,7 @@ impl Config {
             .expect("缺少 JWT_SECRET 环境变量");
 
         let jwt_expiration_seconds: u64 = env::var("JWT_EXPIRATION_SECONDS")
-            .unwrap_or_else(|_| "604800".to_string()) // 默认7天
+            .unwrap_or_else(|_| "604800".to_string())
             .parse()
             .expect("JWT_EXPIRATION_SECONDS 必须是有效的数字");
 
@@ -55,12 +87,53 @@ impl Config {
             .map(|s| s.trim().to_string())
             .collect();
 
+        // Redis 配置
+        let redis = RedisConfig {
+            url: env::var("REDIS_URL")
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+        };
+
+        // 数据库连接池配置
+        let pool = PoolConfig {
+            max_size: env::var("DB_POOL_MAX_SIZE")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()
+                .expect("DB_POOL_MAX_SIZE 必须是有效的数字"),
+            connect_timeout_seconds: env::var("DB_CONNECT_TIMEOUT")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .expect("DB_CONNECT_TIMEOUT 必须是有效的数字"),
+        };
+
+        // 限流配置
+        let rate_limit = RateLimitConfig {
+            ip_max_requests: env::var("RATE_LIMIT_IP_MAX")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse()
+                .expect("RATE_LIMIT_IP_MAX 必须是有效的数字"),
+            ip_window_seconds: env::var("RATE_LIMIT_IP_WINDOW")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .expect("RATE_LIMIT_IP_WINDOW 必须是有效的数字"),
+            user_max_requests: env::var("RATE_LIMIT_USER_MAX")
+                .unwrap_or_else(|_| "30".to_string())
+                .parse()
+                .expect("RATE_LIMIT_USER_MAX 必须是有效的数字"),
+            user_window_seconds: env::var("RATE_LIMIT_USER_WINDOW")
+                .unwrap_or_else(|_| "60".to_string())
+                .parse()
+                .expect("RATE_LIMIT_USER_WINDOW 必须是有效的数字"),
+        };
+
         Self {
             server_addr,
             database_url,
             jwt_secret,
             jwt_expiration_seconds,
             cors_allowed_origins,
+            redis,
+            pool,
+            rate_limit,
         }
     }
 }
