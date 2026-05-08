@@ -34,8 +34,10 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 pub struct AuthenticatedUser {
     /// 用户 ID
     pub user_id: Uuid,
-    /// 用户角色
+    /// 用户主要角色
     pub role: String,
+    /// 用户拥有的所有角色标识列表
+    pub roles: Vec<String>,
 }
 
 /// JWT 鉴权中间件
@@ -69,10 +71,11 @@ pub async fn auth_middleware(
         .verify(token)
         .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "令牌无效或已过期"))?;
 
-    // 将认证用户信息注入请求扩展
+    // 将认证用户信息注入请求扩展（包含角色列表）
     let authenticated_user = AuthenticatedUser {
         user_id: claims.sub,
-        role: claims.role,
+        role: claims.role.clone(),
+        roles: claims.roles.clone(),
     };
     req.extensions_mut().insert(authenticated_user);
 
@@ -106,14 +109,14 @@ where
 
 /// 角色权限验证中间件
 ///
-/// 用于需要特定角色才能访问的路由。
+/// 检查当前用户是否拥有指定角色。
+/// 优先检查 `roles` 列表（RBAC），回退到 `role` 主角色字段。
 ///
 /// # 示例
 ///
 /// ```ignore
 /// .route_layer(middleware::from_fn(require_role("admin")))
 /// ```
-#[allow(dead_code)]
 pub async fn require_role(
     role: &'static str,
     req: Request,
@@ -123,10 +126,14 @@ pub async fn require_role(
         error_response(StatusCode::UNAUTHORIZED, "未认证")
     })?;
 
-    if auth_user.role != role {
+    // 先检查 roles 列表，再回退到 role 主字段
+    let has_role = auth_user.roles.iter().any(|r| r == role)
+        || auth_user.role == role;
+
+    if !has_role {
         return Err(error_response(
             StatusCode::FORBIDDEN,
-            format!("需要 {role} 角色权限，当前角色: {}", auth_user.role),
+            format!("需要 {role} 角色权限"),
         ));
     }
 

@@ -14,8 +14,10 @@ use uuid::Uuid;
 pub struct Claims {
     /// 用户 ID
     pub sub: Uuid,
-    /// 用户角色（admin / user）
+    /// 用户主要角色（向后兼容，保持与旧令牌的一致性）
     pub role: String,
+    /// 用户拥有的所有角色标识列表（RBAC 权限判断依据）
+    pub roles: Vec<String>,
     /// 签发时间（Unix 时间戳，JWT 标准要求 u64）
     pub iat: u64,
     /// 过期时间（Unix 时间戳，JWT 标准要求 u64）
@@ -41,7 +43,8 @@ impl JwtUtil {
     /// # Arguments
     ///
     /// * `user_id` - 用户 UUID
-    /// * `role` - 用户角色
+    /// * `role` - 用户主要角色
+    /// * `roles` - 用户拥有的所有角色标识列表
     /// * `expiration_seconds` - 过期时间（秒）
     ///
     /// # Returns
@@ -51,12 +54,14 @@ impl JwtUtil {
         &self,
         user_id: Uuid,
         role: &str,
+        roles: &[String],
         expiration_seconds: u64,
     ) -> Result<String, jsonwebtoken::errors::Error> {
         let now = chrono::Utc::now().timestamp() as u64;
         let claims = Claims {
             sub: user_id,
             role: role.to_string(),
+            roles: roles.to_vec(),
             iat: now,
             exp: now + expiration_seconds,
         };
@@ -102,10 +107,13 @@ mod tests {
     fn test_sign_and_verify() {
         let jwt = JwtUtil::new("test_secret_key");
         let user_id = Uuid::new_v4();
-        let token = jwt.sign(user_id, "user", 3600).unwrap();
+        let roles = vec!["user".to_string(), "admin".to_string()];
+        let token = jwt.sign(user_id, "admin", &roles, 3600).unwrap();
         let claims = jwt.verify(&token).unwrap();
         assert_eq!(claims.sub, user_id);
-        assert_eq!(claims.role, "user");
+        assert_eq!(claims.role, "admin");
+        assert!(claims.roles.contains(&"user".to_string()));
+        assert!(claims.roles.contains(&"admin".to_string()));
     }
 
     #[test]

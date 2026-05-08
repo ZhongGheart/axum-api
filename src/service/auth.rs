@@ -2,11 +2,13 @@
 //!
 //! 封装用户注册、登录、获取当前用户等业务逻辑。
 //! 调用 Repository 层进行数据访问，调用 Utils 层处理密码和 JWT。
+//! RBAC：注册时自动分配默认角色，登录时将角色列表写入 JWT。
 
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::model::{LoginRequest, LoginResponse, UserInfo, RegisterRequest};
+use crate::model::{LoginRequest, LoginResponse, RegisterRequest, UserInfo};
+use crate::repository::role::RoleRepository;
 use crate::repository::user::UserRepository;
 use crate::utils::jwt::JwtUtil;
 use crate::utils::password::{hash_password, verify_password};
@@ -18,6 +20,8 @@ use crate::utils::password::{hash_password, verify_password};
 pub struct AuthService {
     /// 用户仓储
     pub user_repo: UserRepository,
+    /// 角色仓储（用于 RBAC 角色查询与分配）
+    pub role_repo: RoleRepository,
     /// JWT 工具
     pub jwt_util: JwtUtil,
     /// JWT 过期时间（秒）
@@ -28,11 +32,13 @@ impl AuthService {
     /// 创建新的 AuthService 实例
     pub fn new(
         user_repo: UserRepository,
+        role_repo: RoleRepository,
         jwt_util: JwtUtil,
         jwt_expiration_seconds: u64,
     ) -> Self {
         Self {
             user_repo,
+            role_repo,
             jwt_util,
             jwt_expiration_seconds,
         }
@@ -40,10 +46,12 @@ impl AuthService {
 
     /// 用户注册
     ///
-    /// 1. 校验用户名和邮箱是否已存在
-    /// 2. 对密码进行 Argon2 哈希
-    /// 3. 创建用户记录
-    /// 4. 返回用户信息（不含密码）
+    /// 1. 校验参数
+    /// 2. 检查用户名/邮箱是否已存在
+    /// 3. 对密码进行 Argon2 哈希
+    /// 4. 创建用户记录
+    /// 5. 分配默认 user 角色（事务保证）
+    /// 6. 返回用户信息（不含密码）
     pub async fn register(&self, req: RegisterRequest) -> Result<UserInfo, AppError> {
         // 参数基本校验
         if req.username.len() < 3 || req.username.len() > 50 {
@@ -90,7 +98,12 @@ impl AuthService {
             )
             .await?;
 
-        tracing::info!("新用户注册成功: {}", user.username);
+        // 为新用户分配默认 user 角色
+        self.role_repo
+            .assign_role_to_user(user.id, "user")
+            .await?;
+
+        tracing::info!("新用户注册成功: {} (已分配 user 角色)", user.username);
 
         Ok(UserInfo::from(user))
     }
@@ -99,8 +112,9 @@ impl AuthService {
     ///
     /// 1. 通过用户名/邮箱查找用户
     /// 2. 验证密码
-    /// 3. 签发 JWT 令牌
-    /// 4. 返回令牌
+    /// 3. 查询用户所有角色（RBAC）
+    /// 4. 签发 JWT 令牌（含角色列表）
+    /// 5. 返回令牌
     pub async fn login(&self, req: LoginRequest) -> Result<LoginResponse, AppError> {
         // 查找用户（支持用户名或邮箱登录）
         let user = self
@@ -122,10 +136,23 @@ impl AuthService {
             return Err(AppError::ValidationFailed("用户名或密码错误".to_string()));
         }
 
-        // 签发 JWT 令牌
+        // 查询用户所有角色（来自 user_roles 表）
+        let roles = self
+            .role_repo
+            .find_roles_by_user_id(user.id)
+            .await?;
+
+        tracing::debug!("用户 {} 拥有的角色: {:?}", user.username, roles);
+
+        // 签发 JWT 令牌（包含角色列表）
         let token = self
             .jwt_util
-            .sign(user.id, &user.role.to_string(), self.jwt_expiration_seconds)
+            .sign(
+                user.id,
+                &user.role.to_string(),
+                &roles,
+                self.jwt_expiration_seconds,
+            )
             .map_err(|e| AppError::InternalServerError(format!("JWT 签发失败: {e}")))?;
 
         tracing::info!("用户登录成功: {}", user.username);
