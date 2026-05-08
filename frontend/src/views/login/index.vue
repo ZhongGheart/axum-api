@@ -162,15 +162,17 @@ async function handleLogin(): Promise<void> {
     saveRemembered()
 
     // 调用 user store 登录（内部做 SHA-256 哈希）
-    await userStore.login({
+    const result = await userStore.login({
       username: formData.value.username,
       password: formData.value.password,
     })
 
-    showSuccess('登录成功')
-    router.push('/')
-  } catch {
-    // 错误已在 store 和拦截器中处理
+    if (result) {
+      showSuccess('登录成功')
+      router.push('/')
+    }
+  } catch (e) {
+    console.error('登录失败:', e)
   } finally {
     submitting.value = false
   }
