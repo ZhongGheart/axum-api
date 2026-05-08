@@ -1,5 +1,5 @@
 # ============================================
-# Dockerfile — 多阶段构建
+# Dockerfile — 后端多阶段构建
 # ============================================
 # 阶段一：编译构建
 # ============================================
@@ -12,29 +12,30 @@ RUN apt-get update && \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# 创建工作目录
 WORKDIR /app
 
-# 先复制 Cargo.toml 和 Cargo.lock 以缓存依赖层
-COPY Cargo.toml ./
+# ── 依赖缓存层 ──────────────────────────────
+# 先复制 Cargo.toml 和 Cargo.lock（如果存在）
+COPY Cargo.toml Cargo.lock* ./
 
-# 创建空的 main.rs 以构建依赖缓存
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release 2>/dev/null || true
-RUN rm -rf src
+# 创建虚拟 main.rs 以缓存依赖编译
+RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+    mkdir migrations && \
+    cargo build --release 2>/dev/null || true && \
+    rm -rf src
 
-# 复制完整源代码
+# ── 完整编译 ─────────────────────────────────
 COPY . .
-
-# 生产构建
-RUN cargo build --release
+RUN cargo build --release && \
+    strip target/release/axum-api && \
+    rm -rf target/release/build target/release/.fingerprint target/release/deps target/release/incremental
 
 # ============================================
-# 阶段二：运行镜像（极简尺寸）
+# 阶段二：运行镜像（极简 debian slim）
 # ============================================
 FROM debian:bookworm-slim AS runtime
 
-# 安装 CA 证书和 PostgreSQL 客户端库（运行时依赖）
+# 安装运行时依赖
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -46,19 +47,21 @@ RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
 
 WORKDIR /app
 
-# 从构建阶段复制编译产物
+# 复制编译产物和运行时文件
 COPY --from=builder /app/target/release/axum-api /app/axum-api
 COPY --from=builder /app/.env.example /app/.env
 COPY --from=builder /app/migrations /app/migrations
 
-# 设置权限
-RUN chown -R app:app /app
+# 安全配置
+RUN chown -R app:app /app && \
+    chmod 500 /app/axum-api && \
+    chmod 400 /app/.env
 
-# 切换到非 root 用户
 USER app
 
-# 暴露端口
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["/app/axum-api"]
+
 EXPOSE 8080
 
-# 运行
 CMD ["/app/axum-api"]

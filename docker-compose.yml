@@ -1,0 +1,80 @@
+# ============================================
+# Docker Compose 全栈编排
+# ============================================
+# 启动方式:
+#   docker compose up -d
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# ============================================
+
+version: "3.9"
+
+services:
+  # ── PostgreSQL 数据库 ─────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: axum-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: axum_api
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis 缓存（Token黑名单+限流） ────────
+  redis:
+    image: redis:7-alpine
+    container_name: axum-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Rust Axum 后端 API ────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: axum-api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "8080"
+      DATABASE_URL: "postgres://postgres:${DB_PASSWORD:-password}@postgres:5432/axum_api"
+      REDIS_URL: "redis://redis:6379"
+      JWT_SECRET: ${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      JWT_EXPIRATION_SECONDS: "604800"
+      RUST_LOG: "info"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── Vue 前端管理面板 ──────────────────────
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: axum-web
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

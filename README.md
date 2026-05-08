@@ -1,228 +1,198 @@
-# Axum API — 生产级 Rust 后端项目
+# Axum Admin — 全栈管理系统
 
-基于 [Axum](https://github.com/tokio-rs/axum) 框架构建的生产级 RESTful API 后端，采用纯 Rust 实现。
-
-## 技术栈
-
-| 类别 | 技术 | 说明 |
-|------|------|------|
-| **Web 框架** | Axum 0.8 | 基于 Tokio 的高性能异步 Web 框架 |
-| **异步运行时** | Tokio | Rust 生态标准异步运行时 |
-| **数据库** | PostgreSQL + SQLx | 纯 SQL 方式，编译期 SQL 校验 |
-| **序列化** | serde + serde_json | 高性能 JSON 序列化/反序列化 |
-| **错误处理** | thiserror + anyhow | 自定义错误枚举 + 便捷错误传播 |
-| **日志追踪** | tracing + tracing-subscriber | 结构化日志，span 追踪 |
-| **配置管理** | dotenvy | 从 `.env` 文件加载配置 |
-| **密码加密** | Argon2 | OWASP 推荐的密码哈希算法 |
-| **JWT 认证** | jsonwebtoken | 无状态 JWT 登录鉴权 |
-| **CORS/中间件** | tower-http | CORS、Trace 等中间件 |
+基于 **Rust Axum** 后端 + **Vue 3** 前端的企业级全栈管理平台。
 
 ## 项目结构
 
 ```
-src/
-├── main.rs            # 应用入口：启动服务器、初始化日志
-├── config/            # 配置层：从 .env 加载配置
-├── router/            # 路由层：注册 API 路由分组
-├── controller/        # 控制器层：处理 HTTP 请求
-├── service/           # 服务层：业务逻辑
-├── repository/        # 数据访问层：SQLx 数据库操作
-├── model/             # 模型层：数据实体与响应结构
-├── middleware/         # 中间件层：JWT 鉴权、权限拦截
-├── error/             # 错误层：全局异常处理
-└── utils/             # 工具层：JWT、密码哈希
+axum-api/
+├── src/                     # Rust 后端源码
+│   ├── main.rs              # 入口：日志、配置、优雅关闭
+│   ├── config/              # 配置层（DB、Redis、JWT、CORS、限流）
+│   ├── router/              # 路由注册 + 全局中间件链
+│   ├── controller/          # 控制器层（auth、user、role、rbac）
+│   ├── service/             # 服务层（认证、RBAC）
+│   ├── repository/          # 数据访问层（SQLx 纯SQL）
+│   ├── model/               # 实体 + DTO 模型
+│   ├── middleware/           # 中间件（JWT鉴权、限流、请求ID）
+│   ├── error/               # 全局异常处理
+│   └── utils/               # 工具（JWT、密码哈希、Redis）
+├── frontend/                # Vue 3 前端源码
+│   ├── src/
+│   │   ├── api/             # Axios 请求层（对齐后端 controller）
+│   │   ├── components/      # 通用组件（BaseTable、SearchForm等）
+│   │   ├── views/           # 页面（login、register、system/）
+│   │   ├── router/          # 路由配置 + 鉴权守卫
+│   │   ├── stores/          # Pinia 状态管理
+│   │   ├── directives/      # 自定义指令（v-permission）
+│   │   └── utils/           # 工具（加密存储、SHA256、防抖等）
+│   ├── nginx.conf           # Nginx 部署配置
+│   └── Dockerfile           # 多阶段构建 -> nginx alpine
+├── migrations/              # 数据库迁移 SQL
+├── Cargo.toml
+├── Dockerfile               # 后端多阶段构建 -> debian slim
+└── docker-compose.yml       # 全栈编排（pg + redis + api + web）
 ```
 
-### 分层调用链
+## 技术栈
 
-```
-HTTP Request
-  → Router (路由匹配)
-    → Middleware (JWT 鉴中间件)
-      → Controller (参数校验)
-        → Service (业务逻辑)
-          → Repository (SQLx 数据库操作)
-            → PostgreSQL
-```
-
-## API 端点
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| POST | `/api/auth/register` | No | 用户注册 |
-| POST | `/api/auth/login` | No | 用户登录，返回 JWT |
-| GET | `/api/auth/me` | Yes | 获取当前用户信息 |
-| GET | `/api/health` | No | 健康检查 |
-
-### 统一响应格式
-
-```json
-{
-  "code": 200,
-  "message": "success",
-  "data": { ... }
-}
-```
+| 层级 | 技术 | 版本 |
+|------|------|------|
+| **后端** | Rust + Axum + Tokio | 1.82 / 0.8 |
+| **数据库** | PostgreSQL + SQLx | 16 / 0.8 |
+| **缓存** | Redis | 7 |
+| **前端** | Vue 3 + TypeScript + Vite | 3.5 / 6 |
+| **UI** | Naive UI | 2.41 |
+| **部署** | Docker + Docker Compose + Nginx | — |
 
 ## 快速开始
 
-### 前置条件
+### 环境要求
 
 - Rust 1.82+
-- PostgreSQL 14+
-- Docker（可选，用于容器部署）
+- Node.js 18+
+- pnpm 最新版（`corepack enable && corepack prepare pnpm@latest --activate`）
+- Docker & Docker Compose（可选）
 
-### 1. 克隆项目
+### 本地运行（前后端分离）
 
-```bash
-git clone <your-repo-url> axum-api
-cd axum-api
-```
-
-### 2. 配置环境变量
+#### 1. 配置环境变量
 
 ```bash
 cp .env.example .env
-# 编辑 .env 文件，修改数据库连接等配置
+# 编辑 .env，修改 DATABASE_URL、JWT_SECRET、REDIS_URL
 ```
 
-### 3. 创建数据库
+#### 2. 创建数据库
 
 ```bash
-# 登录 PostgreSQL 并创建数据库
-psql -U postgres
-CREATE DATABASE axum_api;
-\q
-
-# 运行数据库迁移
-DATABASE_URL=postgres://postgres:password@localhost:5432/axum_api sqlx migrate run
+psql -U postgres -c "CREATE DATABASE axum_api;"
+DATABASE_URL="postgres://postgres:password@localhost:5432/axum_api" sqlx migrate run
 ```
 
-### 4. 编译并运行
+#### 3. 启动后端
 
 ```bash
-# 开发模式
+# 开发模式（自动重载需安装 cargo-watch）
 cargo run
-
-# 或使用 Release 模式
-cargo run --release
+# 或使用 RUST_LOG=debug cargo run 查看详细日志
 ```
 
-### 5. 验证服务
+#### 4. 启动前端
 
 ```bash
-# 健康检查
-curl http://localhost:8080/api/health
-
-# 注册用户
-curl -X POST http://localhost:8080/api/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"username":"testuser","email":"test@example.com","password":"password123"}'
-
-# 登录
-curl -X POST http://localhost:8080/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"testuser","password":"password123"}'
-
-# 获取当前用户信息（使用登录返回的 token）
-curl http://localhost:8080/api/auth/me \
-  -H "Authorization: Bearer <your-jwt-token>"
+cd frontend
+pnpm install
+pnpm dev
+# 默认监听 http://localhost:3000，自动代理 /api 到后端
 ```
 
-## Docker 部署
+#### 5. 访问
 
-### 使用 Docker Compose（推荐）
+打开 `http://localhost:3000`，使用 `admin / admin123` 登录。
 
-创建 `docker-compose.yml`：
-
-```yaml
-version: "3.9"
-services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: axum_api
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-
-  api:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      DATABASE_URL: postgres://postgres:password@postgres:5432/axum_api
-      JWT_SECRET: "change-this-to-a-random-secret"
-    depends_on:
-      - postgres
-
-volumes:
-  pgdata:
-```
+### Docker Compose 一键部署（推荐）
 
 ```bash
+# 全栈启动（PostgreSQL + Redis + 后端 + 前端）
 docker compose up -d
+
+# 查看日志
+docker compose logs -f api
+
+# 停止
+docker compose down
+
+# 停止并删除数据卷
+docker compose down -v
 ```
 
-### 单容器构建
+访问 `http://localhost`，Nginx 自动代理 `/api` 到后端。
+
+### Docker 单容器运行
 
 ```bash
+# 后端
 docker build -t axum-api .
 docker run -p 8080:8080 --env-file .env axum-api
+
+# 前端
+cd frontend
+docker build -t axum-web .
+docker run -p 80:80 axum-web
 ```
 
-## 配置说明
+## API 文档
 
-参考 `.env.example` 文件：
+| Method | Path | Auth | 角色 | 说明 |
+|--------|------|------|------|------|
+| GET | `/api/health` | — | — | 健康检查 |
+| POST | `/api/auth/register` | — | — | 用户注册 |
+| POST | `/api/auth/login` | — | — | 登录（返回 JWT） |
+| GET | `/api/auth/me` | JWT | — | 当前用户信息 |
+| POST | `/api/auth/logout` | JWT | — | 登出（Redis 黑名单） |
+| GET | `/api/admin/test` | JWT | admin | 权限测试 |
+| GET | `/api/admin/users` | JWT | admin | 用户列表（分页） |
+| POST | `/api/admin/users` | JWT | admin | 新建用户 |
+| PUT | `/api/admin/users/:id` | JWT | admin | 更新用户 |
+| DELETE | `/api/admin/users/:id` | JWT | admin | 删除用户 |
+| GET | `/api/admin/roles` | JWT | admin | 角色列表 |
+| GET | `/api/admin/users/:id/roles` | JWT | admin | 用户角色 |
+| POST | `/api/admin/users/:id/roles` | JWT | admin | 分配角色 |
+
+## 环境变量
+
+### 后端（.env）
 
 | 变量 | 必需 | 默认值 | 说明 |
 |------|------|--------|------|
 | `SERVER_HOST` | 否 | `0.0.0.0` | 监听地址 |
 | `SERVER_PORT` | 否 | `8080` | 监听端口 |
-| `DATABASE_URL` | **是** | - | PostgreSQL 连接字符串 |
-| `JWT_SECRET` | **是** | - | JWT 签名密钥 |
+| `DATABASE_URL` | **是** | — | PostgreSQL 连接字符串 |
+| `REDIS_URL` | 否 | `redis://127.0.0.1:6379` | Redis 连接字符串 |
+| `JWT_SECRET` | **是** | — | JWT 签名密钥 |
 | `JWT_EXPIRATION_SECONDS` | 否 | `604800` | JWT 过期时间（秒） |
 | `CORS_ALLOWED_ORIGINS` | 否 | `*` | CORS 允许的来源 |
+| `DB_POOL_MAX_SIZE` | 否 | `20` | 数据库连接池大小 |
+| `RATE_LIMIT_IP_MAX` | 否 | `100` | 单 IP 每分钟最大请求数 |
 
-## 日志配置
+### 前端（.env.production）
 
-通过 `RUST_LOG` 环境变量控制日志级别：
-
-```bash
-# 调试模式
-RUST_LOG=debug cargo run
-
-# 只显示当前模块的 info 及以上级别
-RUST_LOG=info cargo run
-
-# 禁用第三方库的日志
-RUST_LOG=info,axum=warn,tower_http=warn cargo run
-```
-
-## 生产部署建议
-
-1. **JWT 密钥**：使用足够长的随机字符串（建议 64 字节以上）
-2. **数据库连接池**：根据并发量调整 SQLx 连接池大小
-3. **日志收集**：配置 JSON 格式日志输出到日志收集系统
-4. **健康检查**：配置负载均衡器的健康检查端点
-5. **HTTPS**：使用反向代理（如 Nginx）终止 TLS
-6. **资源限制**：Docker 部署时设置 CPU/内存限制
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `VITE_API_BASE_URL` | `/api` | API 基础路径（同域部署无需修改） |
 
 ## 开发命令
 
 ```bash
-# 编译
-cargo build
+# 后端
+cargo build            # 编译
+cargo test             # 运行测试
+cargo clippy           # 代码检查
+cargo fmt              # 代码格式化
 
-# 运行测试
-cargo test
-
-# 检查代码（需要先安装 clippy）
-cargo clippy -- -D warnings
-
-# 格式化代码
-cargo fmt
+# 前端
+cd frontend
+pnpm dev               # 开发服务器
+pnpm build             # 生产构建
+pnpm lint              # ESLint 检查
+pnpm format            # Prettier 格式化
 ```
+
+## 默认账号
+
+| 用户名 | 密码 | 角色 |
+|--------|------|------|
+| `admin` | `admin123` | admin + user |
+| 新注册用户 | 注册时设置 | user |
+
+## 生产部署建议
+
+1. **JWT 密钥**：使用 `openssl rand -base64 64` 生成强密钥
+2. **HTTPS**：Nginx 配置 SSL 证书，前端使用 `https://`
+3. **数据库**：使用托管数据库（RDS）或设置密码强策略
+4. **Redis**：设置密码 `requirepass`，使用 ACL 控制
+5. **日志**：配置 `RUST_LOG=info`，使用 JSON 格式输出到日志系统
+6. **监控**：配置 `/api/health` 健康检查端点
+7. **资源**：Docker 设置 CPU/内存限制
+8. **备份**：定期备份 PostgreSQL 数据卷
