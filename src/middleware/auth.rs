@@ -57,11 +57,15 @@ pub async fn auth_middleware(
         .headers()
         .get("Authorization")
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "缺少 Authorization 请求头"))?;
+        .ok_or_else(|| {
+            tracing::warn!("auth_middleware: 缺少 Authorization 请求头");
+            error_response(StatusCode::UNAUTHORIZED, "缺少 Authorization 请求头")
+        })?;
 
     let token = auth_header
         .strip_prefix("Bearer ")
         .ok_or_else(|| {
+            tracing::warn!("auth_middleware: Authorization 格式错误: {}", &auth_header[..20.min(auth_header.len())]);
             error_response(
                 StatusCode::UNAUTHORIZED,
                 "Authorization 格式错误，请使用 Bearer <token>",
@@ -71,7 +75,10 @@ pub async fn auth_middleware(
     let claims: Claims = state
         .jwt_util
         .verify(token)
-        .map_err(|_| error_response(StatusCode::UNAUTHORIZED, "令牌无效或已过期"))?;
+        .map_err(|e| {
+            tracing::warn!("auth_middleware: JWT 验证失败: {:?}", e);
+            error_response(StatusCode::UNAUTHORIZED, "令牌无效或已过期")
+        })?;
 
     // 检查 Token 是否在黑名单中（已下线/登出）
     if state
@@ -129,6 +136,7 @@ pub async fn require_role(
         || auth_user.role == role;
 
     if !has_role {
+        tracing::warn!("require_role({}): 用户 {} 角色 {:?} 权限不足", role, auth_user.user_id, auth_user.roles);
         return Err(error_response(
             StatusCode::FORBIDDEN,
             format!("需要 {role} 角色权限"),
