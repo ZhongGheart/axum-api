@@ -86,12 +86,21 @@ impl RbacService {
         .await
         .map_err(|e| AppError::InternalServerError(format!("查询 admin 用户失败: {e}")))?;
 
+        // 先 SHA256 再 Argon2，与前端登录流程保持一致
+        let sha256_hash = crate::utils::crypto::sha256_hex("admin123");
+        let password_hash = hash_password(&sha256_hash)
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+
         let admin_id = if let Some(admin) = admin_user {
+            // admin 已存在，更新密码哈希（兼容旧格式迁移）
+            sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+                .bind(&password_hash)
+                .bind(admin.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::InternalServerError(format!("更新 admin 密码失败: {e}")))?;
             admin.id
         } else {
-            let password_hash = hash_password("admin123")
-                .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-
             let new_admin: (Uuid,) = sqlx::query_as(
                 r#"
                 INSERT INTO users (username, email, password_hash, role, is_active)

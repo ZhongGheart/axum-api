@@ -41,6 +41,9 @@ redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
 # 密码加密
 argon2 = "0.5"
 
+# SHA-256 哈希（对齐前端密码传输）
+sha2 = "0.10"
+
 # JWT
 jsonwebtoken = "9"
 
