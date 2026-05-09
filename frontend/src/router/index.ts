@@ -75,6 +75,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '后端能力' },
       },
       {
+        path: 'demo/dict',
+        name: 'DemoDict',
+        component: () => import('@/views/demo/dict.vue'),
+        meta: { title: '字典组件' },
+      },
+      {
         path: 'system',
         name: 'System',
         redirect: '/system/user',
@@ -103,6 +109,12 @@ const routes: RouteRecordRaw[] = [
             name: 'SystemLog',
             component: () => import('@/views/system/log/index.vue'),
             meta: { title: '系统日志', roles: ['admin'] },
+          },
+          {
+            path: 'dict',
+            name: 'SystemDict',
+            component: () => import('@/views/system/dict/index.vue'),
+            meta: { title: '字典管理', roles: ['admin'] },
           },
         ],
       },

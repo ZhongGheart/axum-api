@@ -33,8 +33,9 @@ import { ref, reactive, onMounted, h } from 'vue'
 import { NTag } from 'naive-ui'
 import type { DataTableColumn } from 'naive-ui'
 import { auditApi } from '@/api/audit'
-import type { AuditLogItem } from '@/api/audit' // type used in fetchLogs
+import type { AuditLogItem } from '@/api/audit'
 import { showSuccess, showError } from '@/utils/message'
+import { getToken } from '@/utils/storage'
 
 const loading = ref(false)
 const logList = ref<AuditLogItem[]>([])
@@ -76,8 +77,12 @@ function resetFilters() { filters.action = ''; filters.username = ''; page.value
 
 async function handleExport() {
   try {
-    const res = await auditApi.exportLogs()
-    const blob = (res as unknown as { data: Blob }).data
+    const token = getToken()
+    const res = await fetch('/api/admin/logs/audit/export', {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+    if (!res.ok) throw new Error('导出失败')
+    const blob = await res.blob()
     const url = window.URL.createObjectURL(blob)
     const a = document.createElement('a'); a.href = url; a.download = '操作日志.xlsx'; a.click()
     window.URL.revokeObjectURL(url)

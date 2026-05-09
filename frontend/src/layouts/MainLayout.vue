@@ -139,6 +139,11 @@ const menuOptions: MenuOption[] = [
         key: '/demo/backend',
         icon: renderIcon(SettingsIcon),
       },
+      {
+        label: '字典组件',
+        key: '/demo/dict',
+        icon: renderIcon(SettingsIcon),
+      },
     ],
   },
   {
@@ -165,6 +170,11 @@ const menuOptions: MenuOption[] = [
       {
         label: '系统日志',
         key: '/system/log',
+        icon: renderIcon(SettingsIcon),
+      },
+      {
+        label: '字典管理',
+        key: '/system/dict',
         icon: renderIcon(SettingsIcon),
       },
     ],

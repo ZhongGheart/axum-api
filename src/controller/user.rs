@@ -183,7 +183,6 @@ pub async fn assign_user_roles(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     Json(req): Json<AssignUserRolesRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    use sqlx::PgPool;
     let pool = &state.auth_service.user_repo.pool;
     // 清除旧角色
     sqlx::query("DELETE FROM user_roles WHERE user_id = $1").bind(id).execute(pool).await.ok();

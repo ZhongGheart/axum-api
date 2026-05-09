@@ -13,11 +13,12 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
-use crate::controller::{auth, demo, menu, rbac, role, user};
+use crate::controller::{auth, demo, dict, menu, rbac, role, user};
 use crate::error::AppError;
 use crate::middleware::auth::auth_middleware;
 use crate::middleware::rate_limit::rate_limit_middleware;
 use crate::middleware::request_id::request_id_middleware;
+use crate::repository::dict::DictRepository;
 use crate::repository::menu::MenuRepository;
 use crate::repository::role::RoleRepository;
 use crate::repository::user::UserRepository;
@@ -35,6 +36,7 @@ pub struct AppState {
     pub jwt_util: Arc<JwtUtil>,
     pub redis_client: Arc<RedisClient>,
     pub menu_repo: MenuRepository,
+    pub dict_repo: DictRepository,
 }
 
 /// 构建应用路由
@@ -66,6 +68,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
     let user_repo = UserRepository::new(pool.clone());
     let role_repo = RoleRepository::new(pool.clone());
     let menu_repo = MenuRepository::new(pool.clone());
+    let dict_repo = DictRepository::new(pool.clone(), Some(redis_client.as_ref().clone()));
     let auth_service = AuthService::new(
         user_repo,
         role_repo.clone(),
@@ -82,6 +85,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         jwt_util: Arc::clone(&jwt_util),
         redis_client: Arc::clone(&redis_client),
         menu_repo,
+        dict_repo,
     };
 
     // ── 配置 CORS ──────────────────────────────────────────────
@@ -127,7 +131,8 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route("/api/admin/test", get(rbac::admin_test))
         .route("/api/admin/users", get(user::list_users).post(user::create_user))
         .route("/api/admin/users/{id}", axum::routing::put(user::update_user).delete(user::delete_user))
-        .route("/api/admin/roles", get(role::list_roles))
+        .route("/api/admin/roles", get(role::list_roles).post(role::create_role))
+        .route("/api/admin/roles/{id}", axum::routing::put(role::update_role).delete(role::delete_role))
         .route("/api/admin/users/{id}/roles", get(role::get_user_roles).post(role::assign_user_role))
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
@@ -149,6 +154,20 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         }))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
+    // ── 数据字典路由（仅 admin） ────────────────────────────
+    let dict_routes = Router::new()
+        .route("/api/admin/dict/types", get(dict::list_types).post(dict::create_type))
+        .route("/api/admin/dict/types/{id}", axum::routing::put(dict::update_type).delete(dict::delete_type))
+        .route("/api/admin/dict/items", get(dict::list_items).post(dict::create_item))
+        .route("/api/admin/dict/items/{id}", axum::routing::put(dict::update_item).delete(dict::delete_item))
+        .route("/api/admin/dict/{code}/items", get(dict::get_items_by_code))
+        .route("/api/admin/dict/cached", get(dict::list_all_cached))
+        .route("/api/admin/dict/refresh", post(dict::refresh_cache))
+        .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+            async move { crate::middleware::auth::require_role("admin", req, next).await }
+        }))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
     // ── 能力测试路由（仅 admin） ────────────────────────────
     let demo_routes = Router::new()
         .route("/api/admin/export/users", axum::routing::get(demo::export_users))
@@ -159,8 +178,6 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route("/api/admin/users/{id}/status", axum::routing::put(user::toggle_user_status))
         .route("/api/admin/users/{id}/reset-password", axum::routing::post(user::reset_user_password))
         .route("/api/admin/users/{id}/roles", axum::routing::put(user::assign_user_roles))
-        .route("/api/admin/roles", axum::routing::post(role::create_role))
-        .route("/api/admin/roles/{id}", axum::routing::put(role::update_role).delete(role::delete_role))
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
@@ -177,6 +194,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .merge(admin_routes)
         .merge(demo_routes)
         .merge(menu_routes)
+        .merge(dict_routes)
         // 全局中间件：限流（最外层）
         .layer(middleware::from_fn_with_state(
             rate_limit_state,

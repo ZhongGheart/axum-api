@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod demo;
+pub mod dict;
 pub mod menu;
 pub mod rbac;
 pub mod role;

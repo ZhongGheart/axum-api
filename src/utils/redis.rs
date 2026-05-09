@@ -161,6 +161,25 @@ impl RedisClient {
             .await
     }
 
+    // ──────────────────────────────────────────────
+    // 通用键值对（字典缓存等）
+    // ──────────────────────────────────────────────
+
+    /// 取字符串值
+    pub async fn get_string(&self, key: &str) -> Result<Option<String>> {
+        let mut conn = self.conn.clone();
+        conn.get(key).await
+            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis GET失败: {e}")))
+    }
+
+    /// 设置字符串值（含过期时间）
+    pub async fn set_string(&self, key: &str, value: &str, ttl_seconds: u64) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let _: () = conn.set_ex(key, value, ttl_seconds).await
+            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis SET失败: {e}")))?;
+        Ok(())
+    }
+
     /// 检查用户级限流
     pub async fn check_user_rate_limit(
         &self,
