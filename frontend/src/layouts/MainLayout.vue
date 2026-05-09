@@ -128,6 +128,18 @@ const menuOptions: MenuOption[] = [
     label: '组件示例',
     key: '/demo',
     icon: renderIcon(SettingsIcon),
+    children: [
+      {
+        label: '前端组件',
+        key: '/demo',
+        icon: renderIcon(SettingsIcon),
+      },
+      {
+        label: '后端能力',
+        key: '/demo/backend',
+        icon: renderIcon(SettingsIcon),
+      },
+    ],
   },
   {
     label: '系统管理',

@@ -9,7 +9,7 @@ authors = ["dev"]
 # Web框架
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
 
 # 数据库
 sqlx = { version = "0.8", features = [
@@ -53,3 +53,11 @@ chrono = { version = "0.4", features = ["serde"] }
 # UUID
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Excel 导出
+rust_xlsxwriter = "0.82"
+
+# 参数校验
+validator = { version = "0.20", features = ["derive"] }
+
+# 文件下载（响应头）
+axum-extra = { version = "0.10", features = ["typed-header"] }

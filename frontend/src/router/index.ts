@@ -69,6 +69,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '组件示例' },
       },
       {
+        path: 'demo/backend',
+        name: 'DemoBackend',
+        component: () => import('@/views/demo/backend.vue'),
+        meta: { title: '后端能力' },
+      },
+      {
         path: 'system',
         name: 'System',
         redirect: '/system/user',

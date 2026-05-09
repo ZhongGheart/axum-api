@@ -13,7 +13,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
-use crate::controller::{auth, rbac, role, user};
+use crate::controller::{auth, demo, rbac, role, user};
 use crate::error::AppError;
 use crate::middleware::auth::auth_middleware;
 use crate::middleware::rate_limit::rate_limit_middleware;
@@ -139,12 +139,26 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
             auth_middleware,
         ));
 
+    // ── 能力测试路由（仅 admin） ────────────────────────────
+    let demo_routes = Router::new()
+        .route("/api/admin/export/users", axum::routing::get(demo::export_users))
+        .route("/api/admin/validate", axum::routing::post(demo::validate_test))
+        .route("/api/admin/audit-logs", axum::routing::get(demo::list_audit_logs))
+        .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+            async move { crate::middleware::auth::require_role("admin", req, next).await }
+        }))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
     // ── 合并所有路由并应用全局中间件 ──────────────────────────
     let rate_limit_state = (Arc::clone(&redis_client), Arc::new(config.rate_limit));
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
         .merge(admin_routes)
+        .merge(demo_routes)
         // 全局中间件：限流（最外层）
         .layer(middleware::from_fn_with_state(
             rate_limit_state,

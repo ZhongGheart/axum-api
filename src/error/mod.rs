@@ -79,6 +79,13 @@ impl IntoResponse for AppError {
     }
 }
 
+/// 将 rust_xlsxwriter 错误转换为 AppError
+impl From<rust_xlsxwriter::XlsxError> for AppError {
+    fn from(e: rust_xlsxwriter::XlsxError) -> Self {
+        AppError::InternalServerError(format!("Excel 错误: {e}"))
+    }
+}
+
 /// 将 anyhow::Error 转换为 AppError 的便捷实现
 impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
