@@ -63,6 +63,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '首页' },
       },
       {
+        path: 'demo',
+        name: 'Demo',
+        component: () => import('@/views/demo/index.vue'),
+        meta: { title: '组件示例' },
+      },
+      {
         path: 'system',
         name: 'System',
         redirect: '/system/user',

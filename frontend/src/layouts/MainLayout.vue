@@ -125,6 +125,11 @@ const menuOptions: MenuOption[] = [
     icon: renderIcon(HomeIcon),
   },
   {
+    label: '组件示例',
+    key: '/demo',
+    icon: renderIcon(SettingsIcon),
+  },
+  {
     label: '系统管理',
     key: '/system',
     icon: renderIcon(SettingsIcon),
