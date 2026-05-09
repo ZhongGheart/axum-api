@@ -16,18 +16,22 @@ use crate::config::Config;
 use crate::controller::{auth, demo, dict, menu, rbac, role, user};
 use crate::error::AppError;
 use crate::middleware::auth::auth_middleware;
+use crate::middleware::captcha::{captcha_middleware, CaptchaState};
 use crate::middleware::rate_limit::rate_limit_middleware;
 use crate::middleware::request_id::request_id_middleware;
+use crate::middleware::sql_injection::sql_injection_middleware;
+use crate::repository::db::DatabasePool;
 use crate::repository::dict::DictRepository;
 use crate::repository::menu::MenuRepository;
 use crate::repository::role::RoleRepository;
 use crate::repository::user::UserRepository;
 use crate::service::auth::AuthService;
 use crate::service::rbac::RbacService;
+use crate::utils::crypto::CryptoService;
 use crate::utils::jwt::JwtUtil;
 use crate::utils::redis::RedisClient;
 
-/// 应用共享状态
+/// 应用共享状态（V9：新增 crypto/DB 池）
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub auth_service: AuthService,
@@ -37,20 +41,15 @@ pub struct AppState {
     pub redis_client: Arc<RedisClient>,
     pub menu_repo: MenuRepository,
     pub dict_repo: DictRepository,
+    pub crypto_service: Arc<CryptoService>,
+    pub db_pool: DatabasePool,
 }
 
 /// 构建应用路由
 pub async fn create_router(config: Config) -> Result<Router, AppError> {
-    // ── 初始化数据库连接池（带 PoolOptions 配置） ──────────────
-    use sqlx::postgres::PgPoolOptions;
-    let pool = PgPoolOptions::new()
-        .max_connections(config.pool.max_size)
-        .acquire_timeout(std::time::Duration::from_secs(
-            config.pool.connect_timeout_seconds,
-        ))
-        .connect(&config.database_url)
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("数据库连接失败: {e}")))?;
+    // ── 初始化读写分离数据库连接池 ────────────────────────
+    let db_pool = DatabasePool::new(&config.database).await?;
+    let pool = db_pool.writer(); // 主库用于初始化
 
     // ── 初始化 Redis 客户端 ────────────────────────────────────
     let redis_client = Arc::new(
@@ -64,6 +63,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
 
     // ── 初始化各层 ──────────────────────────────────────────────
     let jwt_util = Arc::new(JwtUtil::new(&config.jwt_secret));
+    let crypto_service = Arc::new(CryptoService::new(config.crypto.clone()));
 
     let user_repo = UserRepository::new(pool.clone());
     let role_repo = RoleRepository::new(pool.clone());
@@ -86,6 +86,8 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         redis_client: Arc::clone(&redis_client),
         menu_repo,
         dict_repo,
+        crypto_service,
+        db_pool,
     };
 
     // ── 配置 CORS ──────────────────────────────────────────────
@@ -137,12 +139,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
-        // auth_middleware 先运行（外层），解析 JWT 注入 AuthenticatedUser
-        // require_role 再运行（内层），读取 AuthenticatedUser 校验角色
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // ── 菜单管理路由（仅 admin） ────────────────────────────
     let menu_routes = Router::new()
@@ -181,10 +178,16 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    // ── 预初始化中间件状态 ──────────────────────────────────────
+    let sql_injection_state = crate::middleware::sql_injection::create_sql_injection_state();
+    let captcha_state: CaptchaState = Arc::new(tokio::sync::RwLock::new(
+        crate::middleware::captcha::CaptchaConfig {
+            enabled: config.captcha_enabled,
+            ..Default::default()
+        }
+    ));
 
     // ── 合并所有路由并应用全局中间件 ──────────────────────────
     let rate_limit_state = (Arc::clone(&redis_client), Arc::new(config.rate_limit));
@@ -195,6 +198,10 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .merge(demo_routes)
         .merge(menu_routes)
         .merge(dict_routes)
+        // V9 新增：SQL 注入防护（最外安全层）
+        .layer(middleware::from_fn_with_state(sql_injection_state, sql_injection_middleware))
+        // V9 新增：验证码检查
+        .layer(middleware::from_fn_with_state(captcha_state, captcha_middleware))
         // 全局中间件：限流（最外层）
         .layer(middleware::from_fn_with_state(
             rate_limit_state,

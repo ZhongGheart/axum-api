@@ -180,6 +180,97 @@ impl RedisClient {
         Ok(())
     }
 
+    // ──────────────────────────────────────────────
+    // 高级缓存策略：热点数据 + 自动刷新 + 击穿防护
+    // ──────────────────────────────────────────────
+
+    /// 缓存 TTL（秒）
+    const CACHE_SHORT_TTL: u64 = 60;      // 1 分钟
+    const CACHE_MEDIUM_TTL: u64 = 300;    // 5 分钟
+    const CACHE_LONG_TTL: u64 = 3600;     // 1 小时
+    const CACHE_REFRESH_AHEAD: u64 = 60;  // 提前刷新时间（秒）
+
+    /// 获取缓存，支持自动刷新
+    ///
+    /// 当缓存即将过期（剩余 TTL < CACHE_REFRESH_AHEAD）时，
+    /// 返回旧值的同时异步刷新缓存，避免缓存雪崩。
+    pub async fn get_cache_with_auto_refresh<F, Fut>(
+        &self,
+        key: &str,
+        ttl: u64,
+        fetch_fn: F,
+    ) -> Result<String>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<String>> + Send,
+    {
+        let mut conn = self.conn.clone();
+
+        // 1. 先尝试读缓存
+        let cached: Option<String> = conn.get(key).await
+            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis GET 失败: {e}")))?;
+
+        if let Some(ref value) = cached {
+            // 2. 检查剩余 TTL，如果接近过期则异步刷新
+            let ttl_remaining: Option<i64> = conn.ttl(key).await.ok();
+            if let Some(remaining) = ttl_remaining {
+                if remaining > 0 && remaining as u64 <= Self::CACHE_REFRESH_AHEAD {
+                    // 异步刷新缓存，不阻塞当前响应
+                    let key_owned = key.to_string();
+                    let redis_clone = self.clone();
+                    tokio::spawn(async move {
+                        match fetch_fn().await {
+                            Ok(new_value) => {
+                                let _ = redis_clone.set_string(&key_owned, &new_value, ttl).await;
+                                tracing::debug!("缓存自动刷新: {}", key_owned);
+                            }
+                            Err(e) => {
+                                tracing::warn!("缓存自动刷新失败: {}: {}", key_owned, e);
+                            }
+                        }
+                    });
+                }
+            }
+            return Ok(value.clone());
+        }
+
+        // 3. 缓存穿透：使用 SETNX 实现互斥锁防止击穿
+        let lock_key = format!("{}:lock", key);
+        let lock_acquired: bool = conn.set_nx(&lock_key, "1").await
+            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis SETNX 失败: {e}")))?;
+
+        if lock_acquired {
+            // 当前线程获得锁，执行回源查询
+            conn.expire::<_, ()>(&lock_key, 10).await.ok(); // 锁 10 秒自动释放
+            let value = fetch_fn().await?;
+            self.set_string(key, &value, ttl).await?;
+            conn.del::<_, ()>(&lock_key).await.ok(); // 释放锁
+            Ok(value)
+        } else {
+            // 其他线程等待锁释放后重试
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // 重试读缓存
+            let retry: Option<String> = conn.get(key).await
+                .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 重试失败: {e}")))?;
+            Ok(retry.unwrap_or_default())
+        }
+    }
+
+    /// 批量预热缓存
+    pub async fn warmup_cache<K, V>(
+        &self,
+        entries: Vec<(K, V)>,
+        ttl: u64,
+    ) where
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        for (key, value) in &entries {
+            let _ = self.set_string(key.as_ref(), value.as_ref(), ttl).await;
+        }
+        tracing::info!("缓存预热完成: {} 条", entries.len());
+    }
+
     /// 检查用户级限流
     pub async fn check_user_rate_limit(
         &self,

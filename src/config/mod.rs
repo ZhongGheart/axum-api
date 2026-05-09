@@ -5,6 +5,17 @@
 
 use std::env;
 use std::net::SocketAddr;
+use crate::utils::crypto::CryptoConfig;
+
+/// 读写分离数据库配置
+#[derive(Debug, Clone)]
+pub struct DatabaseConfig {
+    pub read_url: Option<String>,
+    pub write_url: String,
+    pub max_size: u32,
+    pub connect_timeout_seconds: u64,
+    pub read_max_size: Option<u32>,
+}
 
 /// Redis 配置
 #[derive(Debug, Clone)]
@@ -55,6 +66,14 @@ pub struct Config {
     pub pool: PoolConfig,
     /// 限流配置
     pub rate_limit: RateLimitConfig,
+    /// 应用密钥
+    pub app_secret: String,
+    /// 加密配置
+    pub crypto: CryptoConfig,
+    /// 数据库读写分离配置
+    pub database: DatabaseConfig,
+    /// 验证码配置
+    pub captcha_enabled: bool,
 }
 
 impl Config {
@@ -105,6 +124,40 @@ impl Config {
                 .expect("DB_CONNECT_TIMEOUT 必须是有效的数字"),
         };
 
+        // 应用密钥（用于验证码生成等）
+        let app_secret = env::var("APP_SECRET")
+            .unwrap_or_else(|_| jwt_secret.clone());
+
+        // 加密配置
+        let crypto = CryptoConfig {
+            private_key_pem: env::var("RSA_PRIVATE_KEY").unwrap_or_default(),
+            public_key_pem: env::var("RSA_PUBLIC_KEY").ok(),
+            enabled: env::var("CRYPTO_ENABLED").unwrap_or_else(|_| "true".to_string()) == "true",
+            enforced_paths: env::var("CRYPTO_ENFORCED_PATHS")
+                .unwrap_or_else(|_| "/api/auth/login,/api/auth/register".to_string())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect(),
+        };
+
+        // 数据库读写分离
+        let database = DatabaseConfig {
+            read_url: env::var("DATABASE_READ_URL").ok(),
+            write_url: database_url.clone(),
+            max_size: pool.max_size,
+            connect_timeout_seconds: pool.connect_timeout_seconds,
+            read_max_size: Some(
+                env::var("DB_READ_POOL_MAX_SIZE")
+                    .unwrap_or_else(|_| "30".to_string())
+                    .parse()
+                    .expect("DB_READ_POOL_MAX_SIZE 必须是有效数字"),
+            ),
+        };
+
+        // 验证码
+        let captcha_enabled = env::var("CAPTCHA_ENABLED")
+            .unwrap_or_else(|_| "true".to_string()) == "true";
+
         // 限流配置
         let rate_limit = RateLimitConfig {
             ip_max_requests: env::var("RATE_LIMIT_IP_MAX")
@@ -134,6 +187,10 @@ impl Config {
             redis,
             pool,
             rate_limit,
+            app_secret,
+            crypto,
+            database,
+            captcha_enabled,
         }
     }
 }
