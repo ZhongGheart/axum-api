@@ -87,8 +87,10 @@ impl MetricsCollector {
 }
 
 /// API 性能追踪中间件
+///
+/// 从 AppState 中提取 metrics_collector，避免 Axum 类型不匹配。
 pub async fn api_metrics_mw(
-    State(metrics): State<Arc<MetricsCollector>>,
+    State(state): State<crate::router::AppState>,
     req: Request,
     next: Next,
 ) -> Response {
@@ -98,7 +100,7 @@ pub async fn api_metrics_mw(
     let response = next.run(req).await;
     let duration_ms = start.elapsed().as_millis() as u64;
     let is_error = response.status().is_server_error() || response.status().is_client_error();
-    let mc = metrics.clone();
+    let mc = state.metrics_collector.clone();
     tokio::spawn(async move {
         mc.record(&method, &path, duration_ms, is_error).await;
     });

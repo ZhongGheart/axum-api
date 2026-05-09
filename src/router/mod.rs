@@ -220,7 +220,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         // V9 新增：验证码检查
         .layer(middleware::from_fn_with_state(captcha_state, captcha_middleware))
         // API 性能追踪中间件（记录每个接口的耗时/报错）
-        .layer(middleware::from_fn_with_state(metrics_collector.clone(), api_metrics_mw))
+        .layer(middleware::from_fn_with_state(state.clone(), api_metrics_mw))
         // 全局中间件：限流（最外层）
         .layer(middleware::from_fn_with_state(
             rate_limit_state,
