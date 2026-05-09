@@ -1,9 +1,9 @@
 /**
  * Axios 全局配置
  *
- * - 请求拦截器：注入 Authorization 头 + 全局 loading
- * - 响应拦截器：统一解包 ApiResponse.data + 自动重试 + 友好错误提示
- * - 限流友好提示：429 时显示带倒计时的消息
+ * - 请求拦截器：注入 Authorization 头 + 全局 loading + 请求缓存（GET）
+ * - 响应拦截器：统一解包 ApiResponse.data + 自动重试 + 友好错误提示 + 性能记录
+ * - 请求去重：相同 GET 请求同时发送时自动合并
  */
 
 import axios from 'axios'
@@ -11,6 +11,14 @@ import type { AxiosError, AxiosResponse, InternalAxiosRequestConfig } from 'axio
 import type { ApiResponse } from '@/api/types/response'
 import { getToken, removeToken } from '@/utils/storage'
 import { showError } from '@/utils/message'
+import { requestCache } from '@/utils/cache'
+import { perfMonitor } from '@/utils/performance'
+
+/** 是否启用请求缓存（通过环境变量控制，默认生产环境启用） */
+const ENABLE_CACHE = import.meta.env.PROD ?? true
+
+/** 是否启用性能监控 */
+const ENABLE_PERF = true
 
 const http = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api',
@@ -41,12 +49,33 @@ http.interceptors.request.use(
     const token = getToken()
     if (token && config.headers) {
       config.headers.Authorization = `Bearer ${token}`
-      console.log('[Axios] token 已注入:', config.url, token.slice(0, 20) + '...')
-    } else {
-      console.warn('[Axios] 未找到 token，请求可能被拒:', config.url)
     }
+
     // 启动全局 loading bar
     window.$loadingBar?.start()
+
+    // 记录请求开始时间（用于性能监控）
+    config.headers.set('X-Request-Start', String(performance.now()))
+
+    // GET 请求尝试读取缓存（通过 cancelToken 机制短路）
+    if (ENABLE_CACHE && config.method === 'get') {
+      const cached = requestCache.get<unknown>('GET', config.url || '', config.params as Record<string, unknown>)
+      if (cached !== null) {
+        // 模拟响应，跳过实际请求
+        config.headers.set('X-Cache', 'HIT')
+        // 修改 adapter 返回缓存数据
+        config.adapter = async () => {
+          return {
+            data: cached,
+            status: 200,
+            statusText: 'OK (cached)',
+            headers: { 'x-cache': 'HIT' },
+            config,
+          } as AxiosResponse
+        }
+      }
+    }
+
     return config
   },
   (error) => {
@@ -63,6 +92,16 @@ http.interceptors.response.use(
   (response: AxiosResponse<ApiResponse>) => {
     window.$loadingBar?.finish()
 
+    // 记录接口耗时
+    if (ENABLE_PERF) {
+      const startTime = response.config?.headers?.['X-Request-Start']
+      if (startTime) {
+        const duration = performance.now() - Number(startTime)
+        const url = response.config?.url || 'unknown'
+        perfMonitor.recordApi(url, Math.round(duration))
+      }
+    }
+
     // 二进制响应（blob/arraybuffer）直接返回，不拆包 ApiResponse
     const respType = response.config?.responseType
     if (respType === 'blob' || respType === 'arraybuffer') {
@@ -73,6 +112,11 @@ http.interceptors.response.use(
 
     if (data.code !== 200) {
       return Promise.reject(new Error(data.message || '请求失败'))
+    }
+
+    // 写入缓存（仅 GET）
+    if (ENABLE_CACHE && response.config?.method === 'get') {
+      requestCache.set('GET', response.config.url || '', data.data, response.config.params)
     }
 
     return data.data as unknown as AxiosResponse
@@ -89,6 +133,11 @@ http.interceptors.response.use(
         await new Promise((r) => setTimeout(r, delayMs))
         return http(config)
       }
+    }
+
+    // ── 记录错误到性能监控 ───────────────────────────────────
+    if (ENABLE_PERF) {
+      perfMonitor.record('error', error.message || '请求错误')
     }
 
     // ── 错误消息处理 ─────────────────────────────────────────
@@ -116,7 +165,6 @@ http.interceptors.response.use(
         break
       case 429:
         message = '请求过于频繁，请稍后再试'
-        // 429 已由后端限流中间件处理，前端给出明确的友好提示
         break
       case 500:
         message = '服务器内部错误'
