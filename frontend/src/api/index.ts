@@ -62,6 +62,13 @@ http.interceptors.request.use(
 http.interceptors.response.use(
   (response: AxiosResponse<ApiResponse>) => {
     window.$loadingBar?.finish()
+
+    // 二进制响应（blob/arraybuffer）直接返回，不拆包 ApiResponse
+    const respType = response.config?.responseType
+    if (respType === 'blob' || respType === 'arraybuffer') {
+      return response
+    }
+
     const { data } = response
 
     if (data.code !== 200) {

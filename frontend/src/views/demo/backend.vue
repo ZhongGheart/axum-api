@@ -45,7 +45,8 @@ async function handleExport() {
     const response = await http.get('/admin/export/users', {
       responseType: 'blob',
     })
-    const blob = response as unknown as Blob
+    // 响应拦截器对 blob 类型返回原始 AxiosResponse，需取 .data
+    const blob = (response as unknown as { data: Blob }).data
     const url = window.URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
