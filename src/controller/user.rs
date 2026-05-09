@@ -118,3 +118,85 @@ pub async fn delete_user(
     tracing::info!("管理员删除用户: {}", id);
     Ok(Json(ApiResponse::success("删除成功")))
 }
+
+/// POST /api/admin/users/batch-delete — 批量删除
+pub async fn batch_delete_users(
+    State(state): State<AppState>,
+    Json(req): Json<BatchDeleteRequest>,
+) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    use crate::service::crud::CrudTemplate;
+    for id in &req.ids {
+        let _ = CrudTemplate::delete(&state.auth_service.user_repo.pool, "user_roles", *id).await;
+    }
+    CrudTemplate::delete_many(&state.auth_service.user_repo.pool, "users", &req.ids).await?;
+    Ok(Json(ApiResponse::success("批量删除成功")))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct BatchDeleteRequest {
+    pub ids: Vec<Uuid>,
+}
+
+/// PUT /api/admin/users/:id/status — 切换状态
+pub async fn toggle_user_status(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Json(req): Json<ToggleStatusRequest>,
+) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
+    let user = state.auth_service.user_repo.find_by_id(id).await?;
+    let updated = state.auth_service.user_repo
+        .update(id, &user.username, &user.email, &user.role.to_string(), req.is_active)
+        .await?;
+    Ok(Json(ApiResponse::success(UserInfo::from(updated))))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ToggleStatusRequest {
+    pub is_active: bool,
+}
+
+/// POST /api/admin/users/:id/reset-password — 重置密码
+pub async fn reset_user_password(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Json(req): Json<ResetPasswordRequest>,
+) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    use crate::utils::password::hash_password;
+    let hashed = hash_password(&req.password)
+        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+        .bind(&hashed).bind(id)
+        .execute(&state.auth_service.user_repo.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("重置密码失败: {e}")))?;
+    Ok(Json(ApiResponse::success("密码重置成功")))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ResetPasswordRequest {
+    pub password: String,
+}
+
+/// PUT /api/admin/users/:id/roles — 全量角色分配
+pub async fn assign_user_roles(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Json(req): Json<AssignUserRolesRequest>,
+) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    use sqlx::PgPool;
+    let pool = &state.auth_service.user_repo.pool;
+    // 清除旧角色
+    sqlx::query("DELETE FROM user_roles WHERE user_id = $1").bind(id).execute(pool).await.ok();
+    // 分配新角色
+    for role_id in &req.role_ids {
+        sqlx::query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(id).bind(role_id)
+            .execute(pool).await.ok();
+    }
+    Ok(Json(ApiResponse::success("角色分配成功")))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct AssignUserRolesRequest {
+    pub role_ids: Vec<Uuid>,
+}

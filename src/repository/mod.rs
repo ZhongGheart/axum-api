@@ -1,4 +1,5 @@
-//! 数据访问层模块导出
+//! 仓储层模块导出
 
+pub mod menu;
 pub mod role;
 pub mod user;

@@ -96,6 +96,45 @@ pub async fn validate_test(
     Ok(Json(ApiResponse::success(resp)))
 }
 
+/// GET /api/admin/logs/audit/export — 导出操作日志（Excel）
+pub async fn export_audit_logs(
+    State(state): State<AppState>,
+) -> Result<axum::response::Response, AppError> {
+    let logs: Vec<crate::model::AuditLog> = sqlx::query_as(
+        "SELECT id, user_id, username, action, method, path, params, result, status_code, client_ip, duration_ms, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 10000"
+    )
+    .fetch_all(&state.auth_service.user_repo.pool)
+    .await
+    .map_err(|e| AppError::InternalServerError(format!("查询日志失败: {e}")))?;
+
+    let columns = vec![
+        ExcelColumn { header: "用户名".into(), width: 15.0 },
+        ExcelColumn { header: "操作".into(), width: 25.0 },
+        ExcelColumn { header: "方法".into(), width: 10.0 },
+        ExcelColumn { header: "路径".into(), width: 40.0 },
+        ExcelColumn { header: "状态码".into(), width: 10.0 },
+        ExcelColumn { header: "IP".into(), width: 20.0 },
+        ExcelColumn { header: "耗时(ms)".into(), width: 12.0 },
+        ExcelColumn { header: "时间".into(), width: 25.0 },
+    ];
+
+    let mut export = ExcelExport::new("操作日志.xlsx");
+    export.add_sheet_from_rows("操作日志", &columns, &logs.iter().map(|l| {
+        vec![
+            l.username.clone().unwrap_or_default(),
+            l.action.clone(),
+            l.method.clone(),
+            l.path.clone(),
+            l.status_code.map(|s| s.to_string()).unwrap_or_default(),
+            l.client_ip.clone().unwrap_or_default(),
+            l.duration_ms.map(|d| d.to_string()).unwrap_or_default(),
+            l.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+        ]
+    }).collect::<Vec<_>>())?;
+
+    export.into_response()
+}
+
 /// GET /api/admin/audit-logs — 查询操作日志（分页）
 pub async fn list_audit_logs(
     State(state): State<AppState>,
