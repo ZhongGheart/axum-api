@@ -15,6 +15,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
 use crate::controller::{auth, demo, dict, menu, monitor, rbac, role, user};
+use crate::docs::swagger_ui_handler;
 use crate::error::AppError;
 use crate::middleware::auth::auth_middleware;
 use crate::middleware::captcha::{captcha_middleware, CaptchaState};
@@ -216,10 +217,12 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .merge(menu_routes)
         .merge(dict_routes)
         .merge(monitor_routes)
-        // OpenAPI JSON 端点（Swagger UI 通过前端 iframe + CDN 加载此文件）
+        // OpenAPI JSON 端点
         .route("/api/openapi.json", axum::routing::get(|| async {
             axum::Json(crate::docs::openapi_json())
         }))
+        // Swagger UI HTML 页面（同源服务，避免 iframe 跨域限制）
+        .route("/api/swagger-ui/{*path}", axum::routing::get(swagger_ui_handler))
         // V9 新增：SQL 注入防护（最外安全层）
         .layer(middleware::from_fn_with_state(sql_injection_state, sql_injection_middleware))
         // V9 新增：验证码检查

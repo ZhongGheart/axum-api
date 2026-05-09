@@ -3,6 +3,7 @@
 //! 手动构建 OpenAPI 规范 JSON，避免 utoipa 过程宏兼容性问题。
 //! 端点：GET /api/openapi.json
 
+use axum::http::{header, StatusCode, Response};
 use serde_json::json;
 
 /// 返回完整的 OpenAPI 3.0 规范 JSON
@@ -449,4 +450,63 @@ pub fn openapi_json() -> serde_json::Value {
             }
         }
     })
+}
+
+/// Swagger UI 静态页面处理
+///
+/// 返回一个完整的 HTML 页面，通过 CDN 加载 Swagger UI 渲染引擎，
+/// 指向同源的 `/api/openapi.json` 作为数据源。
+/// 同源服务避免了 iframe 跨域限制，CDN 加载避免了前端打包体积膨胀。
+pub async fn swagger_ui_handler(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> Result<Response<String>, std::convert::Infallible> {
+    if path != "index.html" && path != "" {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body("Not Found".to_string())
+            .unwrap());
+    }
+
+    let html = r#"<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Axum Admin API - Swagger UI</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+  <style>
+    html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
+    *, *:before, *:after { box-sizing: inherit; }
+    body { margin: 0; background: #fafafa; }
+    .topbar { display: none; }
+  </style>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    SwaggerUIBundle({
+      url: '/api/openapi.json',
+      dom_id: '#swagger-ui',
+      deepLinking: true,
+      presets: [
+        SwaggerUIBundle.presets.apis,
+        SwaggerUIBundle.SwaggerUIStandalonePreset
+      ],
+      plugins: [SwaggerUIBundle.plugins.DownloadUrl],
+      layout: "StandaloneLayout",
+      showExtensions: true,
+      showCommonExtensions: true,
+      tryItOutEnabled: true,
+      defaultModelsExpandDepth: 3,
+      defaultModelExpandDepth: 3,
+    })
+  </script>
+</body>
+</html>"#;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(html.to_string())
+        .unwrap())
 }
