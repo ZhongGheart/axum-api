@@ -11,6 +11,7 @@ use axum::{
 };
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+// Swagger UI 通过前端 iframe + CDN 渲染
 
 use crate::config::Config;
 use crate::controller::{auth, demo, dict, menu, monitor, rbac, role, user};
@@ -215,6 +216,10 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .merge(menu_routes)
         .merge(dict_routes)
         .merge(monitor_routes)
+        // OpenAPI JSON 端点（Swagger UI 通过前端 iframe + CDN 加载此文件）
+        .route("/api/openapi.json", axum::routing::get(|| async {
+            axum::Json(crate::docs::openapi_json())
+        }))
         // V9 新增：SQL 注入防护（最外安全层）
         .layer(middleware::from_fn_with_state(sql_injection_state, sql_injection_middleware))
         // V9 新增：验证码检查

@@ -2,8 +2,11 @@
 //!
 //! 初始化 Tracing 日志系统、加载配置、构建路由、启动 HTTP 服务器。
 
+#![recursion_limit = "256"]
+
 mod config;
 mod controller;
+mod docs;
 mod error;
 mod middleware;
 mod model;

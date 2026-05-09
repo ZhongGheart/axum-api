@@ -173,6 +173,11 @@ const menuOptions: MenuOption[] = [
         icon: renderIcon(SettingsIcon),
       },
       {
+        label: '接口文档',
+        key: '/system/api-docs',
+        icon: renderIcon(SettingsIcon),
+      },
+      {
         label: '系统监控',
         key: '/system/monitor/system',
         icon: renderIcon(SettingsIcon),
