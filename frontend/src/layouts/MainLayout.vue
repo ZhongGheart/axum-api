@@ -157,6 +157,16 @@ const menuOptions: MenuOption[] = [
         key: '/system/role',
         icon: renderIcon(RoleIcon),
       },
+      {
+        label: '菜单管理',
+        key: '/system/menu',
+        icon: renderIcon(SettingsIcon),
+      },
+      {
+        label: '系统日志',
+        key: '/system/log',
+        icon: renderIcon(SettingsIcon),
+      },
     ],
   },
 ]

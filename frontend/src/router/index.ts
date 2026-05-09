@@ -92,6 +92,18 @@ const routes: RouteRecordRaw[] = [
             component: () => import('@/views/system/role/index.vue'),
             meta: { title: '角色管理', roles: ['admin'] },
           },
+          {
+            path: 'menu',
+            name: 'SystemMenu',
+            component: () => import('@/views/system/menu/index.vue'),
+            meta: { title: '菜单管理', roles: ['admin'] },
+          },
+          {
+            path: 'log',
+            name: 'SystemLog',
+            component: () => import('@/views/system/log/index.vue'),
+            meta: { title: '系统日志', roles: ['admin'] },
+          },
         ],
       },
     ],
