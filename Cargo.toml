@@ -74,3 +74,7 @@ validator = { version = "0.20", features = ["derive"] }
 
 # 文件下载（响应头）
 axum-extra = { version = "0.10", features = ["typed-header"] }
+
+# 系统监控（CPU/内存/磁盘/进程）
+sysinfo = "0.33"
+

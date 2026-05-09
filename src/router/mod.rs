@@ -13,11 +13,12 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
-use crate::controller::{auth, demo, dict, menu, rbac, role, user};
+use crate::controller::{auth, demo, dict, menu, monitor, rbac, role, user};
 use crate::error::AppError;
 use crate::middleware::auth::auth_middleware;
 use crate::middleware::captcha::{captcha_middleware, CaptchaState};
 use crate::middleware::rate_limit::rate_limit_middleware;
+use crate::middleware::api_metrics::{api_metrics_mw, MetricsCollector};
 use crate::middleware::request_id::request_id_middleware;
 use crate::middleware::sql_injection::sql_injection_middleware;
 use crate::repository::db::DatabasePool;
@@ -43,6 +44,7 @@ pub struct AppState {
     pub dict_repo: DictRepository,
     pub crypto_service: Arc<CryptoService>,
     pub db_pool: DatabasePool,
+    pub metrics_collector: Arc<MetricsCollector>,
 }
 
 /// 构建应用路由
@@ -64,6 +66,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
     // ── 初始化各层 ──────────────────────────────────────────────
     let jwt_util = Arc::new(JwtUtil::new(&config.jwt_secret));
     let crypto_service = Arc::new(CryptoService::new(config.crypto.clone()));
+    let metrics_collector = Arc::new(MetricsCollector::new());
 
     let user_repo = UserRepository::new(pool.clone());
     let role_repo = RoleRepository::new(pool.clone());
@@ -88,6 +91,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         dict_repo,
         crypto_service,
         db_pool,
+        metrics_collector: metrics_collector.clone(),
     };
 
     // ── 配置 CORS ──────────────────────────────────────────────
@@ -180,6 +184,18 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         }))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
+    // ── 系统监控路由（仅 admin） ────────────────────────────
+    let monitor_routes = Router::new()
+        .route("/api/admin/monitor/system", get(monitor::system_info))
+        .route("/api/admin/monitor/api-metrics", get(monitor::api_metrics))
+        .route("/api/admin/monitor/alerts", get(monitor::alerts))
+        .route("/api/admin/monitor/metrics/reset", post(monitor::reset_metrics))
+        .route("/api/admin/monitor/system/export", get(monitor::export_system))
+        .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+            async move { crate::middleware::auth::require_role("admin", req, next).await }
+        }))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
     // ── 预初始化中间件状态 ──────────────────────────────────────
     let sql_injection_state = crate::middleware::sql_injection::create_sql_injection_state();
     let captcha_state: CaptchaState = Arc::new(tokio::sync::RwLock::new(
@@ -198,10 +214,13 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .merge(demo_routes)
         .merge(menu_routes)
         .merge(dict_routes)
+        .merge(monitor_routes)
         // V9 新增：SQL 注入防护（最外安全层）
         .layer(middleware::from_fn_with_state(sql_injection_state, sql_injection_middleware))
         // V9 新增：验证码检查
         .layer(middleware::from_fn_with_state(captcha_state, captcha_middleware))
+        // API 性能追踪中间件（记录每个接口的耗时/报错）
+        .layer(middleware::from_fn_with_state(metrics_collector.clone(), api_metrics_mw))
         // 全局中间件：限流（最外层）
         .layer(middleware::from_fn_with_state(
             rate_limit_state,

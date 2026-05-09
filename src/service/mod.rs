@@ -2,4 +2,5 @@
 
 pub mod auth;
 pub mod crud;
+pub mod monitor;
 pub mod rbac;

@@ -111,6 +111,18 @@ const routes: RouteRecordRaw[] = [
             meta: { title: '系统日志', roles: ['admin'] },
           },
           {
+            path: 'monitor/system',
+            name: 'MonitorSystem',
+            component: () => import('@/views/monitor/system/index.vue'),
+            meta: { title: '系统监控', roles: ['admin'] },
+          },
+          {
+            path: 'monitor/api',
+            name: 'MonitorApi',
+            component: () => import('@/views/monitor/api/index.vue'),
+            meta: { title: '接口监控', roles: ['admin'] },
+          },
+          {
             path: 'dict',
             name: 'SystemDict',
             component: () => import('@/views/system/dict/index.vue'),

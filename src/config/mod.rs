@@ -156,7 +156,7 @@ impl Config {
 
         // 验证码
         let captcha_enabled = env::var("CAPTCHA_ENABLED")
-            .unwrap_or_else(|_| "true".to_string()) == "true";
+            .unwrap_or_else(|_| "false".to_string()) == "true";
 
         // 限流配置
         let rate_limit = RateLimitConfig {
