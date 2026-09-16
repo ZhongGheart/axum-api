@@ -62,3 +62,53 @@ impl<T: Serialize> IntoResponse for ApiResponse<T> {
         (status, Json(self)).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use serde_json::Value;
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn success_response_has_data_and_http_200() {
+        let response = ApiResponse::success("ok").into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        assert_eq!(json["code"], 200);
+        assert_eq!(json["message"], "success");
+        assert_eq!(json["data"], "ok");
+    }
+
+    #[tokio::test]
+    async fn success_response_without_data_uses_null() {
+        let response = ApiResponse::<Value>::success_no_data().into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        assert_eq!(json["code"], 200);
+        assert!(json["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn error_response_preserves_http_status_and_message() {
+        let response = ApiResponse::<Value>::error(400, "bad request").into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let json = response_json(response).await;
+        assert_eq!(json["code"], 400);
+        assert_eq!(json["message"], "bad request");
+        assert!(json["data"].is_null());
+    }
+
+    #[tokio::test]
+    async fn invalid_status_code_falls_back_to_500() {
+        let response = ApiResponse::<Value>::error(1000, "invalid").into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

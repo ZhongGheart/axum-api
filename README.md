@@ -1,5 +1,7 @@
 # Axum Admin — 全栈管理系统
 
+[![CI](https://github.com/ZhongGheart/axum-api/actions/workflows/ci.yml/badge.svg)](https://github.com/ZhongGheart/axum-api/actions/workflows/ci.yml)
+
 基于 **Rust Axum** 后端 + **Vue 3** 前端的企业级全栈管理平台。
 
 ## 项目结构

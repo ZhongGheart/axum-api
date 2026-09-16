@@ -69,3 +69,68 @@ pub fn validate_phone(phone: &str) -> ValidationResult<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn username_accepts_valid_values() {
+        assert!(validate_username("alice_01").is_ok());
+        assert!(validate_username("alice-01").is_ok());
+    }
+
+    #[test]
+    fn username_rejects_invalid_length_and_characters() {
+        assert!(matches!(validate_username("ab"), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_username("alice space"), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            validate_username(&"a".repeat(51)),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn password_enforces_length_boundaries() {
+        assert!(validate_password("123456").is_ok());
+        assert!(matches!(validate_password("12345"), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            validate_password(&"a".repeat(129)),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn email_requires_basic_shape_and_length_boundary() {
+        assert!(validate_email("user@example.com").is_ok());
+        assert!(matches!(validate_email("user.example.com"), Err(AppError::BadRequest(_))));
+        assert!(matches!(
+            validate_email(&format!("{}@example.com", "a".repeat(250))),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn page_validation_enforces_bounds() {
+        assert!(validate_page(1, 1).is_ok());
+        assert!(validate_page(10, 200).is_ok());
+        assert!(matches!(validate_page(0, 10), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_page(1, 0), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_page(1, 201), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn uuid_validation_accepts_generated_uuid() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(validate_uuid(&id).is_ok());
+        assert!(matches!(validate_uuid("not-a-uuid"), Err(AppError::BadRequest(_))));
+    }
+
+    #[test]
+    fn phone_validation_requires_mainland_mobile_shape() {
+        assert!(validate_phone("13800138000").is_ok());
+        assert!(matches!(validate_phone("1380013800"), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_phone("23800138000"), Err(AppError::BadRequest(_))));
+        assert!(matches!(validate_phone("1380013800a"), Err(AppError::BadRequest(_))));
+    }
+}

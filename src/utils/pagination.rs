@@ -69,8 +69,20 @@ pub struct PaginatedResponse<T: Serialize> {
 
 impl<T: Serialize> PaginatedResponse<T> {
     pub fn new(items: Vec<T>, total: i64, page: i64, page_size: i64) -> Self {
-        let total_pages = if total == 0 { 1 } else { (total as f64 / page_size as f64).ceil() as i64 };
-        Self { items, total, page, page_size, total_pages }
+        let page = page.max(1);
+        let page_size = page_size.max(1);
+        let total_pages = if total <= 0 {
+            1
+        } else {
+            (total + page_size - 1) / page_size
+        };
+        Self {
+            items,
+            total,
+            page,
+            page_size,
+            total_pages,
+        }
     }
 }
 
@@ -79,4 +91,78 @@ impl<T: Serialize> PaginatedResponse<T> {
 pub struct PageParams {
     pub page: Option<i64>,
     pub page_size: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(
+        page: Option<i64>,
+        page_size: Option<i64>,
+        sort_by: Option<&str>,
+        sort_order: Option<&str>,
+        keyword: Option<&str>,
+    ) -> PaginationParams {
+        PaginationParams {
+            page,
+            page_size,
+            sort_by: sort_by.map(str::to_string),
+            sort_order: sort_order.map(str::to_string),
+            keyword: keyword.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn pagination_uses_safe_defaults() {
+        let params = params(None, None, None, None, None);
+        assert_eq!(params.get_page(), 1);
+        assert_eq!(params.get_page_size(), 10);
+        assert_eq!(params.get_offset(), 0);
+    }
+
+    #[test]
+    fn pagination_clamps_invalid_values() {
+        let params = params(Some(0), Some(999), None, None, None);
+        assert_eq!(params.get_page(), 1);
+        assert_eq!(params.get_page_size(), 200);
+        assert_eq!(params.get_offset(), 0);
+    }
+
+    #[test]
+    fn pagination_calculates_offset() {
+        let params = params(Some(3), Some(20), None, None, None);
+        assert_eq!(params.get_offset(), 40);
+    }
+
+    #[test]
+    fn pagination_respects_allowed_sort_fields() {
+        let params = params(None, None, Some("username"), Some("asc"), None);
+        assert_eq!(params.get_order_sql(&["username", "created_at"]), "username ASC");
+    }
+
+    #[test]
+    fn pagination_falls_back_for_unknown_sort_field() {
+        let params = params(None, None, Some("password"), Some("DROP TABLE users"), None);
+        assert_eq!(params.get_order_sql(&["username", "created_at"]), "created_at DESC");
+    }
+
+    #[test]
+    fn paginated_response_calculates_total_pages() {
+        let empty = PaginatedResponse::new(Vec::<i32>::new(), 0, 1, 10);
+        assert_eq!(empty.total_pages, 1);
+
+        let page = PaginatedResponse::new(vec![1, 2, 3], 10, 2, 3);
+        assert_eq!(page.total_pages, 4);
+        assert_eq!(page.page, 2);
+        assert_eq!(page.page_size, 3);
+    }
+
+    #[test]
+    fn paginated_response_guards_zero_page_size() {
+        let page = PaginatedResponse::new(vec![1], 1, 0, 0);
+        assert_eq!(page.page, 1);
+        assert_eq!(page.page_size, 1);
+        assert_eq!(page.total_pages, 1);
+    }
 }

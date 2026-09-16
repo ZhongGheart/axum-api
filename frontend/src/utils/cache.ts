@@ -109,8 +109,8 @@ setInterval(() => requestCache.clean(), 60_000)
 // 批量请求合并
 // ──────────────────────────────────────────────
 
-type BatchItem<T> = {
-  params: unknown
+type BatchItem<T, P> = {
+  params: P
   resolve: (value: T) => void
   reject: (error: unknown) => void
 }
@@ -136,7 +136,7 @@ interface BatchConfig {
  *   batcher.add('id2').then(user => ...)  // 合并为一个请求
  */
 export class BatchRequester<T, P = unknown> {
-  private queue: BatchItem<P>[] = []
+  private queue: BatchItem<T, P>[] = []
   private timer: ReturnType<typeof setTimeout> | null = null
   private readonly batchFn: (params: P[]) => Promise<T[]>
   private readonly config: BatchConfig
