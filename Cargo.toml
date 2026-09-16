@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Production-grade Rust backend API with Axum, SQLx, JWT auth"
 authors = ["dev"]
+license = "MIT"
 
 [dependencies]
 # Web框架

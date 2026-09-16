@@ -196,3 +196,7 @@ pnpm format            # Prettier 格式化
 6. **监控**：配置 `/api/health` 健康检查端点
 7. **资源**：Docker 设置 CPU/内存限制
 8. **备份**：定期备份 PostgreSQL 数据卷
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
