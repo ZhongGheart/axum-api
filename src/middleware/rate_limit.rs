@@ -15,44 +15,45 @@ use axum::{
 use serde_json::json;
 
 use crate::config::RateLimitConfig;
+use crate::middleware::client_ip;
 use crate::utils::redis::RedisClient;
 
-/// 限流中间件状态（由 router 传入的元组）
-pub type RateLimitState = (Arc<RedisClient>, Arc<RateLimitConfig>);
+/// 限流中间件状态（Redis 客户端、限流配置、是否信任代理转发头）
+pub type RateLimitState = (Arc<RedisClient>, Arc<RateLimitConfig>, bool);
 
 /// 限流中间件
 ///
 /// 同时检查 IP 级和用户级（如果已认证）限流。
 pub async fn rate_limit_middleware(
-    State((redis_client, rate_limit_config)): State<RateLimitState>,
-    req: Request,
+    State((redis_client, rate_limit_config, trust_proxy_headers)): State<RateLimitState>,
+    mut req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, Response> {
-    let client_ip = req
-        .headers()
-        .get("X-Forwarded-For")
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            req.headers()
-                .get("X-Real-IP")
-                .and_then(|v| v.to_str().ok())
-        })
-        .unwrap_or("unknown");
+    // 健康检查不得被限流依赖阻断：依赖故障时仍需可探活
+    if req.uri().path() == "/api/health" {
+        return Ok(next.run(req).await);
+    }
+
+    let client_ip = client_ip::resolve_client_ip(&req, trust_proxy_headers);
+    // 注入扩展：登录失败计数等下游逻辑复用同一来源，避免各处理解不一致
+    req.extensions_mut()
+        .insert(client_ip::ClientIp(client_ip.clone()));
 
     let ip_result = redis_client
         .check_ip_rate_limit(
-            client_ip,
+            &client_ip,
             rate_limit_config.ip_max_requests,
             rate_limit_config.ip_window_seconds,
         )
         .await
-        .map_err(|_| {
+        .map_err(|e| {
+            tracing::error!("限流依赖不可用（IP 维度）: {e}");
             let body = Json(json!({
-                "code": 500,
-                "message": "限流检查失败",
+                "code": 503,
+                "message": "限流服务不可用",
                 "data": null,
             }));
-            (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+            (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
         })?;
 
     if !ip_result.allowed {
@@ -67,7 +68,10 @@ pub async fn rate_limit_middleware(
         return Err((StatusCode::TOO_MANY_REQUESTS, body).into_response());
     }
 
-    if let Some(auth_user) = req.extensions().get::<crate::middleware::auth::AuthenticatedUser>() {
+    if let Some(auth_user) = req
+        .extensions()
+        .get::<crate::middleware::auth::AuthenticatedUser>()
+    {
         let user_result = redis_client
             .check_user_rate_limit(
                 &auth_user.user_id.to_string(),
@@ -75,13 +79,14 @@ pub async fn rate_limit_middleware(
                 rate_limit_config.user_window_seconds,
             )
             .await
-            .map_err(|_| {
+            .map_err(|e| {
+                tracing::error!("限流依赖不可用（用户维度）: {e}");
                 let body = Json(json!({
-                    "code": 500,
-                    "message": "限流检查失败",
+                    "code": 503,
+                    "message": "限流服务不可用",
                     "data": null,
                 }));
-                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+                (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
             })?;
 
         if !user_result.allowed {
@@ -101,7 +106,11 @@ pub async fn rate_limit_middleware(
 
     resp.headers_mut().insert(
         "X-RateLimit-Limit",
-        rate_limit_config.ip_max_requests.to_string().parse().unwrap(),
+        rate_limit_config
+            .ip_max_requests
+            .to_string()
+            .parse()
+            .unwrap(),
     );
 
     Ok(resp)

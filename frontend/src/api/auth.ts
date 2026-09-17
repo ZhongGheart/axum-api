@@ -6,7 +6,6 @@
 
 import http from './index'
 import type {
-  ApiResponse,
   LoginRequest,
   LoginResponse,
   RegisterRequest,

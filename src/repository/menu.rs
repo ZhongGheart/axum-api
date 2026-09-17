@@ -35,13 +35,12 @@ impl MenuRepository {
 
     /// 根据角色 ID 查询菜单 ID 列表
     pub async fn find_menu_ids_by_role(&self, role_id: Uuid) -> Result<Vec<Uuid>, AppError> {
-        let ids = sqlx::query_scalar::<_, Uuid>(
-            "SELECT menu_id FROM role_menus WHERE role_id = $1",
-        )
-        .bind(role_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("查询角色菜单失败: {e}")))?;
+        let ids =
+            sqlx::query_scalar::<_, Uuid>("SELECT menu_id FROM role_menus WHERE role_id = $1")
+                .bind(role_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| AppError::InternalServerError(format!("查询角色菜单失败: {e}")))?;
         Ok(ids)
     }
 
@@ -49,7 +48,10 @@ impl MenuRepository {
     pub async fn find_tree_by_role(&self, role_id: Uuid) -> Result<Vec<MenuNode>, AppError> {
         let menu_ids = self.find_menu_ids_by_role(role_id).await?;
         let all = self.find_all().await?;
-        let filtered: Vec<Menu> = all.into_iter().filter(|m| menu_ids.contains(&m.id)).collect();
+        let filtered: Vec<Menu> = all
+            .into_iter()
+            .filter(|m| menu_ids.contains(&m.id))
+            .collect();
         Ok(build_tree(filtered, None))
     }
 
@@ -78,7 +80,11 @@ impl MenuRepository {
     }
 
     /// 更新菜单
-    pub async fn update(&self, id: Uuid, fields: &crate::model::UpdateMenuRequest) -> Result<Menu, AppError> {
+    pub async fn update(
+        &self,
+        id: Uuid,
+        fields: &crate::model::UpdateMenuRequest,
+    ) -> Result<Menu, AppError> {
         let menu = self.find_by_id(id).await?;
         let parent_id = fields.parent_id.or(menu.parent_id);
         let name = fields.name.as_deref().unwrap_or(&menu.name);
@@ -107,18 +113,42 @@ impl MenuRepository {
 
     /// 删除菜单（级联删除子节点 + role_menus）
     pub async fn delete(&self, id: Uuid) -> Result<(), AppError> {
-        let mut tx = self.pool.begin().await.map_err(|e| AppError::InternalServerError(e.to_string()))?;
-        sqlx::query("DELETE FROM role_menus WHERE menu_id = $1").bind(id).execute(&mut *tx).await.ok();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+        sqlx::query("DELETE FROM role_menus WHERE menu_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .ok();
         // 递归删除子节点
         let children: Vec<(Uuid,)> = sqlx::query_as("SELECT id FROM menus WHERE parent_id = $1")
-            .bind(id).fetch_all(&mut *tx).await.unwrap_or_default();
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap_or_default();
         for (cid,) in children {
-            sqlx::query("DELETE FROM role_menus WHERE menu_id = $1").bind(cid).execute(&mut *tx).await.ok();
-            sqlx::query("DELETE FROM menus WHERE id = $1").bind(cid).execute(&mut *tx).await.ok();
+            sqlx::query("DELETE FROM role_menus WHERE menu_id = $1")
+                .bind(cid)
+                .execute(&mut *tx)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM menus WHERE id = $1")
+                .bind(cid)
+                .execute(&mut *tx)
+                .await
+                .ok();
         }
-        sqlx::query("DELETE FROM menus WHERE id = $1").bind(id).execute(&mut *tx).await
+        sqlx::query("DELETE FROM menus WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
             .map_err(|e| AppError::InternalServerError(format!("删除菜单失败: {e}")))?;
-        tx.commit().await.map_err(|e| AppError::InternalServerError(e.to_string()))
+        tx.commit()
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))
     }
 
     /// 根据 ID 查询
@@ -134,16 +164,34 @@ impl MenuRepository {
     }
 
     /// 分配角色菜单权限（全量替换）
-    pub async fn assign_role_menus(&self, role_id: Uuid, menu_ids: &[Uuid]) -> Result<(), AppError> {
-        let mut tx = self.pool.begin().await.map_err(|e| AppError::InternalServerError(e.to_string()))?;
-        sqlx::query("DELETE FROM role_menus WHERE role_id = $1").bind(role_id)
-            .execute(&mut *tx).await.ok();
+    pub async fn assign_role_menus(
+        &self,
+        role_id: Uuid,
+        menu_ids: &[Uuid],
+    ) -> Result<(), AppError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+        sqlx::query("DELETE FROM role_menus WHERE role_id = $1")
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await
+            .ok();
         for mid in menu_ids {
-            sqlx::query("INSERT INTO role_menus (role_id, menu_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-                .bind(role_id).bind(mid)
-                .execute(&mut *tx).await.ok();
+            sqlx::query(
+                "INSERT INTO role_menus (role_id, menu_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            )
+            .bind(role_id)
+            .bind(mid)
+            .execute(&mut *tx)
+            .await
+            .ok();
         }
-        tx.commit().await.map_err(|e| AppError::InternalServerError(e.to_string()))
+        tx.commit()
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))
     }
 }
 

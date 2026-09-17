@@ -3,8 +3,40 @@
 //! 手动构建 OpenAPI 规范 JSON，避免 utoipa 过程宏兼容性问题。
 //! 端点：GET /api/openapi.json
 
-use axum::http::{header, StatusCode, Response};
+use axum::http::{header, Response, StatusCode};
 use serde_json::json;
+
+/// 列出 OpenAPI 文档中声明的所有路由
+///
+/// 返回 `(path, methods)`，用于路由覆盖率测试：
+/// 文档里写了但实际不存在的接口会被测试发现。
+pub fn documented_paths() -> Vec<(String, Vec<String>)> {
+    let spec = openapi_json();
+    let mut routes = Vec::new();
+
+    if let Some(paths) = spec.get("paths").and_then(|v| v.as_object()) {
+        for (path, item) in paths {
+            let methods = item
+                .as_object()
+                .map(|ops| {
+                    ops.keys()
+                        .filter(|k| {
+                            matches!(
+                                k.as_str(),
+                                "get" | "post" | "put" | "patch" | "delete" | "head"
+                            )
+                        })
+                        .map(|k| k.to_uppercase())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            routes.push((path.clone(), methods));
+        }
+    }
+
+    routes.sort();
+    routes
+}
 
 /// 返回完整的 OpenAPI 3.0 规范 JSON
 pub fn openapi_json() -> serde_json::Value {
@@ -253,7 +285,7 @@ pub fn openapi_json() -> serde_json::Value {
                     "responses": { "200": { "description": "删除成功" } }
                 }
             },
-            "/api/admin/dict/{code}/items": {
+            "/api/dict/{code}/items": {
                 "get": {
                     "tags": ["数据字典"], "summary": "获取字典项",
                     "parameters": [{ "name": "code", "in": "path", "required": true, "schema": { "type": "string" } }],
@@ -460,7 +492,7 @@ pub fn openapi_json() -> serde_json::Value {
 pub async fn swagger_ui_handler(
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> Result<Response<String>, std::convert::Infallible> {
-    if path != "index.html" && path != "" {
+    if path != "index.html" && !path.is_empty() {
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body("Not Found".to_string())

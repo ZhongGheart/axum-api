@@ -1,25 +1,13 @@
 //! 应用入口
 //!
-//! 初始化 Tracing 日志系统、加载配置、构建路由、启动 HTTP 服务器。
-
-#![recursion_limit = "256"]
-
-mod config;
-mod controller;
-mod docs;
-mod error;
-mod middleware;
-mod model;
-mod repository;
-mod router;
-mod service;
-mod utils;
+//! 初始化日志、加载配置、构建路由并启动 HTTP 服务器。
 
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::router::create_router;
+use axum_api::config;
+use axum_api::router::create_router;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -42,9 +30,14 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // into_make_service_with_connect_info：向中间件暴露真实 TCP 来源地址，
+    // 使限流在未信任代理头时仍能取得客户端 IP
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }
@@ -79,14 +72,10 @@ async fn shutdown_signal() {
 /// 配置说明：
 /// - 支持通过 `RUST_LOG` 环境变量控制日志级别（如 `RUST_LOG=debug`）
 /// - 默认级别为 `info`
-/// - 同时输出到终端（格式化）和可用于日志收集的结构化输出
-/// - 包含 span 追踪信息，便于请求链路定位
+/// - 包含 span 追踪信息（request_id 等），便于请求链路定位
 fn init_tracing() {
-    // 环境变量过滤：RUST_LOG=debug ./target/release/axum-api
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    // 格式化终端输出（带颜色、时间戳、目标模块）
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_thread_ids(true)

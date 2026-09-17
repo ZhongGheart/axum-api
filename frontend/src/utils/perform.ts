@@ -30,14 +30,12 @@ export function useDebounce<T extends (...args: Parameters<T>) => ReturnType<T>>
 ): (...args: Parameters<T>) => ReturnType<T> | undefined {
   const { leading = false, trailing = true, maxWait } = options
   let timer: ReturnType<typeof setTimeout> | null = null
-  let lastCallTime = 0
   let lastInvokeTime = 0
   let result: ReturnType<T> | undefined
 
   return function (this: unknown, ...args: Parameters<T>): ReturnType<T> | undefined {
     const context = this
     const now = Date.now()
-    lastCallTime = now
 
     // 前缘执行：首次立即触发
     if (leading && !timer) {

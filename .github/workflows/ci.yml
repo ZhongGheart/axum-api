@@ -13,10 +13,43 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   rust:
-    name: Rust test and clippy
+    name: Rust (fmt / clippy / unit / integration)
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: axum_api_it
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/axum_api_it
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+      TEST_JWT_SECRET: integration-test-secret-value-0123456789
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,23 +57,32 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: rustfmt, clippy
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      # 警告即失败：历史上积累了 35 条 clippy 警告，正是死代码长期未被发现的信号
+      - name: Clippy (deny warnings)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
         run: cargo test --locked --all-targets --all-features
 
-      - name: Run clippy
-        run: cargo clippy --locked --all-targets --all-features
+      # 集成测试需要真实 Postgres + Redis，故标记为 #[ignore] 并在此显式运行
+      - name: Integration tests
+        run: cargo test --locked --test api_integration -- --ignored --test-threads=1
 
   frontend:
-    name: Frontend typecheck and build
+    name: Frontend (lint / typecheck / test / build)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: frontend
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,8 +102,36 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Lint
+        run: pnpm lint
+
       - name: Typecheck
         run: pnpm typecheck
 
+      - name: Tests
+        run: pnpm test
+
       - name: Build
         run: pnpm build
+
+  docker:
+    name: Docker images and compose config
+    runs-on: ubuntu-latest
+    needs: [rust, frontend]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: docker build -t axum-api:ci .
+
+      - name: Build frontend image
+        run: docker build -t axum-web:ci ./frontend
+
+      # 校验编排文件可解析（缺少必填变量时应当直接失败）
+      - name: Validate compose file
+        env:
+          DB_PASSWORD: ci-db-password
+          JWT_SECRET: ci-compose-secret-value-0123456789abcdef
+        run: docker compose config > /dev/null

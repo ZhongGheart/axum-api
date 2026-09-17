@@ -83,7 +83,7 @@
  *   />
  */
 import { computed, ref, h } from 'vue'
-import { NCheckbox, NSwitch, NButton, NInput } from 'naive-ui'
+import { NButton, NInput } from 'naive-ui'
 import type { DataTableColumn, DataTableSortState, DataTableSize } from 'naive-ui'
 import { debounce } from '@/utils/perform'
 

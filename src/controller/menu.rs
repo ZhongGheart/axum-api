@@ -1,10 +1,15 @@
 //! 菜单管理控制器
 
-use axum::{extract::{Path, Query, State}, Json};
+use axum::{
+    extract::{Path, Query, State},
+    Json,
+};
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::model::{ApiResponse, Menu, MenuNode, CreateMenuRequest, UpdateMenuRequest, AssignMenuRequest};
+use crate::model::{
+    ApiResponse, AssignMenuRequest, CreateMenuRequest, Menu, MenuNode, UpdateMenuRequest,
+};
 use crate::router::AppState;
 use crate::utils::validation;
 
@@ -77,6 +82,9 @@ pub async fn assign_role_menus(
     Path(role_id): Path<Uuid>,
     Json(req): Json<AssignMenuRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    state.menu_repo.assign_role_menus(role_id, &req.menu_ids).await?;
+    state
+        .menu_repo
+        .assign_role_menus(role_id, &req.menu_ids)
+        .await?;
     Ok(Json(ApiResponse::success("权限分配成功")))
 }

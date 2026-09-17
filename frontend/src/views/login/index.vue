@@ -75,8 +75,8 @@
  * 登录页面
  *
  * - 表单校验规则对齐后端（用户名 3-50 字符，密码至少 6 位）
- * - 记住密码：用户名 + 加密后的密码存入 localStorage
- * - 提交时前端 SHA-256 哈希，后端 Argon2 校验
+ * - 记住登录：只记忆用户名，口令不落盘
+ * - 口令经 HTTPS 明文提交，后端 Argon2 校验
  */
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
@@ -85,7 +85,6 @@ import type { FormInst, FormRules } from 'naive-ui'
 import { useUserStore } from '@/stores/user'
 import { showSuccess } from '@/utils/message'
 import { getStorage, setStorage, removeStorage } from '@/utils/storage'
-import { hashPassword } from '@/utils/crypto'
 
 // ── 状态 ────────────────────────────────────────────────────────
 
@@ -98,8 +97,8 @@ const submitting = ref(false)
 const REMEMBER_KEY = 'remember_login'
 
 interface RememberData {
+  /** 仅记忆用户名；口令不落盘，避免本地明文泄露 */
   username: string
-  password: string // 明文密码（仅用于填充表单，不再传输）
 }
 
 interface LoginForm {
@@ -134,17 +133,13 @@ function loadRemembered(): void {
   const saved = getStorage<RememberData>(REMEMBER_KEY)
   if (saved) {
     formData.value.username = saved.username
-    formData.value.password = saved.password
     rememberMe.value = true
   }
 }
 
 function saveRemembered(): void {
   if (rememberMe.value) {
-    setStorage(REMEMBER_KEY, {
-      username: formData.value.username,
-      password: formData.value.password,
-    })
+    setStorage(REMEMBER_KEY, { username: formData.value.username })
   } else {
     removeStorage(REMEMBER_KEY)
   }

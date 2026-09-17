@@ -59,7 +59,12 @@ impl RoleRepository {
             .into_iter()
             .map(|(id, name, description, created_at, user_count)| {
                 (
-                    RoleRow { id, name, description, created_at },
+                    RoleRow {
+                        id,
+                        name,
+                        description,
+                        created_at,
+                    },
                     user_count,
                 )
             })
@@ -174,5 +179,77 @@ impl RoleRepository {
             .map_err(|e| AppError::InternalServerError(format!("事务提交失败: {e}")))?;
 
         Ok(())
+    }
+
+    /// 全量替换某用户的角色集合（事务内先删后插）
+    ///
+    /// 角色的唯一数据源是 `user_roles`；整体替换必须原子完成，
+    /// 否则中途失败会留下"角色被清空但新角色未写入"的用户。
+    pub async fn replace_user_roles(
+        &self,
+        user_id: Uuid,
+        role_names: &[String],
+    ) -> Result<(), AppError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("事务开启失败: {e}")))?;
+
+        // 先校验所有角色都存在，避免删掉旧角色后才发现新角色非法
+        let mut role_ids = Vec::with_capacity(role_names.len());
+        for name in role_names {
+            let role: (Uuid,) = sqlx::query_as("SELECT id FROM roles WHERE name = $1")
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| AppError::InternalServerError(format!("查询角色失败: {e}")))?
+                .ok_or_else(|| AppError::NotFound(format!("角色不存在: {name}")))?;
+            role_ids.push(role.0);
+        }
+
+        sqlx::query("DELETE FROM user_roles WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("清除旧角色失败: {e}")))?;
+
+        for role_id in role_ids {
+            sqlx::query(
+                r#"
+                INSERT INTO user_roles (user_id, role_id)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id, role_id) DO NOTHING
+                "#,
+            )
+            .bind(user_id)
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("分配角色失败: {e}")))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("事务提交失败: {e}")))?;
+
+        Ok(())
+    }
+
+    /// 统计拥有指定角色的用户数（用于"最后一个管理员"保护）
+    pub async fn count_users_with_role(&self, role_name: &str) -> Result<i64, AppError> {
+        let count: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*)
+            FROM user_roles ur
+            JOIN roles r ON r.id = ur.role_id
+            WHERE r.name = $1
+            "#,
+        )
+        .bind(role_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("统计角色用户数失败: {e}")))?;
+        Ok(count.0)
     }
 }

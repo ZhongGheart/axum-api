@@ -3,12 +3,12 @@
 # ============================================
 # 阶段一：依赖安装与编译
 # ============================================
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
 # 安装 pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN corepack enable && corepack prepare pnpm@10.17.1 --activate
 
 # 复制依赖配置文件
 COPY package.json pnpm-lock.yaml ./

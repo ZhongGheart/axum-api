@@ -52,32 +52,48 @@ impl DictRepository {
         .map_err(|e| AppError::InternalServerError(format!("创建字典类型失败: {e}")))
     }
 
-    pub async fn update_type(&self, id: Uuid, fields: &crate::model::CreateDictTypeRequest) -> Result<DictType, AppError> {
+    pub async fn update_type(
+        &self,
+        id: Uuid,
+        fields: &crate::model::CreateDictTypeRequest,
+    ) -> Result<DictType, AppError> {
         let old = self.find_type_by_id(id).await?;
+        let old_code = old.code.clone();
         let code = &fields.code;
         let name = &fields.name;
         let desc = fields.description.as_deref().or(old.description.as_deref());
         let status = fields.status.as_deref().unwrap_or(&old.status);
         let sort = fields.sort_order.unwrap_or(old.sort_order);
-        sqlx::query_as::<_, DictType>(
+        let saved = sqlx::query_as::<_, DictType>(
             "UPDATE dict_types SET code=$2,name=$3,description=$4,status=$5,sort_order=$6 WHERE id=$1 RETURNING *",
         )
         .bind(id).bind(code).bind(name).bind(desc).bind(status).bind(sort)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| AppError::InternalServerError(format!("更新字典类型失败: {e}")))
+        .map_err(|e| AppError::InternalServerError(format!("更新字典类型失败: {e}")))?;
+
+        // 编码可能变化：新旧两个缓存键都要失效
+        self.invalidate_cache(&old_code).await;
+        self.invalidate_cache(code).await;
+        Ok(saved)
     }
 
     pub async fn delete_type(&self, id: Uuid) -> Result<(), AppError> {
-        sqlx::query("DELETE FROM dict_types WHERE id = $1").bind(id)
-            .execute(&self.pool).await.ok();
-        self.invalidate_cache().await;
+        let old = self.find_type_by_id(id).await?;
+        sqlx::query("DELETE FROM dict_types WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("删除字典类型失败: {e}")))?;
+        self.invalidate_cache(&old.code).await;
         Ok(())
     }
 
     async fn find_type_by_id(&self, id: Uuid) -> Result<DictType, AppError> {
-        sqlx::query_as::<_, DictType>("SELECT * FROM dict_types WHERE id=$1").bind(id)
-            .fetch_optional(&self.pool).await
+        sqlx::query_as::<_, DictType>("SELECT * FROM dict_types WHERE id=$1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
             .map_err(|e| AppError::InternalServerError(e.to_string()))?
             .ok_or_else(|| AppError::NotFound("字典类型不存在".into()))
     }
@@ -103,13 +119,19 @@ impl DictRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("创建字典项失败: {e}")))?;
-        self.invalidate_cache().await;
+        self.invalidate_cache_for_type(item.dict_type_id).await;
         Ok(saved)
     }
 
-    pub async fn update_item(&self, id: Uuid, fields: &crate::model::CreateDictItemRequest) -> Result<DictItem, AppError> {
-        let old = sqlx::query_as::<_, DictItem>("SELECT * FROM dict_items WHERE id=$1").bind(id)
-            .fetch_optional(&self.pool).await
+    pub async fn update_item(
+        &self,
+        id: Uuid,
+        fields: &crate::model::CreateDictItemRequest,
+    ) -> Result<DictItem, AppError> {
+        let old = sqlx::query_as::<_, DictItem>("SELECT * FROM dict_items WHERE id=$1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
             .map_err(|e| AppError::InternalServerError(e.to_string()))?
             .ok_or_else(|| AppError::NotFound("字典项不存在".into()))?;
         let label = &fields.label;
@@ -125,14 +147,24 @@ impl DictRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("更新字典项失败: {e}")))?;
-        self.invalidate_cache().await;
+        self.invalidate_cache_for_type(old.dict_type_id).await;
         Ok(saved)
     }
 
     pub async fn delete_item(&self, id: Uuid) -> Result<(), AppError> {
-        sqlx::query("DELETE FROM dict_items WHERE id = $1").bind(id)
-            .execute(&self.pool).await.ok();
-        self.invalidate_cache().await;
+        let old = sqlx::query_as::<_, DictItem>("SELECT * FROM dict_items WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("字典项不存在".into()))?;
+
+        sqlx::query("DELETE FROM dict_items WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("删除字典项失败: {e}")))?;
+        self.invalidate_cache_for_type(old.dict_type_id).await;
         Ok(())
     }
 
@@ -153,11 +185,18 @@ impl DictRepository {
         let type_opt = self.find_type_by_code(code).await?;
         if let Some(t) = type_opt {
             let items = self.list_items(t.id).await?;
-            let resp: Vec<DictItemResponse> = items.iter().map(|i| DictItemResponse {
-                id: i.id, label: i.label.clone(), value: i.value.clone(),
-                sort_order: i.sort_order, status: i.status.clone(),
-                is_default: i.is_default, color: i.color.clone(),
-            }).collect();
+            let resp: Vec<DictItemResponse> = items
+                .iter()
+                .map(|i| DictItemResponse {
+                    id: i.id,
+                    label: i.label.clone(),
+                    value: i.value.clone(),
+                    sort_order: i.sort_order,
+                    status: i.status.clone(),
+                    is_default: i.is_default,
+                    color: i.color.clone(),
+                })
+                .collect();
             // 写入 Redis 缓存
             if let Some(ref redis) = self.redis {
                 let cache_key = format!("{}{}", DICT_CACHE_PREFIX, code);
@@ -176,25 +215,49 @@ impl DictRepository {
         let mut result = vec![];
         for t in types {
             let items = self.list_items(t.id).await?;
-            let item_resp: Vec<DictItemResponse> = items.iter().map(|i| DictItemResponse {
-                id: i.id, label: i.label.clone(), value: i.value.clone(),
-                sort_order: i.sort_order, status: i.status.clone(),
-                is_default: i.is_default, color: i.color.clone(),
-            }).collect();
+            let item_resp: Vec<DictItemResponse> = items
+                .iter()
+                .map(|i| DictItemResponse {
+                    id: i.id,
+                    label: i.label.clone(),
+                    value: i.value.clone(),
+                    sort_order: i.sort_order,
+                    status: i.status.clone(),
+                    is_default: i.is_default,
+                    color: i.color.clone(),
+                })
+                .collect();
             result.push(DictTypeWithItems {
-                id: t.id, code: t.code, name: t.name,
-                description: t.description, status: t.status,
-                sort_order: t.sort_order, items: item_resp,
+                id: t.id,
+                code: t.code,
+                name: t.name,
+                description: t.description,
+                status: t.status,
+                sort_order: t.sort_order,
+                items: item_resp,
             });
         }
         Ok(result)
     }
 
-    /// 使字典缓存失效
-    async fn invalidate_cache(&self) {
+    /// 使指定字典编码的缓存失效
+    ///
+    /// 缓存失效失败不应让写操作失败，但必须可观测，
+    /// 否则用户会看到最长 1 小时的陈旧字典数据。
+    async fn invalidate_cache(&self, code: &str) {
         if let Some(ref redis) = self.redis {
-            // 简单方案：不精确清除，让缓存自然过期
-            // 生产环境可用 Redis SCAN 匹配删除
+            let cache_key = format!("{}{}", DICT_CACHE_PREFIX, code);
+            if let Err(e) = redis.delete_key(&cache_key).await {
+                tracing::warn!("字典缓存失效失败 (key={cache_key}): {e}");
+            }
+        }
+    }
+
+    /// 按字典类型 ID 使其编码对应缓存失效
+    async fn invalidate_cache_for_type(&self, type_id: Uuid) {
+        match self.find_type_by_id(type_id).await {
+            Ok(t) => self.invalidate_cache(&t.code).await,
+            Err(e) => tracing::warn!("字典缓存失效跳过（类型 {type_id} 查询失败）: {e}"),
         }
     }
 }

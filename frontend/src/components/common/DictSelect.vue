@@ -22,7 +22,7 @@
  *   <DictSelect code="gender" v-model="gender" />
  *   <DictSelect code="status" v-model="status" multiple />
  */
-import { ref, watch, computed, onMounted } from 'vue'
+import { ref, watch, computed } from 'vue'
 import type { SelectOption } from 'naive-ui'
 import { dictApi } from '@/api/dict'
 import type { DictItemInfo } from '@/api/dict'
@@ -47,7 +47,7 @@ const props = withDefaults(
   { filterable: true, clearable: true, multiple: false },
 )
 
-const emit = defineEmits<{
+defineEmits<{
   'update:modelValue': [value: string | string[] | null]
 }>()
 

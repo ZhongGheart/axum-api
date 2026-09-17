@@ -35,12 +35,8 @@ pub async fn api_metrics(
     // 计算聚合数据
     let total_calls: u64 = snapshot.iter().map(|m| m.call_count).sum();
     let total_errors: u64 = snapshot.iter().map(|m| m.error_count).sum();
-    let avg_response: u64 = if total_calls > 0 {
-        let total_duration: u64 = snapshot.iter().map(|m| m.total_duration_ms).sum();
-        total_duration / total_calls
-    } else {
-        0
-    };
+    let total_duration: u64 = snapshot.iter().map(|m| m.total_duration_ms).sum();
+    let avg_response: u64 = total_duration.checked_div(total_calls).unwrap_or(0);
 
     let result = serde_json::json!({
         "metrics": snapshot,
@@ -88,8 +84,7 @@ pub async fn reset_metrics(
 pub async fn export_system(
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, AppError> {
-    use crate::utils::export::{ExcelExport, ExcelColumn};
-    use std::sync::Arc;
+    use crate::utils::export::{ExcelColumn, ExcelExport};
 
     let sys = MonitorService::get_system_info()?;
     let db = MonitorService::get_database_status(&state).await?;
@@ -99,17 +94,29 @@ pub async fn export_system(
 
     // 系统资源 sheet
     let columns = vec![
-        ExcelColumn { header: "指标".into(), width: 20.0 },
-        ExcelColumn { header: "值".into(), width: 20.0 },
+        ExcelColumn {
+            header: "指标".into(),
+            width: 20.0,
+        },
+        ExcelColumn {
+            header: "值".into(),
+            width: 20.0,
+        },
     ];
     let rows = vec![
         vec!["操作系统".into(), sys.os.clone()],
         vec!["主机名".into(), sys.hostname.clone()],
-        vec!["CPU 使用率".into(), format!("{:.1}%", sys.cpu.usage_percent)],
+        vec![
+            "CPU 使用率".into(),
+            format!("{:.1}%", sys.cpu.usage_percent),
+        ],
         vec!["CPU 核心数".into(), sys.cpu.core_count.to_string()],
         vec!["内存总量".into(), format!("{} MB", sys.memory.total_mb)],
         vec!["内存已用".into(), format!("{} MB", sys.memory.used_mb)],
-        vec!["内存使用率".into(), format!("{:.1}%", sys.memory.usage_percent)],
+        vec![
+            "内存使用率".into(),
+            format!("{:.1}%", sys.memory.usage_percent),
+        ],
         vec!["数据库活跃连接".into(), db.active_connections.to_string()],
         vec!["Redis 连接".into(), redis.connected_clients.to_string()],
     ];
@@ -117,19 +124,35 @@ pub async fn export_system(
 
     // 磁盘 sheet
     let disk_columns = vec![
-        ExcelColumn { header: "名称".into(), width: 15.0 },
-        ExcelColumn { header: "总量(GB)".into(), width: 12.0 },
-        ExcelColumn { header: "已用(GB)".into(), width: 12.0 },
-        ExcelColumn { header: "使用率".into(), width: 10.0 },
+        ExcelColumn {
+            header: "名称".into(),
+            width: 15.0,
+        },
+        ExcelColumn {
+            header: "总量(GB)".into(),
+            width: 12.0,
+        },
+        ExcelColumn {
+            header: "已用(GB)".into(),
+            width: 12.0,
+        },
+        ExcelColumn {
+            header: "使用率".into(),
+            width: 10.0,
+        },
     ];
-    let disk_rows: Vec<Vec<String>> = sys.disks.iter().map(|d| {
-        vec![
-            d.name.clone(),
-            d.total_gb.to_string(),
-            d.used_gb.to_string(),
-            format!("{:.1}%", d.usage_percent),
-        ]
-    }).collect();
+    let disk_rows: Vec<Vec<String>> = sys
+        .disks
+        .iter()
+        .map(|d| {
+            vec![
+                d.name.clone(),
+                d.total_gb.to_string(),
+                d.used_gb.to_string(),
+                format!("{:.1}%", d.usage_percent),
+            ]
+        })
+        .collect();
     export.add_sheet_from_rows("磁盘信息", &disk_columns, &disk_rows)?;
 
     export.into_response()

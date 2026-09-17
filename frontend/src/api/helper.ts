@@ -4,7 +4,7 @@
  * 请求重试逻辑 + 错误消息集成。
  */
 
-import type { AxiosError, AxiosResponse } from 'axios'
+import type { AxiosError } from 'axios'
 import { showError } from '@/utils/message'
 
 /** 重试配置 */

@@ -51,7 +51,11 @@ pub async fn get_user_roles(
     State(state): State<AppState>,
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, AppError> {
-    let roles = state.auth_service.role_repo.find_roles_by_user_id(user_id).await?;
+    let roles = state
+        .auth_service
+        .role_repo
+        .find_roles_by_user_id(user_id)
+        .await?;
     Ok(Json(ApiResponse::success(roles)))
 }
 
@@ -61,7 +65,11 @@ pub async fn assign_user_role(
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
     Json(req): Json<AssignRoleRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    state.auth_service.role_repo.assign_role_to_user(user_id, &req.role_name).await?;
+    state
+        .auth_service
+        .role_repo
+        .assign_role_to_user(user_id, &req.role_name)
+        .await?;
     Ok(Json(ApiResponse::success("角色分配成功")))
 }
 
@@ -72,7 +80,9 @@ pub async fn create_role(
 ) -> Result<Json<ApiResponse<RoleItem>>, AppError> {
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO roles (id, name, description) VALUES ($1, $2, $3)")
-        .bind(id).bind(&req.name).bind(&req.description)
+        .bind(id)
+        .bind(&req.name)
+        .bind(&req.description)
         .execute(&state.auth_service.user_repo.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("创建角色失败: {e}")))?;
@@ -92,7 +102,9 @@ pub async fn update_role(
     Json(req): Json<CreateRoleReq>,
 ) -> Result<Json<ApiResponse<RoleItem>>, AppError> {
     sqlx::query("UPDATE roles SET name = $1, description = $2 WHERE id = $3")
-        .bind(&req.name).bind(&req.description).bind(id)
+        .bind(&req.name)
+        .bind(&req.description)
+        .bind(id)
         .execute(&state.auth_service.user_repo.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("更新角色失败: {e}")))?;
@@ -110,8 +122,15 @@ pub async fn delete_role(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    sqlx::query("DELETE FROM user_roles WHERE role_id = $1").bind(id).execute(&state.auth_service.user_repo.pool).await.ok();
-    sqlx::query("DELETE FROM roles WHERE id = $1").bind(id).execute(&state.auth_service.user_repo.pool).await
+    sqlx::query("DELETE FROM user_roles WHERE role_id = $1")
+        .bind(id)
+        .execute(&state.auth_service.user_repo.pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM roles WHERE id = $1")
+        .bind(id)
+        .execute(&state.auth_service.user_repo.pool)
+        .await
         .map_err(|e| AppError::InternalServerError(format!("删除角色失败: {e}")))?;
     Ok(Json(ApiResponse::success("角色删除成功")))
 }

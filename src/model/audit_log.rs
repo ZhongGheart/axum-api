@@ -20,18 +20,3 @@ pub struct AuditLog {
     pub duration_ms: Option<i32>,
     pub created_at: DateTime<Utc>,
 }
-
-/// 操作日志写入请求
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateAuditLogRequest {
-    pub user_id: Option<Uuid>,
-    pub username: Option<String>,
-    pub action: String,
-    pub method: String,
-    pub path: String,
-    pub params: Option<String>,
-    pub result: Option<String>,
-    pub status_code: Option<i32>,
-    pub client_ip: Option<String>,
-    pub duration_ms: Option<i32>,
-}

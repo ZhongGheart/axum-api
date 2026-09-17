@@ -113,7 +113,6 @@ import {
 import type { FormInst, FormRules } from 'naive-ui'
 import { authApi } from '@/api/auth'
 import { showSuccess } from '@/utils/message'
-import { hashPassword } from '@/utils/crypto'
 import { handleError } from '@/api/helper'
 
 // ── 状态 ────────────────────────────────────────────────────────
@@ -173,13 +172,11 @@ async function handleRegister(): Promise<void> {
     await formRef.value?.validate()
     submitting.value = true
 
-    // 前端 SHA-256 哈希后再传输
-    const hashedPassword = await hashPassword(formData.value.password)
-
+    // 口令经 HTTPS 明文提交，由服务端 Argon2 存储
     await authApi.register({
       username: formData.value.username,
       email: formData.value.email,
-      password: hashedPassword,
+      password: formData.value.password,
     })
 
     showSuccess('注册成功，请登录')

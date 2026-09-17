@@ -38,7 +38,11 @@ pub struct AuthenticatedUser {
     pub role: String,
     /// 用户拥有的所有角色标识列表
     pub roles: Vec<String>,
-    /// JWT 过期时间戳（用于黑名单校验）
+    /// 用户名（审计日志展示用）
+    pub username: String,
+    /// 当前令牌的 jti（用于单令牌注销）
+    pub token_jti: String,
+    /// JWT 过期时间戳（用于黑名单 TTL）
     pub token_exp: u64,
 }
 
@@ -62,38 +66,66 @@ pub async fn auth_middleware(
             error_response(StatusCode::UNAUTHORIZED, "缺少 Authorization 请求头")
         })?;
 
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| {
-            tracing::warn!("auth_middleware: Authorization 格式错误: {}", &auth_header[..20.min(auth_header.len())]);
+    let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
+        tracing::warn!(
+            "auth_middleware: Authorization 格式错误: {}",
+            &auth_header[..20.min(auth_header.len())]
+        );
+        error_response(
+            StatusCode::UNAUTHORIZED,
+            "Authorization 格式错误，请使用 Bearer <token>",
+        )
+    })?;
+
+    let claims: Claims = state.jwt_util.verify(token).map_err(|e| {
+        tracing::warn!("auth_middleware: JWT 验证失败: {:?}", e);
+        error_response(StatusCode::UNAUTHORIZED, "令牌无效或已过期")
+    })?;
+
+    // 单令牌注销校验（登出/下线）：Redis 不可用时 fail-closed
+    let blacklisted = state
+        .redis_client
+        .is_token_blacklisted(&claims.jti)
+        .await
+        .map_err(|e| {
+            tracing::error!("auth_middleware: 令牌黑名单校验失败: {e}");
             error_response(
-                StatusCode::UNAUTHORIZED,
-                "Authorization 格式错误，请使用 Bearer <token>",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "认证依赖不可用，请稍后重试",
             )
         })?;
+    if blacklisted {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "令牌已被注销，请重新登录",
+        ));
+    }
 
-    let claims: Claims = state
-        .jwt_util
-        .verify(token)
-        .map_err(|e| {
-            tracing::warn!("auth_middleware: JWT 验证失败: {:?}", e);
-            error_response(StatusCode::UNAUTHORIZED, "令牌无效或已过期")
-        })?;
-
-    // 检查 Token 是否在黑名单中（已下线/登出）
-    if state
+    // 全量会话吊销校验（改密/停用/删除账号）
+    let revoked_before = state
         .redis_client
-        .is_token_blacklisted(&claims.sub.to_string())
+        .user_revoked_before(&claims.sub)
         .await
-        .unwrap_or(false)
-    {
-        return Err(error_response(StatusCode::UNAUTHORIZED, "令牌已被注销，请重新登录"));
+        .map_err(|e| {
+            tracing::error!("auth_middleware: 会话吊销校验失败: {e}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "认证依赖不可用，请稍后重试",
+            )
+        })?;
+    if matches!(revoked_before, Some(ts) if claims.iat < ts) {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "登录状态已失效，请重新登录",
+        ));
     }
 
     let authenticated_user = AuthenticatedUser {
         user_id: claims.sub,
+        username: claims.username.clone(),
         role: claims.role.clone(),
         roles: claims.roles.clone(),
+        token_jti: claims.jti.clone(),
         token_exp: claims.exp,
     };
     req.extensions_mut().insert(authenticated_user);
@@ -116,9 +148,7 @@ where
             .extensions
             .get::<AuthenticatedUser>()
             .cloned()
-            .ok_or_else(|| {
-                error_response(StatusCode::UNAUTHORIZED, "未认证，请先登录")
-            })
+            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "未认证，请先登录"))
     }
 }
 
@@ -128,15 +158,20 @@ pub async fn require_role(
     req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, Response> {
-    let auth_user = req.extensions().get::<AuthenticatedUser>().ok_or_else(|| {
-        error_response(StatusCode::UNAUTHORIZED, "未认证")
-    })?;
+    let auth_user = req
+        .extensions()
+        .get::<AuthenticatedUser>()
+        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "未认证"))?;
 
-    let has_role = auth_user.roles.iter().any(|r| r == role)
-        || auth_user.role == role;
+    let has_role = auth_user.roles.iter().any(|r| r == role) || auth_user.role == role;
 
     if !has_role {
-        tracing::warn!("require_role({}): 用户 {} 角色 {:?} 权限不足", role, auth_user.user_id, auth_user.roles);
+        tracing::warn!(
+            "require_role({}): 用户 {} 角色 {:?} 权限不足",
+            role,
+            auth_user.user_id,
+            auth_user.roles
+        );
         return Err(error_response(
             StatusCode::FORBIDDEN,
             format!("需要 {role} 角色权限"),

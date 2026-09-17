@@ -97,22 +97,25 @@ impl MonitorService {
 
         let disks: Vec<DiskInfo> = {
             let disks_list = Disks::new_with_refreshed_list();
-            disks_list.iter().map(|disk| {
-                let total = disk.total_space();
-                let available = disk.available_space();
-                let used = total.saturating_sub(available);
-                DiskInfo {
-                    total_gb: total / 1024 / 1024 / 1024,
-                    used_gb: used / 1024 / 1024 / 1024,
-                    free_gb: available / 1024 / 1024 / 1024,
-                    usage_percent: if total > 0 {
-                        (used as f32 / total as f32) * 100.0
-                    } else {
-                        0.0
-                    },
-                    name: disk.name().to_str().unwrap_or("").to_string(),
-                }
-            }).collect()
+            disks_list
+                .iter()
+                .map(|disk| {
+                    let total = disk.total_space();
+                    let available = disk.available_space();
+                    let used = total.saturating_sub(available);
+                    DiskInfo {
+                        total_gb: total / 1024 / 1024 / 1024,
+                        used_gb: used / 1024 / 1024 / 1024,
+                        free_gb: available / 1024 / 1024 / 1024,
+                        usage_percent: if total > 0 {
+                            (used as f32 / total as f32) * 100.0
+                        } else {
+                            0.0
+                        },
+                        name: disk.name().to_str().unwrap_or("").to_string(),
+                    }
+                })
+                .collect()
         };
 
         Ok(SystemInfo {
@@ -190,7 +193,10 @@ impl MonitorService {
     }
 
     /// 告警检查
-    pub fn check_alerts(system: &SystemInfo, metrics: &[crate::middleware::api_metrics::EndpointMetric]) -> Vec<AlertInfo> {
+    pub fn check_alerts(
+        system: &SystemInfo,
+        metrics: &[crate::middleware::api_metrics::EndpointMetric],
+    ) -> Vec<AlertInfo> {
         let mut alerts = vec![];
 
         // CPU 过高告警

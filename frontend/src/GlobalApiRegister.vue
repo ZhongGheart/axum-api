@@ -1,5 +1,6 @@
 <template>
-  <!-- 此组件无 UI，仅在 setup 中注册全局 API -->
+  <!-- 无 UI：仅执行 setup 注册全局 API；无子节点时不渲染任何内容 -->
+  <slot />
 </template>
 
 <script setup lang="ts">

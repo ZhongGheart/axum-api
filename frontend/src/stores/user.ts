@@ -9,7 +9,7 @@ import type { LoginRequest, UserInfo } from '@/api/types/response'
 import { authApi } from '@/api/auth'
 import { handleError } from '@/api/helper'
 import { getToken, removeToken, setToken, setUserInfo, removeUserInfo, getUserInfo } from '@/utils/storage'
-import { hashPassword } from '@/utils/crypto'
+import { requestCache } from '@/utils/cache'
 import router from '@/router'
 
 export const useUserStore = defineStore('user', () => {
@@ -26,17 +26,18 @@ export const useUserStore = defineStore('user', () => {
 
   async function login(req: LoginRequest) {
     try {
-      // 前端对密码做 SHA-256 哈希，后端再对哈希值做 Argon2 加密
-      const hashedPassword = await hashPassword(req.password)
+      // 口令经 HTTPS 明文提交，服务端用 Argon2 存储（不再做客户端预哈希）
       const res = await authApi.login({
         username: req.username,
-        password: hashedPassword,
+        password: req.password,
       })
 
       const data = res as unknown as { token: string; token_type: string }
       token.value = data.token
       setToken(data.token)
       isLoggedIn.value = true
+      // 换账号后不得复用上一会话的 GET 缓存
+      requestCache.invalidate()
 
       return data
     } catch (error) {
@@ -57,6 +58,7 @@ export const useUserStore = defineStore('user', () => {
       isLoggedIn.value = false
       removeToken()
       removeUserInfo()
+      requestCache.invalidate()
       router.push('/login')
     }
   }
