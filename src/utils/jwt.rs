@@ -18,6 +18,8 @@ pub struct Claims {
     pub role: String,
     /// 用户拥有的所有角色标识列表（RBAC 权限判断依据）
     pub roles: Vec<String>,
+    /// 令牌唯一标识（用于单令牌注销）
+    pub jti: String,
     /// 签发时间（Unix 时间戳，JWT 标准要求 u64）
     pub iat: u64,
     /// 过期时间（Unix 时间戳，JWT 标准要求 u64）
@@ -62,6 +64,7 @@ impl JwtUtil {
             sub: user_id,
             role: role.to_string(),
             roles: roles.to_vec(),
+            jti: Uuid::new_v4().to_string(),
             iat: now,
             exp: now + expiration_seconds,
         };
@@ -114,6 +117,20 @@ mod tests {
         assert_eq!(claims.role, "admin");
         assert!(claims.roles.contains(&"user".to_string()));
         assert!(claims.roles.contains(&"admin".to_string()));
+        assert!(!claims.jti.is_empty());
+    }
+
+    #[test]
+    fn test_each_token_has_unique_jti() {
+        let jwt = JwtUtil::new("test_secret_key");
+        let user_id = Uuid::new_v4();
+        let a = jwt.sign(user_id, "user", &[], 3600).unwrap();
+        let b = jwt.sign(user_id, "user", &[], 3600).unwrap();
+        assert_ne!(
+            jwt.verify(&a).unwrap().jti,
+            jwt.verify(&b).unwrap().jti,
+            "同一用户的不同令牌必须具有不同 jti，才能单令牌注销"
+        );
     }
 
     #[test]

@@ -115,6 +115,11 @@ pub async fn delete_user(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     state.auth_service.user_repo.delete(id).await?;
+    // 账号已删除：吊销其全部会话
+    state
+        .auth_service
+        .revoke_all_sessions(&state.redis_client, id)
+        .await?;
     tracing::info!("管理员删除用户: {}", id);
     Ok(Json(ApiResponse::success("删除成功")))
 }
@@ -147,6 +152,15 @@ pub async fn toggle_user_status(
     let updated = state.auth_service.user_repo
         .update(id, &user.username, &user.email, &user.role.to_string(), req.is_active)
         .await?;
+
+    // 停用账号必须立即失效其全部会话
+    if !req.is_active {
+        state
+            .auth_service
+            .revoke_all_sessions(&state.redis_client, id)
+            .await?;
+    }
+
     Ok(Json(ApiResponse::success(UserInfo::from(updated))))
 }
 
@@ -162,13 +176,27 @@ pub async fn reset_user_password(
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     use crate::utils::password::hash_password;
+    use crate::utils::validation;
+
+    // 先确认用户存在（不存在则 404），再校验新口令
+    let user = state.auth_service.user_repo.find_by_id(id).await?;
+    validation::validate_password(&req.password)?;
+
     let hashed = hash_password(&req.password)
         .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
-        .bind(&hashed).bind(id)
-        .execute(&state.auth_service.user_repo.pool)
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("重置密码失败: {e}")))?;
+    state
+        .auth_service
+        .user_repo
+        .update_password_hash(id, &hashed)
+        .await?;
+
+    // 口令已变化：吊销该用户全部存量会话
+    state
+        .auth_service
+        .revoke_all_sessions(&state.redis_client, id)
+        .await?;
+
+    tracing::info!("管理员重置用户密码并吊销会话: {}", user.username);
     Ok(Json(ApiResponse::success("密码重置成功")))
 }
 

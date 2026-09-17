@@ -38,7 +38,9 @@ pub struct AuthenticatedUser {
     pub role: String,
     /// 用户拥有的所有角色标识列表
     pub roles: Vec<String>,
-    /// JWT 过期时间戳（用于黑名单校验）
+    /// 当前令牌的 jti（用于单令牌注销）
+    pub token_jti: String,
+    /// JWT 过期时间戳（用于黑名单 TTL）
     pub token_exp: u64,
 }
 
@@ -80,20 +82,46 @@ pub async fn auth_middleware(
             error_response(StatusCode::UNAUTHORIZED, "令牌无效或已过期")
         })?;
 
-    // 检查 Token 是否在黑名单中（已下线/登出）
-    if state
+    // 单令牌注销校验（登出/下线）：Redis 不可用时 fail-closed
+    let blacklisted = state
         .redis_client
-        .is_token_blacklisted(&claims.sub.to_string())
+        .is_token_blacklisted(&claims.jti)
         .await
-        .unwrap_or(false)
-    {
+        .map_err(|e| {
+            tracing::error!("auth_middleware: 令牌黑名单校验失败: {e}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "认证依赖不可用，请稍后重试",
+            )
+        })?;
+    if blacklisted {
         return Err(error_response(StatusCode::UNAUTHORIZED, "令牌已被注销，请重新登录"));
+    }
+
+    // 全量会话吊销校验（改密/停用/删除账号）
+    let revoked_before = state
+        .redis_client
+        .user_revoked_before(&claims.sub)
+        .await
+        .map_err(|e| {
+            tracing::error!("auth_middleware: 会话吊销校验失败: {e}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "认证依赖不可用，请稍后重试",
+            )
+        })?;
+    if matches!(revoked_before, Some(ts) if claims.iat < ts) {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "登录状态已失效，请重新登录",
+        ));
     }
 
     let authenticated_user = AuthenticatedUser {
         user_id: claims.sub,
         role: claims.role.clone(),
         roles: claims.roles.clone(),
+        token_jti: claims.jti.clone(),
         token_exp: claims.exp,
     };
     req.extensions_mut().insert(authenticated_user);

@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::error::AppError;
 use crate::middleware::auth::AuthenticatedUser;
+use crate::middleware::client_ip::ClientIp;
 use crate::model::{ApiResponse, LoginRequest, LoginResponse, RegisterRequest, UserInfo};
 use crate::router::AppState;
 
@@ -22,9 +23,13 @@ pub async fn register(
 /// POST /api/auth/login — 用户登录
 pub async fn login(
     State(state): State<AppState>,
+    client_ip: ClientIp,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<ApiResponse<LoginResponse>>, AppError> {
-    let login_resp = state.auth_service.login(req, &state.redis_client).await?;
+    let login_resp = state
+        .auth_service
+        .login(req, &state.redis_client, &client_ip.0)
+        .await?;
     Ok(Json(ApiResponse::success(login_resp)))
 }
 
@@ -39,14 +44,18 @@ pub async fn me(
     Ok(Json(ApiResponse::success(user_info)))
 }
 
-/// POST /api/auth/logout — 用户登出（Token 加入 Redis 黑名单）
+/// POST /api/auth/logout — 用户登出（仅注销当前令牌）
 pub async fn logout(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     state
         .auth_service
-        .logout(&state.redis_client, auth_user.user_id, auth_user.token_exp)
+        .logout(
+            &state.redis_client,
+            &auth_user.token_jti,
+            auth_user.token_exp,
+        )
         .await?;
     Ok(Json(ApiResponse::success("登出成功")))
 }

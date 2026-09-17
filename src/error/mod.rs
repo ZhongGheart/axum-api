@@ -39,9 +39,17 @@ pub enum AppError {
     #[error("资源冲突: {0}")]
     Conflict(String),
 
-    /// 验证失败（用户名或密码错误）
-    #[error("验证失败: {0}")]
+    /// 凭证错误（用户名或密码错误）
+    #[error("凭证错误: {0}")]
+    InvalidCredentials(String),
+
+    /// 校验失败（入参不合法）
+    #[error("校验失败: {0}")]
     ValidationFailed(String),
+
+    /// 触发限流/锁定
+    #[error("请求过于频繁: {0}")]
+    TooManyRequests(String),
 
     /// 内部服务器错误（数据库异常等）
     #[error("服务器内部错误: {0}")]
@@ -61,7 +69,9 @@ impl IntoResponse for AppError {
             AppError::Forbidden => (StatusCode::FORBIDDEN, self.to_string()),
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
-            AppError::ValidationFailed(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
+            AppError::InvalidCredentials(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
+            AppError::ValidationFailed(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             AppError::InternalServerError(_) => {
                 // 生产环境不暴露具体内部错误信息
                 (StatusCode::INTERNAL_SERVER_ERROR, "服务器内部错误".to_string())

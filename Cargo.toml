@@ -42,7 +42,7 @@ redis = { version = "0.28", features = ["tokio-comp", "connection-manager"] }
 # 密码加密
 argon2 = "0.5"
 
-# SHA-256 哈希（对齐前端密码传输）
+# SHA-256（仅用于兼容 v0.1 旧口令格式，v0.3 起可移除）
 sha2 = "0.10"
 
 # JWT
@@ -57,28 +57,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Excel 导出
 rust_xlsxwriter = "0.82"
 
-# RSA 非对称加密
-rsa = { version = "0.9", features = ["pem"] }
-rand = "0.8"
-sha1 = "0.10"
-
-# AES-GCM 对称加密（请求体加密）
-aes-gcm = "0.10"
-
-# Base64 编码
-base64 = "0.22"
-
-# 图形验证码（手动生成，使用 rand + uuid）
-
-# 参数校验
-validator = { version = "0.20", features = ["derive"] }
-
 # 文件下载（响应头）
 axum-extra = { version = "0.10", features = ["typed-header"] }
 
 # 系统监控（CPU/内存/磁盘/进程）
 sysinfo = "0.33"
-
-# OpenAPI 接口文档
 
 

@@ -5,7 +5,12 @@
 
 use std::env;
 use std::net::SocketAddr;
-use crate::utils::crypto::CryptoConfig;
+
+/// 已知示例占位密钥，生产启动时必须拒绝
+const PLACEHOLDER_JWT_SECRETS: [&str; 2] = [
+    "your-super-secret-jwt-key-change-in-production",
+    "change-me",
+];
 
 /// 读写分离数据库配置
 #[derive(Debug, Clone)]
@@ -47,9 +52,22 @@ pub struct RateLimitConfig {
     pub user_window_seconds: u64,
 }
 
+/// 安全策略配置
+#[derive(Debug, Clone)]
+pub struct SecurityConfig {
+    /// 是否信任上游代理的转发头（决定客户端 IP 取值方式）
+    pub trust_proxy_headers: bool,
+    /// 登录失败锁定阈值（账号与 IP 各自独立计数）
+    pub login_max_failures: u64,
+    /// 登录失败计数窗口（秒）
+    pub login_failure_window_seconds: u64,
+}
+
 /// 应用全局配置
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// 运行环境：development / production
+    pub app_env: String,
     /// 服务器监听地址
     pub server_addr: SocketAddr,
     /// 数据库连接字符串
@@ -66,14 +84,10 @@ pub struct Config {
     pub pool: PoolConfig,
     /// 限流配置
     pub rate_limit: RateLimitConfig,
-    /// 应用密钥
-    pub app_secret: String,
-    /// 加密配置
-    pub crypto: CryptoConfig,
+    /// 安全策略配置
+    pub security: SecurityConfig,
     /// 数据库读写分离配置
     pub database: DatabaseConfig,
-    /// 验证码配置
-    pub captcha_enabled: bool,
     /// 启动时是否自动执行数据库迁移
     pub migrate_on_startup: bool,
 }
@@ -81,6 +95,8 @@ pub struct Config {
 impl Config {
     /// 从环境变量加载配置
     pub fn from_env() -> Self {
+        let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+
         let host = env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port: u16 = env::var("SERVER_PORT")
             .unwrap_or_else(|_| "8080".to_string())
@@ -94,19 +110,32 @@ impl Config {
         let database_url = env::var("DATABASE_URL")
             .expect("缺少 DATABASE_URL 环境变量");
 
-        let jwt_secret = env::var("JWT_SECRET")
-            .expect("缺少 JWT_SECRET 环境变量");
+        let jwt_secret = env::var("JWT_SECRET").expect("缺少 JWT_SECRET 环境变量");
+        // 拒绝弱密钥与示例占位值，避免签名可被伪造
+        if jwt_secret.len() < 32 {
+            panic!("JWT_SECRET 长度必须不少于 32 个字符（可用 `openssl rand -base64 48` 生成）");
+        }
+        if PLACEHOLDER_JWT_SECRETS.contains(&jwt_secret.as_str()) {
+            if app_env == "production" {
+                panic!("生产环境禁止使用示例占位 JWT_SECRET，请用 `openssl rand -base64 48` 生成");
+            }
+            tracing::warn!("JWT_SECRET 使用示例占位值，仅可用于本地开发");
+        }
 
         let jwt_expiration_seconds: u64 = env::var("JWT_EXPIRATION_SECONDS")
             .unwrap_or_else(|_| "604800".to_string())
             .parse()
             .expect("JWT_EXPIRATION_SECONDS 必须是有效的数字");
 
-        let cors_allowed_origins = env::var("CORS_ALLOWED_ORIGINS")
-            .unwrap_or_else(|_| "*".to_string())
+        let cors_allowed_origins: Vec<String> = env::var("CORS_ALLOWED_ORIGINS")
+            .unwrap_or_else(|_| "http://localhost:3000".to_string())
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
+
+        if app_env == "production" && cors_allowed_origins.iter().any(|o| o == "*") {
+            panic!("生产环境禁止 CORS_ALLOWED_ORIGINS=*，请显式列出允许的来源");
+        }
 
         // Redis 配置
         let redis = RedisConfig {
@@ -124,22 +153,6 @@ impl Config {
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()
                 .expect("DB_CONNECT_TIMEOUT 必须是有效的数字"),
-        };
-
-        // 应用密钥（用于验证码生成等）
-        let app_secret = env::var("APP_SECRET")
-            .unwrap_or_else(|_| jwt_secret.clone());
-
-        // 加密配置
-        let crypto = CryptoConfig {
-            private_key_pem: env::var("RSA_PRIVATE_KEY").unwrap_or_default(),
-            public_key_pem: env::var("RSA_PUBLIC_KEY").ok(),
-            enabled: env::var("CRYPTO_ENABLED").unwrap_or_else(|_| "true".to_string()) == "true",
-            enforced_paths: env::var("CRYPTO_ENFORCED_PATHS")
-                .unwrap_or_else(|_| "/api/auth/login,/api/auth/register".to_string())
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect(),
         };
 
         // 数据库读写分离
@@ -161,10 +174,6 @@ impl Config {
             .unwrap_or_else(|_| "true".to_string())
             != "false";
 
-        // 验证码
-        let captcha_enabled = env::var("CAPTCHA_ENABLED")
-            .unwrap_or_else(|_| "false".to_string()) == "true";
-
         // 限流配置
         let rate_limit = RateLimitConfig {
             ip_max_requests: env::var("RATE_LIMIT_IP_MAX")
@@ -185,7 +194,22 @@ impl Config {
                 .expect("RATE_LIMIT_USER_WINDOW 必须是有效的数字"),
         };
 
+        let security = SecurityConfig {
+            trust_proxy_headers: env::var("TRUST_PROXY_HEADERS")
+                .unwrap_or_else(|_| "false".to_string())
+                == "true",
+            login_max_failures: env::var("LOGIN_MAX_FAILURES")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .expect("LOGIN_MAX_FAILURES 必须是有效的数字"),
+            login_failure_window_seconds: env::var("LOGIN_FAILURE_WINDOW")
+                .unwrap_or_else(|_| "300".to_string())
+                .parse()
+                .expect("LOGIN_FAILURE_WINDOW 必须是有效的数字"),
+        };
+
         Self {
+            app_env,
             server_addr,
             database_url,
             jwt_secret,
@@ -194,10 +218,8 @@ impl Config {
             redis,
             pool,
             rate_limit,
-            app_secret,
-            crypto,
+            security,
             database,
-            captcha_enabled,
             migrate_on_startup,
         }
     }

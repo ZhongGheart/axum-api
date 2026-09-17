@@ -81,54 +81,120 @@ impl RedisClient {
     }
 
     // ──────────────────────────────────────────────
-    // Token 黑名单
+    // 会话注销
     // ──────────────────────────────────────────────
+    //
+    // 两类注销语义：
+    // 1. 单令牌注销（登出）：以 jti 为键，只影响当前设备
+    // 2. 全量会话吊销（改密/停用/删除账号）：记录时间点，使该用户在此之前签发的令牌全部失效
 
-    /// Token 黑名单 Key 前缀
+    /// 单令牌黑名单 Key 前缀
     const TOKEN_BLACKLIST_PREFIX: &'static str = "token:blacklist:";
+    /// 用户会话吊销时间点 Key 前缀
+    const USER_REVOKED_PREFIX: &'static str = "user:revoked_before:";
 
-    /// 将 Token 加入黑名单，TTL 由 Token 剩余有效期决定
-    pub async fn add_token_to_blacklist(
-        &self,
-        token_sub: &str,
-        token_exp: u64,
-    ) -> Result<()> {
-        let key = format!("{}{}", Self::TOKEN_BLACKLIST_PREFIX, token_sub);
+    /// 注销单个令牌（jti），TTL 由令牌剩余有效期决定
+    pub async fn add_token_to_blacklist(&self, jti: &str, token_exp: u64) -> Result<()> {
+        let key = format!("{}{}", Self::TOKEN_BLACKLIST_PREFIX, jti);
         let now = chrono::Utc::now().timestamp() as u64;
         // 剩余有效秒数 = 令牌过期时间 - 当前时间，最少 1 秒
-        let ttl = if token_exp > now {
-            token_exp - now
-        } else {
-            1
-        };
+        let ttl = if token_exp > now { token_exp - now } else { 1 };
 
         let mut conn = self.conn.clone();
-        let _: () = conn.set_ex(key, "1", ttl).await
+        let _: () = conn
+            .set_ex(key, "1", ttl)
+            .await
             .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}")))?;
 
         Ok(())
     }
 
-    /// 从黑名单中移除（登录成功时调用，清除旧登出记录）
-    pub async fn remove_token_blacklist(&self, token_sub: &str) -> Result<()> {
-        let key = format!("{}{}", Self::TOKEN_BLACKLIST_PREFIX, token_sub);
+    /// 查询令牌是否已被注销
+    pub async fn is_token_blacklisted(&self, jti: &str) -> Result<bool> {
+        let key = format!("{}{}", Self::TOKEN_BLACKLIST_PREFIX, jti);
         let mut conn = self.conn.clone();
-        let _: () = conn.del(key).await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 删除失败: {e}")))?;
-        Ok(())
-    }
-
-    /// 检查 Token 是否在黑名单中
-    pub async fn is_token_blacklisted(&self, token_sub: &str) -> Result<bool> {
-        let key = format!("{}{}", Self::TOKEN_BLACKLIST_PREFIX, token_sub);
-        let mut conn = self.conn.clone();
-        let exists: Option<String> = conn.get(key).await
+        let exists: Option<String> = conn
+            .get(key)
+            .await
             .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 查询失败: {e}")))?;
         Ok(exists.is_some())
     }
 
+    /// 吊销某用户当前及之前签发的全部令牌
+    ///
+    /// 记录"吊销时间点"，`iat` 早于该时间点的令牌一律失效。
+    /// 新登录签发的令牌 `iat` 不早于该时间点，因此不会被误伤。
+    /// TTL 取令牌最长有效期，过期后键自动清理。
+    pub async fn revoke_user_sessions(&self, user_id: &uuid::Uuid, ttl_seconds: u64) -> Result<u64> {
+        let key = format!("{}{}", Self::USER_REVOKED_PREFIX, user_id);
+        let revoked_before = chrono::Utc::now().timestamp() as u64;
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .set_ex(key, revoked_before, ttl_seconds.max(1))
+            .await
+            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}")))?;
+        Ok(revoked_before)
+    }
+
+    /// 读取用户会话吊销时间点；未吊销返回 `None`
+    pub async fn user_revoked_before(&self, user_id: &uuid::Uuid) -> Result<Option<u64>> {
+        let key = format!("{}{}", Self::USER_REVOKED_PREFIX, user_id);
+        let mut conn = self.conn.clone();
+        let value: Option<u64> = conn
+            .get(key)
+            .await
+            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 查询失败: {e}")))?;
+        Ok(value)
+    }
+
     // ──────────────────────────────────────────────
-    // 限流计数（滑动窗口 INCR + EXPIRE）
+    // 登录失败计数（登录爆破防护）
+    // ──────────────────────────────────────────────
+
+    /// 登录失败计数 Key 前缀
+    const LOGIN_FAILURE_PREFIX: &'static str = "login:fail:";
+
+    /// 读取当前失败次数
+    pub async fn login_failure_count(&self, scope: &str) -> Result<u64> {
+        let key = format!("{}{}", Self::LOGIN_FAILURE_PREFIX, scope);
+        let mut conn = self.conn.clone();
+        let value: Option<u64> = conn
+            .get(key)
+            .await
+            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 查询失败: {e}")))?;
+        Ok(value.unwrap_or(0))
+    }
+
+    /// 记录一次失败并返回累计次数（首次写入时设置窗口过期时间）
+    pub async fn record_login_failure(&self, scope: &str, window_seconds: u64) -> Result<u64> {
+        let key = format!("{}{}", Self::LOGIN_FAILURE_PREFIX, scope);
+        let mut conn = self.conn.clone();
+        let count: u64 = conn
+            .incr(&key, 1)
+            .await
+            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}")))?;
+        if count == 1 {
+            let _: () = conn
+                .expire(&key, window_seconds.max(1) as i64)
+                .await
+                .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}")))?;
+        }
+        Ok(count)
+    }
+
+    /// 登录成功后清除失败计数
+    pub async fn clear_login_failures(&self, scope: &str) -> Result<()> {
+        let key = format!("{}{}", Self::LOGIN_FAILURE_PREFIX, scope);
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .del(key)
+            .await
+            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 删除失败: {e}")))?;
+        Ok(())
+    }
+
+    // ──────────────────────────────────────────────
+    // 限流计数（固定窗口 INCR + EXPIRE）
     // ──────────────────────────────────────────────
 
     /// 限流 Key 前缀

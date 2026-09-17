@@ -18,11 +18,9 @@ use crate::controller::{auth, demo, dict, menu, monitor, rbac, role, user};
 use crate::docs::swagger_ui_handler;
 use crate::error::AppError;
 use crate::middleware::auth::auth_middleware;
-use crate::middleware::captcha::{captcha_middleware, CaptchaState};
 use crate::middleware::rate_limit::rate_limit_middleware;
 use crate::middleware::api_metrics::{api_metrics_mw, MetricsCollector};
 use crate::middleware::request_id::request_id_middleware;
-use crate::middleware::sql_injection::sql_injection_middleware;
 use crate::repository::db::DatabasePool;
 use crate::repository::dict::DictRepository;
 use crate::repository::menu::MenuRepository;
@@ -30,11 +28,10 @@ use crate::repository::role::RoleRepository;
 use crate::repository::user::UserRepository;
 use crate::service::auth::AuthService;
 use crate::service::rbac::RbacService;
-use crate::utils::crypto::CryptoService;
 use crate::utils::jwt::JwtUtil;
 use crate::utils::redis::RedisClient;
 
-/// 应用共享状态（V9：新增 crypto/DB 池）
+/// 应用共享状态
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub auth_service: AuthService,
@@ -44,7 +41,6 @@ pub struct AppState {
     pub redis_client: Arc<RedisClient>,
     pub menu_repo: MenuRepository,
     pub dict_repo: DictRepository,
-    pub crypto_service: Arc<CryptoService>,
     pub db_pool: DatabasePool,
     pub metrics_collector: Arc<MetricsCollector>,
 }
@@ -74,7 +70,6 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
 
     // ── 初始化各层 ──────────────────────────────────────────────
     let jwt_util = Arc::new(JwtUtil::new(&config.jwt_secret));
-    let crypto_service = Arc::new(CryptoService::new(config.crypto.clone()));
     let metrics_collector = Arc::new(MetricsCollector::new());
 
     let user_repo = UserRepository::new(pool.clone());
@@ -86,6 +81,8 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         role_repo.clone(),
         jwt_util.as_ref().clone(),
         config.jwt_expiration_seconds,
+        config.security.login_max_failures,
+        config.security.login_failure_window_seconds,
     );
     let rbac_service = RbacService::new(role_repo, pool.clone());
 
@@ -98,7 +95,6 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         redis_client: Arc::clone(&redis_client),
         menu_repo,
         dict_repo,
-        crypto_service,
         db_pool,
         metrics_collector: metrics_collector.clone(),
     };
@@ -205,17 +201,12 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         }))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
-    // ── 预初始化中间件状态 ──────────────────────────────────────
-    let sql_injection_state = crate::middleware::sql_injection::create_sql_injection_state();
-    let captcha_state: CaptchaState = Arc::new(tokio::sync::RwLock::new(
-        crate::middleware::captcha::CaptchaConfig {
-            enabled: config.captcha_enabled,
-            ..Default::default()
-        }
-    ));
-
     // ── 合并所有路由并应用全局中间件 ──────────────────────────
-    let rate_limit_state = (Arc::clone(&redis_client), Arc::new(config.rate_limit));
+    let rate_limit_state = (
+        Arc::clone(&redis_client),
+        Arc::new(config.rate_limit.clone()),
+        config.security.trust_proxy_headers,
+    );
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
@@ -230,10 +221,6 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         }))
         // Swagger UI HTML 页面（同源服务，避免 iframe 跨域限制）
         .route("/api/swagger-ui/{*path}", axum::routing::get(swagger_ui_handler))
-        // V9 新增：SQL 注入防护（最外安全层）
-        .layer(middleware::from_fn_with_state(sql_injection_state, sql_injection_middleware))
-        // V9 新增：验证码检查
-        .layer(middleware::from_fn_with_state(captcha_state, captcha_middleware))
         // API 性能追踪中间件（记录每个接口的耗时/报错）
         .layer(middleware::from_fn_with_state(state.clone(), api_metrics_mw))
         // 全局中间件：限流（最外层）

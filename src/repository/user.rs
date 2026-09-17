@@ -160,6 +160,17 @@ impl UserRepository {
         })
     }
 
+    /// 更新密码哈希（用于改密与 v0.1 旧口令格式升级）
+    pub async fn update_password_hash(&self, id: Uuid, password_hash: &str) -> Result<(), AppError> {
+        sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+            .bind(id)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("更新密码失败: {e}")))?;
+        Ok(())
+    }
+
     /// 删除用户
     pub async fn delete(&self, id: Uuid) -> Result<(), AppError> {
         sqlx::query("DELETE FROM users WHERE id = $1")

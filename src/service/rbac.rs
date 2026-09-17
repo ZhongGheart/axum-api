@@ -86,9 +86,8 @@ impl RbacService {
         .await
         .map_err(|e| AppError::InternalServerError(format!("查询 admin 用户失败: {e}")))?;
 
-        // 先 SHA256 再 Argon2，与前端登录流程保持一致
-        let sha256_hash = crate::utils::crypto::sha256_hex("admin123");
-        let password_hash = hash_password(&sha256_hash)
+        // 明文 → Argon2（v0.2 起取消客户端 SHA-256 预哈希）
+        let password_hash = hash_password("admin123")
             .map_err(|e| AppError::InternalServerError(e.to_string()))?;
 
         let admin_id = if let Some(admin) = admin_user {
