@@ -9,7 +9,7 @@
 import axios from 'axios'
 import type { AxiosError, AxiosResponse, InternalAxiosRequestConfig } from 'axios'
 import type { ApiResponse } from '@/api/types/response'
-import { getToken, removeToken } from '@/utils/storage'
+import { getToken } from '@/utils/storage'
 import { showError } from '@/utils/message'
 import { requestCache } from '@/utils/cache'
 import { perfMonitor } from '@/utils/performance'
@@ -119,6 +119,11 @@ http.interceptors.response.use(
       requestCache.set('GET', response.config.url || '', data.data, response.config.params)
     }
 
+    // 写操作后失效 GET 缓存：否则列表/详情会继续返回修改前的数据
+    if (response.config?.method && response.config.method !== 'get') {
+      requestCache.invalidate()
+    }
+
     return data.data as unknown as AxiosResponse
   },
   async (error: AxiosError) => {
@@ -156,6 +161,8 @@ http.interceptors.response.use(
     switch (status) {
       case 401:
         message = '未授权，请重新登录'
+        // 会话已失效：清空缓存，避免换账号后读到上一会话的数据
+        requestCache.invalidate()
         break
       case 403:
         message = '权限不足'

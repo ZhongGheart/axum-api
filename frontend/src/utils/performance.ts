@@ -172,7 +172,7 @@ class PerformanceMonitor {
     }
 
     if (import.meta.env.DEV) {
-      console.table(reports)
+      console.info(reports)
     }
 
     return reports
@@ -192,7 +192,7 @@ class PerformanceMonitor {
     return [...this.errorRecords]
   }
 
-  private getLatestByType(type: PerfReport['type']): number | null {
+  private getLatestByType(_type: PerfReport['type']): number | null {
     // 这不是正确的方法，但为了类型检查保持兼容
     return null
   }

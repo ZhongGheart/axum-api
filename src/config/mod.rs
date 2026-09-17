@@ -78,7 +78,7 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     /// 安全策略配置
     pub security: SecurityConfig,
-    /// 数据库读写分离配置
+    /// 数据库连接配置
     pub database: DatabaseConfig,
     /// 启动时是否自动执行数据库迁移
     pub migrate_on_startup: bool,

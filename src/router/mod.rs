@@ -134,7 +134,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
             state.clone(),
             audit_log_middleware,
         ))
-        .layer(middleware::from_fn_with_state(
+        .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ));
@@ -151,7 +151,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // ── 菜单管理路由（仅 admin） ────────────────────────────
     let menu_routes = Router::new()
@@ -174,7 +174,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route_layer(middleware::from_fn(move |req, next| async move {
             crate::middleware::auth::require_role("admin", req, next).await
         }))
-        .layer(middleware::from_fn_with_state(
+        .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ));
@@ -191,7 +191,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // ── 数据字典读取（任意已登录用户） ──────────────────────
     // 字典是通用展示数据；要求 admin 会让所有非管理页面的 DictSelect 直接 403
@@ -201,7 +201,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
             state.clone(),
             audit_log_middleware,
         ))
-        .layer(middleware::from_fn_with_state(
+        .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ));
@@ -219,7 +219,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // ── 系统监控路由（仅 admin） ────────────────────────────
     let monitor_routes = Router::new()
@@ -232,7 +232,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // ── 合并所有路由并应用全局中间件 ──────────────────────────
     let rate_limit_state = (

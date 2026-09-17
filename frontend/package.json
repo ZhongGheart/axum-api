@@ -1,7 +1,7 @@
 {
   "name": "axum-admin",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "license": "MIT",
   "scripts": {
@@ -9,8 +9,10 @@
     "typecheck": "vue-tsc --noEmit",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "lint": "eslint . --ext .vue,.ts --fix",
-    "format": "prettier --write \"src/**/*.{vue,ts,css}\""
+    "lint": "eslint . --ext .vue,.ts",
+    "format": "prettier --write \"src/**/*.{vue,ts,css}\"",
+    "lint:fix": "eslint . --ext .vue,.ts --fix",
+    "test": "vitest run"
   },
   "dependencies": {
     "@vicons/ionicons5": "^0.13.0",
@@ -30,11 +32,14 @@
     "@vitejs/plugin-vue": "^5.2.0",
     "eslint": "^9.0.0",
     "eslint-plugin-vue": "^9.32.0",
+    "globals": "^17.12.0",
+    "jsdom": "^30.0.1",
     "prettier": "^3.4.0",
     "prettier-plugin-organize-imports": "^4.1.0",
     "typescript": "~5.7.0",
     "vite": "^6.0.0",
     "vite-plugin-compression": "^0.5.1",
+    "vitest": "^5.0.1",
     "vue-tsc": "^2.2.0"
   }
 }

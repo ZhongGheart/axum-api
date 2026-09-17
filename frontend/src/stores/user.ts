@@ -9,6 +9,7 @@ import type { LoginRequest, UserInfo } from '@/api/types/response'
 import { authApi } from '@/api/auth'
 import { handleError } from '@/api/helper'
 import { getToken, removeToken, setToken, setUserInfo, removeUserInfo, getUserInfo } from '@/utils/storage'
+import { requestCache } from '@/utils/cache'
 import router from '@/router'
 
 export const useUserStore = defineStore('user', () => {
@@ -35,6 +36,8 @@ export const useUserStore = defineStore('user', () => {
       token.value = data.token
       setToken(data.token)
       isLoggedIn.value = true
+      // 换账号后不得复用上一会话的 GET 缓存
+      requestCache.invalidate()
 
       return data
     } catch (error) {
@@ -55,6 +58,7 @@ export const useUserStore = defineStore('user', () => {
       isLoggedIn.value = false
       removeToken()
       removeUserInfo()
+      requestCache.invalidate()
       router.push('/login')
     }
   }

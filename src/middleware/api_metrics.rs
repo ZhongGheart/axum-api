@@ -41,6 +41,12 @@ pub struct MetricsCollector {
     inner: Arc<RwLock<HashMap<String, MetricsData>>>,
 }
 
+impl Default for MetricsCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetricsCollector {
     pub fn new() -> Self {
         Self {

@@ -54,14 +54,13 @@
 
 <script setup lang="ts">
 import { ref, h, onMounted } from 'vue'
-import { NButton, NSpace, NIcon, useMessage } from 'naive-ui'
+import { NButton, NSpace, NIcon } from 'naive-ui'
 import { AddOutline as AddIcon, CreateOutline as EditIcon, TrashOutline as DelIcon } from '@vicons/ionicons5'
 import type { FormInst, FormRules, TreeOption } from 'naive-ui'
 import { menuApi } from '@/api/menu'
 import type { MenuNode, CreateMenuReq } from '@/api/menu'
 import { showConfirm, showSuccess } from '@/utils/message'
 
-const message = useMessage()
 const formRef = ref<FormInst | null>(null)
 const showModal = ref(false)
 const isEditing = ref(false)

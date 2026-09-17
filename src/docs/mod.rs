@@ -6,6 +6,38 @@
 use axum::http::{header, Response, StatusCode};
 use serde_json::json;
 
+/// 列出 OpenAPI 文档中声明的所有路由
+///
+/// 返回 `(path, methods)`，用于路由覆盖率测试：
+/// 文档里写了但实际不存在的接口会被测试发现。
+pub fn documented_paths() -> Vec<(String, Vec<String>)> {
+    let spec = openapi_json();
+    let mut routes = Vec::new();
+
+    if let Some(paths) = spec.get("paths").and_then(|v| v.as_object()) {
+        for (path, item) in paths {
+            let methods = item
+                .as_object()
+                .map(|ops| {
+                    ops.keys()
+                        .filter(|k| {
+                            matches!(
+                                k.as_str(),
+                                "get" | "post" | "put" | "patch" | "delete" | "head"
+                            )
+                        })
+                        .map(|k| k.to_uppercase())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            routes.push((path.clone(), methods));
+        }
+    }
+
+    routes.sort();
+    routes
+}
+
 /// 返回完整的 OpenAPI 3.0 规范 JSON
 pub fn openapi_json() -> serde_json::Value {
     json!({

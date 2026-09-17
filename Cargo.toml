@@ -1,10 +1,14 @@
 [package]
 name = "axum-api"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Production-grade Rust backend API with Axum, SQLx, JWT auth"
 authors = ["dev"]
 license = "MIT"
+
+[dev-dependencies]
+# 集成测试通过 tower::ServiceExt::oneshot 直接驱动路由
+tower = { version = "0.5", features = ["util"] }
 
 [dependencies]
 # Web框架

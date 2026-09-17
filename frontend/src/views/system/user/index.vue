@@ -188,7 +188,7 @@ function onPageSizeChange(size: number) {
   fetchUsers()
 }
 
-function onSearch(keyword: string) {
+function onSearch(_keyword: string) {
   page.value = 1
   // 搜索逻辑由具体业务实现
   fetchUsers()

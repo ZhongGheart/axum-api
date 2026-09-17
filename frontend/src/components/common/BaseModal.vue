@@ -47,7 +47,7 @@
  *     <n-form>...</n-form>
  *   </BaseModal>
  */
-import { ref, computed } from 'vue'
+import { computed } from 'vue'
 import { GridOutline as GridIcon } from '@vicons/ionicons5'
 
 const props = withDefaults(
@@ -100,7 +100,7 @@ function onClose() {
 
 // ── 拖拽逻辑 ──────────────────────────────────────────────────
 
-let startX = 0, startY = 0, offsetX = 0, offsetY = 0
+let offsetX = 0, offsetY = 0
 
 function onDragStart(e: MouseEvent) {
   const target = (e.currentTarget as HTMLElement)?.closest('.n-modal') as HTMLElement

@@ -8,6 +8,9 @@ use crate::error::AppError;
 use crate::model::User;
 use crate::utils::password::hash_password;
 
+/// RBAC 种子数据初始化的事务级建议锁 key
+const RBAC_SEED_LOCK_KEY: i64 = 0x5242_4143; // "RBAC"
+
 /// 角色权限服务
 #[derive(Debug, Clone)]
 pub struct RbacService {
@@ -25,23 +28,34 @@ impl RbacService {
     ///
     /// 幂等操作：仅当 `roles` 表为空时执行。
     pub async fn init_defaults(&self) -> Result<(), AppError> {
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM roles")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| AppError::InternalServerError(format!("查询角色失败: {e}")))?;
-
-        if count.0 > 0 {
-            tracing::info!("RBAC 已初始化，跳过种子数据");
-            return Ok(());
-        }
-
-        tracing::info!("开始初始化 RBAC 种子数据...");
-
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| AppError::InternalServerError(format!("事务开启失败: {e}")))?;
+
+        // 事务级建议锁：多副本同时首次启动时只允许一个进程执行种子写入，
+        // 避免并发 INSERT 触发唯一约束冲突导致启动失败
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(RBAC_SEED_LOCK_KEY)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("获取种子锁失败: {e}")))?;
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM roles")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("查询角色失败: {e}")))?;
+
+        if count.0 > 0 {
+            tracing::info!("RBAC 已初始化，跳过种子数据");
+            tx.commit()
+                .await
+                .map_err(|e| AppError::InternalServerError(format!("事务提交失败: {e}")))?;
+            return Ok(());
+        }
+
+        tracing::info!("开始初始化 RBAC 种子数据...");
 
         // 1. 创建默认角色
         sqlx::query(
