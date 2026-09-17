@@ -54,7 +54,7 @@ axum-api/
 
 | 层级 | 技术 | 版本 |
 |------|------|------|
-| **后端** | Rust + Axum + Tokio | 1.82+ / 0.8 |
+| **后端** | Rust + Axum + Tokio | 1.93+ / 0.8 |
 | **数据库** | PostgreSQL + SQLx | 16 / 0.8 |
 | **缓存** | Redis | 7 |
 | **前端** | Vue 3 + TypeScript + Vite | 3.5 / 6 |
@@ -66,7 +66,7 @@ axum-api/
 
 ### 环境要求
 
-- Rust 1.82+
+- Rust **1.93+**（`Cargo.lock` 中部分依赖使用 edition2024，1.82 无法构建；Dockerfile 固定 1.93）
 - Node.js 18+（CI 使用 22）
 - pnpm 10+
 - PostgreSQL 16、Redis 7（或使用 Docker Compose）
