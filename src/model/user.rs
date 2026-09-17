@@ -6,14 +6,28 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// 用户角色枚举
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "varchar", rename_all = "lowercase")]
+/// 用户主角色
+///
+/// 角色数据的唯一来源是 `user_roles` 表；本枚举只用于对外表达"主角色"，
+/// 权限判定必须使用 `UserInfo::roles`，不要依赖该枚举。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
     /// 管理员
     Admin,
     /// 普通用户
     User,
+}
+
+impl Role {
+    /// 计算主角色：拥有 admin 即视为管理员，否则为普通用户
+    pub fn primary_from(roles: &[String]) -> Role {
+        if roles.iter().any(|r| r.eq_ignore_ascii_case("admin")) {
+            Role::Admin
+        } else {
+            Role::User
+        }
+    }
 }
 
 impl std::fmt::Display for Role {
@@ -38,8 +52,6 @@ pub struct User {
     pub email: String,
     /// 密码哈希值（Argon2 加密）
     pub password_hash: String,
-    /// 用户角色：admin / user
-    pub role: Role,
     /// 是否激活
     pub is_active: bool,
     /// 创建时间
@@ -86,9 +98,9 @@ pub struct UserInfo {
     pub username: String,
     /// 电子邮箱
     pub email: String,
-    /// 用户角色
+    /// 主角色（由 `roles` 计算得到，仅用于展示与前端路由）
     pub role: Role,
-    /// 用户拥有的所有角色标识列表（来自 user_roles 表）
+    /// 用户拥有的全部角色标识（来自 user_roles 表，权限判定依据）
     pub roles: Vec<String>,
     /// 是否激活
     pub is_active: bool,
@@ -96,30 +108,16 @@ pub struct UserInfo {
     pub created_at: DateTime<Utc>,
 }
 
-impl From<User> for UserInfo {
-    /// 从数据库实体转换为对外暴露的用户信息
-    /// 自动过滤掉密码哈希等敏感字段（不含角色列表）
-    fn from(user: User) -> Self {
-        Self {
-            id: user.id,
-            username: user.username,
-            email: user.email,
-            role: user.role,
-            roles: Vec::new(),
-            is_active: user.is_active,
-            created_at: user.created_at,
-        }
-    }
-}
-
 impl UserInfo {
-    /// 从用户实体 + 角色列表构造 UserInfo
-    pub fn with_roles(user: User, roles: Vec<String>) -> Self {
+    /// 由用户实体与角色列表构造对外信息
+    ///
+    /// 自动过滤密码哈希；`role` 由 `roles` 推导，二者不会互相矛盾。
+    pub fn new(user: User, roles: Vec<String>) -> Self {
         Self {
             id: user.id,
             username: user.username,
             email: user.email,
-            role: user.role,
+            role: Role::primary_from(&roles),
             roles,
             is_active: user.is_active,
             created_at: user.created_at,

@@ -12,14 +12,12 @@ const PLACEHOLDER_JWT_SECRETS: [&str; 2] = [
     "change-me",
 ];
 
-/// 读写分离数据库配置
+/// 数据库连接配置
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
-    pub read_url: Option<String>,
     pub write_url: String,
     pub max_size: u32,
     pub connect_timeout_seconds: u64,
-    pub read_max_size: Option<u32>,
 }
 
 /// Redis 配置
@@ -66,12 +64,8 @@ pub struct SecurityConfig {
 /// 应用全局配置
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// 运行环境：development / production
-    pub app_env: String,
     /// 服务器监听地址
     pub server_addr: SocketAddr,
-    /// 数据库连接字符串
-    pub database_url: String,
     /// JWT 密钥
     pub jwt_secret: String,
     /// JWT 过期时间（秒）
@@ -80,8 +74,6 @@ pub struct Config {
     pub cors_allowed_origins: Vec<String>,
     /// Redis 配置
     pub redis: RedisConfig,
-    /// 数据库连接池配置
-    pub pool: PoolConfig,
     /// 限流配置
     pub rate_limit: RateLimitConfig,
     /// 安全策略配置
@@ -107,8 +99,7 @@ impl Config {
             .parse()
             .expect("无法解析 SERVER_HOST 和 SERVER_PORT 的组合");
 
-        let database_url = env::var("DATABASE_URL")
-            .expect("缺少 DATABASE_URL 环境变量");
+        let database_url = env::var("DATABASE_URL").expect("缺少 DATABASE_URL 环境变量");
 
         let jwt_secret = env::var("JWT_SECRET").expect("缺少 JWT_SECRET 环境变量");
         // 拒绝弱密钥与示例占位值，避免签名可被伪造
@@ -139,8 +130,7 @@ impl Config {
 
         // Redis 配置
         let redis = RedisConfig {
-            url: env::var("REDIS_URL")
-                .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+            url: env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
         };
 
         // 数据库连接池配置
@@ -155,24 +145,15 @@ impl Config {
                 .expect("DB_CONNECT_TIMEOUT 必须是有效的数字"),
         };
 
-        // 数据库读写分离
         let database = DatabaseConfig {
-            read_url: env::var("DATABASE_READ_URL").ok(),
-            write_url: database_url.clone(),
+            write_url: database_url,
             max_size: pool.max_size,
             connect_timeout_seconds: pool.connect_timeout_seconds,
-            read_max_size: Some(
-                env::var("DB_READ_POOL_MAX_SIZE")
-                    .unwrap_or_else(|_| "30".to_string())
-                    .parse()
-                    .expect("DB_READ_POOL_MAX_SIZE 必须是有效数字"),
-            ),
         };
 
         // 启动时自动执行数据库迁移（关闭后需由独立迁移步骤保证表结构）
-        let migrate_on_startup = env::var("MIGRATE_ON_STARTUP")
-            .unwrap_or_else(|_| "true".to_string())
-            != "false";
+        let migrate_on_startup =
+            env::var("MIGRATE_ON_STARTUP").unwrap_or_else(|_| "true".to_string()) != "false";
 
         // 限流配置
         let rate_limit = RateLimitConfig {
@@ -209,14 +190,11 @@ impl Config {
         };
 
         Self {
-            app_env,
             server_addr,
-            database_url,
             jwt_secret,
             jwt_expiration_seconds,
             cors_allowed_origins,
             redis,
-            pool,
             rate_limit,
             security,
             database,

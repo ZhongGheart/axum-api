@@ -1,10 +1,16 @@
 //! 数据字典控制器
 
-use axum::{extract::{Path, State}, Json};
+use axum::{
+    extract::{Path, State},
+    Json,
+};
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::model::{ApiResponse, DictItem, DictItemResponse, DictType, DictTypeWithItems, CreateDictTypeRequest, CreateDictItemRequest};
+use crate::model::{
+    ApiResponse, CreateDictItemRequest, CreateDictTypeRequest, DictItem, DictItemResponse,
+    DictType, DictTypeWithItems,
+};
 use crate::router::AppState;
 
 /// GET /api/admin/dict/types — 字典类型列表
@@ -57,7 +63,7 @@ pub async fn delete_type(
 pub async fn get_items_by_code(
     State(state): State<AppState>,
     Path(code): Path<String>,
-) -> Result<Json<ApiResponse<Vec<DictItemResponse>> >, AppError> {
+) -> Result<Json<ApiResponse<Vec<DictItemResponse>>>, AppError> {
     let items = state.dict_repo.get_dict_by_code(&code).await?;
     Ok(Json(ApiResponse::success(items)))
 }
@@ -81,7 +87,9 @@ pub async fn create_item(
     State(state): State<AppState>,
     Json(req): Json<CreateDictItemRequest>,
 ) -> Result<Json<ApiResponse<DictItem>>, AppError> {
-    let type_id = req.dict_type_id.ok_or(AppError::BadRequest("缺少 dict_type_id".into()))?;
+    let type_id = req
+        .dict_type_id
+        .ok_or(AppError::BadRequest("缺少 dict_type_id".into()))?;
     let item = DictItem {
         id: Uuid::new_v4(),
         dict_type_id: type_id,

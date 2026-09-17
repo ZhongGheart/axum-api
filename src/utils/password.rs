@@ -42,8 +42,7 @@ pub fn hash_password(password: &str) -> Result<String> {
 ///
 /// 匹配返回 `true`，否则返回 `false`。
 pub fn verify_password(password: &str, hash: &str) -> Result<bool> {
-    let parsed_hash = PasswordHash::new(hash)
-        .map_err(|e| anyhow!("无法解析密码哈希值: {}", e))?;
+    let parsed_hash = PasswordHash::new(hash).map_err(|e| anyhow!("无法解析密码哈希值: {}", e))?;
     Ok(Argon2::default()
         .verify_password(password.as_bytes(), &parsed_hash)
         .is_ok())
@@ -54,7 +53,11 @@ fn sha256_hex(input: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 /// 口令校验结果
@@ -99,8 +102,14 @@ mod tests {
     #[test]
     fn test_current_format_password_needs_no_upgrade() {
         let hash = hash_password("admin123").unwrap();
-        assert_eq!(check_password("admin123", &hash).unwrap(), PasswordCheck::Valid);
-        assert_eq!(check_password("wrong", &hash).unwrap(), PasswordCheck::Invalid);
+        assert_eq!(
+            check_password("admin123", &hash).unwrap(),
+            PasswordCheck::Valid
+        );
+        assert_eq!(
+            check_password("wrong", &hash).unwrap(),
+            PasswordCheck::Invalid
+        );
     }
 
     #[test]
@@ -114,8 +123,14 @@ mod tests {
         };
 
         // 新哈希必须是 Argon2(明文)，升级后不再需要回退
-        assert_eq!(check_password("admin123", &upgraded).unwrap(), PasswordCheck::Valid);
-        assert_eq!(check_password("wrong", &legacy_hash).unwrap(), PasswordCheck::Invalid);
+        assert_eq!(
+            check_password("admin123", &upgraded).unwrap(),
+            PasswordCheck::Valid
+        );
+        assert_eq!(
+            check_password("wrong", &legacy_hash).unwrap(),
+            PasswordCheck::Invalid
+        );
     }
 
     #[test]
@@ -130,5 +145,3 @@ mod tests {
         assert!(verify_password(password, &hash2).unwrap());
     }
 }
-
-

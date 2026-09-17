@@ -72,9 +72,13 @@ impl IntoResponse for AppError {
             AppError::InvalidCredentials(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
             AppError::ValidationFailed(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
-            AppError::InternalServerError(_) => {
-                // 生产环境不暴露具体内部错误信息
-                (StatusCode::INTERNAL_SERVER_ERROR, "服务器内部错误".to_string())
+            AppError::InternalServerError(detail) => {
+                // 具体原因不回传客户端，但必须留在服务端日志里，否则 500 无法定位
+                tracing::error!("内部错误: {detail}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "服务器内部错误".to_string(),
+                )
             }
             AppError::InvalidToken(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
         };

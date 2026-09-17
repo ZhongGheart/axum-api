@@ -3,7 +3,7 @@
 //! 手动构建 OpenAPI 规范 JSON，避免 utoipa 过程宏兼容性问题。
 //! 端点：GET /api/openapi.json
 
-use axum::http::{header, StatusCode, Response};
+use axum::http::{header, Response, StatusCode};
 use serde_json::json;
 
 /// 返回完整的 OpenAPI 3.0 规范 JSON
@@ -253,7 +253,7 @@ pub fn openapi_json() -> serde_json::Value {
                     "responses": { "200": { "description": "删除成功" } }
                 }
             },
-            "/api/admin/dict/{code}/items": {
+            "/api/dict/{code}/items": {
                 "get": {
                     "tags": ["数据字典"], "summary": "获取字典项",
                     "parameters": [{ "name": "code", "in": "path", "required": true, "schema": { "type": "string" } }],
@@ -460,7 +460,7 @@ pub fn openapi_json() -> serde_json::Value {
 pub async fn swagger_ui_handler(
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> Result<Response<String>, std::convert::Infallible> {
-    if path != "index.html" && path != "" {
+    if path != "index.html" && !path.is_empty() {
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body("Not Found".to_string())

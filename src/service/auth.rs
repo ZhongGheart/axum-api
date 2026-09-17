@@ -7,7 +7,7 @@
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::model::{LoginRequest, LoginResponse, RegisterRequest, UserInfo};
+use crate::model::{LoginRequest, LoginResponse, RegisterRequest, Role, UserInfo};
 use crate::repository::role::RoleRepository;
 use crate::repository::user::UserRepository;
 use crate::utils::jwt::JwtUtil;
@@ -76,13 +76,11 @@ impl AuthService {
             .create(Uuid::new_v4(), &req.username, &req.email, &password_hash)
             .await?;
 
-        self.role_repo
-            .assign_role_to_user(user.id, "user")
-            .await?;
+        self.role_repo.assign_role_to_user(user.id, "user").await?;
 
         tracing::info!("新用户注册成功: {} (已分配 user 角色)", user.username);
 
-        Ok(UserInfo::from(user))
+        Ok(UserInfo::new(user, vec!["user".to_string()]))
     }
 
     /// 用户登录
@@ -129,7 +127,11 @@ impl AuthService {
             }
             PasswordCheck::ValidNeedsUpgrade(new_hash) => {
                 // 已通过校验，升级失败不应阻断本次登录
-                if let Err(e) = self.user_repo.update_password_hash(user.id, &new_hash).await {
+                if let Err(e) = self
+                    .user_repo
+                    .update_password_hash(user.id, &new_hash)
+                    .await
+                {
                     tracing::warn!("v0.1 旧口令格式升级失败 (user={}): {e}", user.id);
                 } else {
                     tracing::info!("v0.1 旧口令格式已升级 (user={})", user.id);
@@ -142,11 +144,15 @@ impl AuthService {
 
         tracing::debug!("用户 {} 拥有的角色: {:?}", user.username, roles);
 
+        // 主角色由角色集合推导，不再读取冗余的 users.role 列
+        let primary_role = Role::primary_from(&roles);
+
         let token = self
             .jwt_util
             .sign(
                 user.id,
-                &user.role.to_string(),
+                &user.username,
+                &primary_role.to_string(),
                 &roles,
                 self.jwt_expiration_seconds,
             )
@@ -161,13 +167,6 @@ impl AuthService {
             token,
             token_type: "Bearer".to_string(),
         })
-    }
-
-    /// 获取当前用户信息
-    #[allow(dead_code)]
-    pub async fn get_current_user(&self, user_id: Uuid) -> Result<UserInfo, AppError> {
-        let user = self.user_repo.find_by_id(user_id).await?;
-        Ok(UserInfo::from(user))
     }
 
     /// 用户登出：只注销当前令牌（jti）
@@ -210,9 +209,7 @@ impl AuthService {
         let account_failures = redis_client.login_failure_count(account_scope).await?;
         let ip_failures = redis_client.login_failure_count(ip_scope).await?;
 
-        if account_failures >= self.login_max_failures
-            || ip_failures >= self.login_max_failures
-        {
+        if account_failures >= self.login_max_failures || ip_failures >= self.login_max_failures {
             tracing::warn!(
                 "登录已锁定: account_failures={account_failures}, ip_failures={ip_failures}"
             );

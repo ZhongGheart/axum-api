@@ -38,9 +38,17 @@ pub async fn me(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
-    let user = state.auth_service.user_repo.find_by_id(auth_user.user_id).await?;
-    let roles = state.auth_service.role_repo.find_roles_by_user_id(auth_user.user_id).await?;
-    let user_info = crate::model::UserInfo::with_roles(user, roles);
+    let user = state
+        .auth_service
+        .user_repo
+        .find_by_id(auth_user.user_id)
+        .await?;
+    let roles = state
+        .auth_service
+        .role_repo
+        .find_roles_by_user_id(auth_user.user_id)
+        .await?;
+    let user_info = crate::model::UserInfo::new(user, roles);
     Ok(Json(ApiResponse::success(user_info)))
 }
 

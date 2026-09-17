@@ -20,6 +20,8 @@ pub struct Claims {
     pub roles: Vec<String>,
     /// 令牌唯一标识（用于单令牌注销）
     pub jti: String,
+    /// 用户名（仅用于审计日志展示，不作为鉴权依据）
+    pub username: String,
     /// 签发时间（Unix 时间戳，JWT 标准要求 u64）
     pub iat: u64,
     /// 过期时间（Unix 时间戳，JWT 标准要求 u64）
@@ -45,6 +47,7 @@ impl JwtUtil {
     /// # Arguments
     ///
     /// * `user_id` - 用户 UUID
+    /// * `username` - 用户名
     /// * `role` - 用户主要角色
     /// * `roles` - 用户拥有的所有角色标识列表
     /// * `expiration_seconds` - 过期时间（秒）
@@ -55,6 +58,7 @@ impl JwtUtil {
     pub fn sign(
         &self,
         user_id: Uuid,
+        username: &str,
         role: &str,
         roles: &[String],
         expiration_seconds: u64,
@@ -65,6 +69,7 @@ impl JwtUtil {
             role: role.to_string(),
             roles: roles.to_vec(),
             jti: Uuid::new_v4().to_string(),
+            username: username.to_string(),
             iat: now,
             exp: now + expiration_seconds,
         };
@@ -111,7 +116,7 @@ mod tests {
         let jwt = JwtUtil::new("test_secret_key");
         let user_id = Uuid::new_v4();
         let roles = vec!["user".to_string(), "admin".to_string()];
-        let token = jwt.sign(user_id, "admin", &roles, 3600).unwrap();
+        let token = jwt.sign(user_id, "alice", "admin", &roles, 3600).unwrap();
         let claims = jwt.verify(&token).unwrap();
         assert_eq!(claims.sub, user_id);
         assert_eq!(claims.role, "admin");
@@ -124,8 +129,8 @@ mod tests {
     fn test_each_token_has_unique_jti() {
         let jwt = JwtUtil::new("test_secret_key");
         let user_id = Uuid::new_v4();
-        let a = jwt.sign(user_id, "user", &[], 3600).unwrap();
-        let b = jwt.sign(user_id, "user", &[], 3600).unwrap();
+        let a = jwt.sign(user_id, "alice", "user", &[], 3600).unwrap();
+        let b = jwt.sign(user_id, "alice", "user", &[], 3600).unwrap();
         assert_ne!(
             jwt.verify(&a).unwrap().jti,
             jwt.verify(&b).unwrap().jti,

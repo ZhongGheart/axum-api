@@ -70,7 +70,7 @@ export const dictApi = {
   updateItem(id: string, data: CreateDictItemReq) { return http.put<DictItemRecord>(`/admin/dict/items/${id}`, data) },
   deleteItem(id: string) { return http.delete<null>(`/admin/dict/items/${id}`) },
 
-  /** 缓存读取 */
-  getCachedDict(code: string) { return http.get<DictItemInfo[]>(`/admin/dict/${code}/items`) },
+  /** 字典读取（任意已登录用户；非管理页面也会用到） */
+  getCachedDict(code: string) { return http.get<DictItemInfo[]>(`/dict/${code}/items`) },
   refreshCache() { return http.post<null>('/admin/dict/refresh') },
 }

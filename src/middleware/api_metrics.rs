@@ -2,10 +2,14 @@
 //!
 //! 记录每个接口的响应时间、调用次数、报错次数。
 
+use axum::{
+    extract::{Request, State},
+    middleware::Next,
+    response::Response,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use axum::{extract::{Request, State}, middleware::Next, response::Response};
 use tokio::sync::RwLock;
 
 /// 单接口指标快照
@@ -63,20 +67,28 @@ impl MetricsCollector {
 
     pub async fn snapshot(&self) -> Vec<EndpointMetric> {
         let map = self.inner.read().await;
-        let mut result: Vec<EndpointMetric> = map.iter().map(|(key, m)| {
-            let parts: Vec<&str> = key.splitn(2, ' ').collect();
-            let method = parts.first().unwrap_or(&"UNKNOWN").to_string();
-            let path = parts.get(1).unwrap_or(&"unknown").to_string();
-            EndpointMetric {
-                path, method,
-                call_count: m.call_count,
-                error_count: m.error_count,
-                total_duration_ms: m.total_duration_ms,
-                avg_duration_ms: if m.call_count > 0 { m.total_duration_ms / m.call_count } else { 0 },
-                max_duration_ms: m.max_duration_ms,
-                min_duration_ms: m.min_duration_ms,
-            }
-        }).collect();
+        let mut result: Vec<EndpointMetric> = map
+            .iter()
+            .map(|(key, m)| {
+                let parts: Vec<&str> = key.splitn(2, ' ').collect();
+                let method = parts.first().unwrap_or(&"UNKNOWN").to_string();
+                let path = parts.get(1).unwrap_or(&"unknown").to_string();
+                EndpointMetric {
+                    path,
+                    method,
+                    call_count: m.call_count,
+                    error_count: m.error_count,
+                    total_duration_ms: m.total_duration_ms,
+                    avg_duration_ms: if m.call_count > 0 {
+                        m.total_duration_ms / m.call_count
+                    } else {
+                        0
+                    },
+                    max_duration_ms: m.max_duration_ms,
+                    min_duration_ms: m.min_duration_ms,
+                }
+            })
+            .collect();
         result.sort_by(|a, b| b.call_count.cmp(&a.call_count));
         result
     }

@@ -16,8 +16,6 @@ pub struct PaginationParams {
     pub sort_by: Option<String>,
     /// 排序方向（asc / desc）
     pub sort_order: Option<String>,
-    /// 关键字搜索
-    pub keyword: Option<String>,
 }
 
 impl PaginationParams {
@@ -50,11 +48,6 @@ impl PaginationParams {
         };
         format!("{} {}", field, order)
     }
-
-    /// 生成过滤条件（LIKE 模糊搜索）
-    pub fn keyword_like(&self) -> String {
-        self.keyword.as_deref().unwrap_or("").to_string()
-    }
 }
 
 /// 统一分页响应数据
@@ -86,13 +79,6 @@ impl<T: Serialize> PaginatedResponse<T> {
     }
 }
 
-/// 前端对齐的分页请求体（与前端 PageParams 一致）
-#[derive(Debug, Deserialize)]
-pub struct PageParams {
-    pub page: Option<i64>,
-    pub page_size: Option<i64>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,20 +88,18 @@ mod tests {
         page_size: Option<i64>,
         sort_by: Option<&str>,
         sort_order: Option<&str>,
-        keyword: Option<&str>,
     ) -> PaginationParams {
         PaginationParams {
             page,
             page_size,
             sort_by: sort_by.map(str::to_string),
             sort_order: sort_order.map(str::to_string),
-            keyword: keyword.map(str::to_string),
         }
     }
 
     #[test]
     fn pagination_uses_safe_defaults() {
-        let params = params(None, None, None, None, None);
+        let params = params(None, None, None, None);
         assert_eq!(params.get_page(), 1);
         assert_eq!(params.get_page_size(), 10);
         assert_eq!(params.get_offset(), 0);
@@ -123,7 +107,7 @@ mod tests {
 
     #[test]
     fn pagination_clamps_invalid_values() {
-        let params = params(Some(0), Some(999), None, None, None);
+        let params = params(Some(0), Some(999), None, None);
         assert_eq!(params.get_page(), 1);
         assert_eq!(params.get_page_size(), 200);
         assert_eq!(params.get_offset(), 0);
@@ -131,20 +115,26 @@ mod tests {
 
     #[test]
     fn pagination_calculates_offset() {
-        let params = params(Some(3), Some(20), None, None, None);
+        let params = params(Some(3), Some(20), None, None);
         assert_eq!(params.get_offset(), 40);
     }
 
     #[test]
     fn pagination_respects_allowed_sort_fields() {
-        let params = params(None, None, Some("username"), Some("asc"), None);
-        assert_eq!(params.get_order_sql(&["username", "created_at"]), "username ASC");
+        let params = params(None, None, Some("username"), Some("asc"));
+        assert_eq!(
+            params.get_order_sql(&["username", "created_at"]),
+            "username ASC"
+        );
     }
 
     #[test]
     fn pagination_falls_back_for_unknown_sort_field() {
-        let params = params(None, None, Some("password"), Some("DROP TABLE users"), None);
-        assert_eq!(params.get_order_sql(&["username", "created_at"]), "created_at DESC");
+        let params = params(None, None, Some("password"), Some("DROP TABLE users"));
+        assert_eq!(
+            params.get_order_sql(&["username", "created_at"]),
+            "created_at DESC"
+        );
     }
 
     #[test]

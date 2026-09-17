@@ -88,8 +88,7 @@ async fn shutdown_signal() {
 /// - 包含 span 追踪信息，便于请求链路定位
 fn init_tracing() {
     // 环境变量过滤：RUST_LOG=debug ./target/release/axum-api
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // 格式化终端输出（带颜色、时间戳、目标模块）
     let fmt_layer = tracing_subscriber::fmt::layer()

@@ -24,6 +24,11 @@ impl UserRepository {
         Self { pool }
     }
 
+    /// 数据库连接池访问器
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// 根据用户 ID 查找用户
     ///
     /// # Arguments
@@ -36,7 +41,7 @@ impl UserRepository {
     pub async fn find_by_id(&self, id: Uuid) -> Result<User, AppError> {
         sqlx::query_as::<_, User>(
             r#"
-            SELECT id, username, email, password_hash, role, is_active, created_at, updated_at
+            SELECT id, username, email, password_hash, is_active, created_at, updated_at
             FROM users
             WHERE id = $1
             "#,
@@ -52,7 +57,7 @@ impl UserRepository {
     pub async fn find_by_username(&self, username: &str) -> Result<Option<User>, AppError> {
         sqlx::query_as::<_, User>(
             r#"
-            SELECT id, username, email, password_hash, role, is_active, created_at, updated_at
+            SELECT id, username, email, password_hash, is_active, created_at, updated_at
             FROM users
             WHERE username = $1
             "#,
@@ -69,7 +74,7 @@ impl UserRepository {
     pub async fn find_by_username_or_email(&self, input: &str) -> Result<Option<User>, AppError> {
         sqlx::query_as::<_, User>(
             r#"
-            SELECT id, username, email, password_hash, role, is_active, created_at, updated_at
+            SELECT id, username, email, password_hash, is_active, created_at, updated_at
             FROM users
             WHERE username = $1 OR email = $1
             "#,
@@ -84,7 +89,7 @@ impl UserRepository {
     pub async fn find_by_email(&self, email: &str) -> Result<Option<User>, AppError> {
         sqlx::query_as::<_, User>(
             r#"
-            SELECT id, username, email, password_hash, role, is_active, created_at, updated_at
+            SELECT id, username, email, password_hash, is_active, created_at, updated_at
             FROM users
             WHERE email = $1
             "#,
@@ -100,7 +105,7 @@ impl UserRepository {
         let offset = (page - 1) * page_size;
         let users = sqlx::query_as::<_, User>(
             r#"
-            SELECT id, username, email, password_hash, role, is_active, created_at, updated_at
+            SELECT id, username, email, password_hash, is_active, created_at, updated_at
             FROM users
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2
@@ -126,21 +131,19 @@ impl UserRepository {
         id: Uuid,
         username: &str,
         email: &str,
-        role: &str,
         is_active: bool,
     ) -> Result<User, AppError> {
         sqlx::query_as::<_, User>(
             r#"
             UPDATE users
-            SET username = $2, email = $3, role = $4, is_active = $5
+            SET username = $2, email = $3, is_active = $4
             WHERE id = $1
-            RETURNING id, username, email, password_hash, role, is_active, created_at, updated_at
+            RETURNING id, username, email, password_hash, is_active, created_at, updated_at
             "#,
         )
         .bind(id)
         .bind(username)
         .bind(email)
-        .bind(role)
         .bind(is_active)
         .fetch_one(&self.pool)
         .await
@@ -160,8 +163,38 @@ impl UserRepository {
         })
     }
 
+    /// 批量查询多个用户的角色（避免列表页 N+1）
+    ///
+    /// 返回 `(user_id, role_name)`，调用方按 user_id 归组。
+    pub async fn find_roles_for_users(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, String)>, AppError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        sqlx::query_as::<_, (Uuid, String)>(
+            r#"
+            SELECT ur.user_id, r.name
+            FROM user_roles ur
+            JOIN roles r ON r.id = ur.role_id
+            WHERE ur.user_id = ANY($1)
+            ORDER BY r.name ASC
+            "#,
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询用户角色失败: {e}")))
+    }
+
     /// 更新密码哈希（用于改密与 v0.1 旧口令格式升级）
-    pub async fn update_password_hash(&self, id: Uuid, password_hash: &str) -> Result<(), AppError> {
+    pub async fn update_password_hash(
+        &self,
+        id: Uuid,
+        password_hash: &str,
+    ) -> Result<(), AppError> {
         sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
             .bind(id)
             .bind(password_hash)
@@ -202,9 +235,9 @@ impl UserRepository {
     ) -> Result<User, AppError> {
         sqlx::query_as::<_, User>(
             r#"
-            INSERT INTO users (id, username, email, password_hash, role, is_active)
-            VALUES ($1, $2, $3, $4, 'user', true)
-            RETURNING id, username, email, password_hash, role, is_active, created_at, updated_at
+            INSERT INTO users (id, username, email, password_hash, is_active)
+            VALUES ($1, $2, $3, $4, true)
+            RETURNING id, username, email, password_hash, is_active, created_at, updated_at
             "#,
         )
         .bind(id)

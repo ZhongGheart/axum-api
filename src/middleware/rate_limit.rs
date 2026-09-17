@@ -68,7 +68,10 @@ pub async fn rate_limit_middleware(
         return Err((StatusCode::TOO_MANY_REQUESTS, body).into_response());
     }
 
-    if let Some(auth_user) = req.extensions().get::<crate::middleware::auth::AuthenticatedUser>() {
+    if let Some(auth_user) = req
+        .extensions()
+        .get::<crate::middleware::auth::AuthenticatedUser>()
+    {
         let user_result = redis_client
             .check_user_rate_limit(
                 &auth_user.user_id.to_string(),
@@ -103,7 +106,11 @@ pub async fn rate_limit_middleware(
 
     resp.headers_mut().insert(
         "X-RateLimit-Limit",
-        rate_limit_config.ip_max_requests.to_string().parse().unwrap(),
+        rate_limit_config
+            .ip_max_requests
+            .to_string()
+            .parse()
+            .unwrap(),
     );
 
     Ok(resp)

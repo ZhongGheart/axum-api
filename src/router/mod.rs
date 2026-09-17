@@ -17,10 +17,12 @@ use crate::config::Config;
 use crate::controller::{auth, demo, dict, menu, monitor, rbac, role, user};
 use crate::docs::swagger_ui_handler;
 use crate::error::AppError;
+use crate::middleware::api_metrics::{api_metrics_mw, MetricsCollector};
+use crate::middleware::audit_log::audit_log_middleware;
 use crate::middleware::auth::auth_middleware;
 use crate::middleware::rate_limit::rate_limit_middleware;
-use crate::middleware::api_metrics::{api_metrics_mw, MetricsCollector};
 use crate::middleware::request_id::request_id_middleware;
+use crate::repository::audit_log::AuditLogRepository;
 use crate::repository::db::DatabasePool;
 use crate::repository::dict::DictRepository;
 use crate::repository::menu::MenuRepository;
@@ -35,12 +37,11 @@ use crate::utils::redis::RedisClient;
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub auth_service: AuthService,
-    #[allow(dead_code)]
-    pub rbac_service: RbacService,
     pub jwt_util: Arc<JwtUtil>,
     pub redis_client: Arc<RedisClient>,
     pub menu_repo: MenuRepository,
     pub dict_repo: DictRepository,
+    pub audit_log_repo: AuditLogRepository,
     pub db_pool: DatabasePool,
     pub metrics_collector: Arc<MetricsCollector>,
 }
@@ -59,14 +60,10 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
     let pool = db_pool.writer(); // 主库用于初始化
 
     // ── 初始化 Redis 客户端 ────────────────────────────────────
-    let redis_client = Arc::new(
-        RedisClient::new(&config.redis)
-            .await
-            .map_err(|e| {
-                tracing::warn!("Redis 连接失败，限流和黑名单功能将不可用: {e}");
-                e
-            })?,
-    );
+    let redis_client = Arc::new(RedisClient::new(&config.redis).await.map_err(|e| {
+        tracing::warn!("Redis 连接失败，限流和黑名单功能将不可用: {e}");
+        e
+    })?);
 
     // ── 初始化各层 ──────────────────────────────────────────────
     let jwt_util = Arc::new(JwtUtil::new(&config.jwt_secret));
@@ -76,6 +73,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
     let role_repo = RoleRepository::new(pool.clone());
     let menu_repo = MenuRepository::new(pool.clone());
     let dict_repo = DictRepository::new(pool.clone(), Some(redis_client.as_ref().clone()));
+    let audit_log_repo = AuditLogRepository::new(pool.clone());
     let auth_service = AuthService::new(
         user_repo,
         role_repo.clone(),
@@ -84,17 +82,17 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         config.security.login_max_failures,
         config.security.login_failure_window_seconds,
     );
-    let rbac_service = RbacService::new(role_repo, pool.clone());
+    let rbac_service = RbacService::new(pool.clone());
 
     rbac_service.init_defaults().await?;
 
     let state = AppState {
         auth_service,
-        rbac_service,
         jwt_util: Arc::clone(&jwt_util),
         redis_client: Arc::clone(&redis_client),
         menu_repo,
         dict_repo,
+        audit_log_repo,
         db_pool,
         metrics_collector: metrics_collector.clone(),
     };
@@ -134,6 +132,10 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route("/api/auth/logout", post(auth::logout))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            audit_log_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             auth_middleware,
         ));
 
@@ -145,6 +147,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route("/api/admin/roles", get(role::list_roles).post(role::create_role))
         .route("/api/admin/roles/{id}", axum::routing::put(role::update_role).delete(role::delete_role))
         .route("/api/admin/users/{id}/roles", get(role::get_user_roles).post(role::assign_user_role))
+        .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware))
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
@@ -152,13 +155,29 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
 
     // ── 菜单管理路由（仅 admin） ────────────────────────────
     let menu_routes = Router::new()
-        .route("/api/admin/menus", get(menu::list_menus).post(menu::create_menu))
-        .route("/api/admin/menus/{id}", axum::routing::put(menu::update_menu).delete(menu::delete_menu))
-        .route("/api/admin/roles/{id}/menus", axum::routing::put(menu::assign_role_menus))
-        .route_layer(middleware::from_fn(move |req, next| {
-            async move { crate::middleware::auth::require_role("admin", req, next).await }
+        .route(
+            "/api/admin/menus",
+            get(menu::list_menus).post(menu::create_menu),
+        )
+        .route(
+            "/api/admin/menus/{id}",
+            axum::routing::put(menu::update_menu).delete(menu::delete_menu),
+        )
+        .route(
+            "/api/admin/roles/{id}/menus",
+            axum::routing::put(menu::assign_role_menus),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit_log_middleware,
+        ))
+        .route_layer(middleware::from_fn(move |req, next| async move {
+            crate::middleware::auth::require_role("admin", req, next).await
         }))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // ── 数据字典路由（仅 admin） ────────────────────────────
     let dict_routes = Router::new()
@@ -166,13 +185,26 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route("/api/admin/dict/types/{id}", axum::routing::put(dict::update_type).delete(dict::delete_type))
         .route("/api/admin/dict/items", get(dict::list_items).post(dict::create_item))
         .route("/api/admin/dict/items/{id}", axum::routing::put(dict::update_item).delete(dict::delete_item))
-        .route("/api/admin/dict/{code}/items", get(dict::get_items_by_code))
         .route("/api/admin/dict/cached", get(dict::list_all_cached))
         .route("/api/admin/dict/refresh", post(dict::refresh_cache))
+        .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware))
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    // ── 数据字典读取（任意已登录用户） ──────────────────────
+    // 字典是通用展示数据；要求 admin 会让所有非管理页面的 DictSelect 直接 403
+    let dict_read_routes = Router::new()
+        .route("/api/dict/{code}/items", get(dict::get_items_by_code))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit_log_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // ── 能力测试路由（仅 admin） ────────────────────────────
     let demo_routes = Router::new()
@@ -183,7 +215,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route("/api/admin/users/batch-delete", axum::routing::post(user::batch_delete_users))
         .route("/api/admin/users/{id}/status", axum::routing::put(user::toggle_user_status))
         .route("/api/admin/users/{id}/reset-password", axum::routing::post(user::reset_user_password))
-        .route("/api/admin/users/{id}/roles", axum::routing::put(user::assign_user_roles))
+        .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware))
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
@@ -196,6 +228,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route("/api/admin/monitor/alerts", get(monitor::alerts))
         .route("/api/admin/monitor/metrics/reset", post(monitor::reset_metrics))
         .route("/api/admin/monitor/system/export", get(monitor::export_system))
+        .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware))
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
         }))
@@ -214,15 +247,23 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .merge(demo_routes)
         .merge(menu_routes)
         .merge(dict_routes)
+        .merge(dict_read_routes)
         .merge(monitor_routes)
         // OpenAPI JSON 端点
-        .route("/api/openapi.json", axum::routing::get(|| async {
-            axum::Json(crate::docs::openapi_json())
-        }))
+        .route(
+            "/api/openapi.json",
+            axum::routing::get(|| async { axum::Json(crate::docs::openapi_json()) }),
+        )
         // Swagger UI HTML 页面（同源服务，避免 iframe 跨域限制）
-        .route("/api/swagger-ui/{*path}", axum::routing::get(swagger_ui_handler))
+        .route(
+            "/api/swagger-ui/{*path}",
+            axum::routing::get(swagger_ui_handler),
+        )
         // API 性能追踪中间件（记录每个接口的耗时/报错）
-        .layer(middleware::from_fn_with_state(state.clone(), api_metrics_mw))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            api_metrics_mw,
+        ))
         // 全局中间件：限流（最外层）
         .layer(middleware::from_fn_with_state(
             rate_limit_state,

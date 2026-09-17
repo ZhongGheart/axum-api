@@ -58,12 +58,17 @@ fn redis_manager_config() -> ConnectionManagerConfig {
 impl RedisClient {
     /// 从配置创建 Redis 客户端连接
     pub async fn new(config: &RedisConfig) -> Result<Self> {
-        let client = redis::Client::open(config.url.as_str())
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 连接失败: {e}")))?;
+        let client = redis::Client::open(config.url.as_str()).map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis 连接失败: {e}"))
+        })?;
 
         let conn = ConnectionManager::new_with_config(client, redis_manager_config())
             .await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 连接管理初始化失败: {e}")))?;
+            .map_err(|e| {
+                crate::error::AppError::InternalServerError(format!(
+                    "Redis 连接管理初始化失败: {e}"
+                ))
+            })?;
 
         Ok(Self { conn })
     }
@@ -101,10 +106,9 @@ impl RedisClient {
         let ttl = if token_exp > now { token_exp - now } else { 1 };
 
         let mut conn = self.conn.clone();
-        let _: () = conn
-            .set_ex(key, "1", ttl)
-            .await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}")))?;
+        let _: () = conn.set_ex(key, "1", ttl).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}"))
+        })?;
 
         Ok(())
     }
@@ -113,10 +117,9 @@ impl RedisClient {
     pub async fn is_token_blacklisted(&self, jti: &str) -> Result<bool> {
         let key = format!("{}{}", Self::TOKEN_BLACKLIST_PREFIX, jti);
         let mut conn = self.conn.clone();
-        let exists: Option<String> = conn
-            .get(key)
-            .await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 查询失败: {e}")))?;
+        let exists: Option<String> = conn.get(key).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis 查询失败: {e}"))
+        })?;
         Ok(exists.is_some())
     }
 
@@ -125,14 +128,20 @@ impl RedisClient {
     /// 记录"吊销时间点"，`iat` 早于该时间点的令牌一律失效。
     /// 新登录签发的令牌 `iat` 不早于该时间点，因此不会被误伤。
     /// TTL 取令牌最长有效期，过期后键自动清理。
-    pub async fn revoke_user_sessions(&self, user_id: &uuid::Uuid, ttl_seconds: u64) -> Result<u64> {
+    pub async fn revoke_user_sessions(
+        &self,
+        user_id: &uuid::Uuid,
+        ttl_seconds: u64,
+    ) -> Result<u64> {
         let key = format!("{}{}", Self::USER_REVOKED_PREFIX, user_id);
         let revoked_before = chrono::Utc::now().timestamp() as u64;
         let mut conn = self.conn.clone();
         let _: () = conn
             .set_ex(key, revoked_before, ttl_seconds.max(1))
             .await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}")))?;
+            .map_err(|e| {
+                crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}"))
+            })?;
         Ok(revoked_before)
     }
 
@@ -140,10 +149,9 @@ impl RedisClient {
     pub async fn user_revoked_before(&self, user_id: &uuid::Uuid) -> Result<Option<u64>> {
         let key = format!("{}{}", Self::USER_REVOKED_PREFIX, user_id);
         let mut conn = self.conn.clone();
-        let value: Option<u64> = conn
-            .get(key)
-            .await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 查询失败: {e}")))?;
+        let value: Option<u64> = conn.get(key).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis 查询失败: {e}"))
+        })?;
         Ok(value)
     }
 
@@ -158,10 +166,9 @@ impl RedisClient {
     pub async fn login_failure_count(&self, scope: &str) -> Result<u64> {
         let key = format!("{}{}", Self::LOGIN_FAILURE_PREFIX, scope);
         let mut conn = self.conn.clone();
-        let value: Option<u64> = conn
-            .get(key)
-            .await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 查询失败: {e}")))?;
+        let value: Option<u64> = conn.get(key).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis 查询失败: {e}"))
+        })?;
         Ok(value.unwrap_or(0))
     }
 
@@ -169,15 +176,16 @@ impl RedisClient {
     pub async fn record_login_failure(&self, scope: &str, window_seconds: u64) -> Result<u64> {
         let key = format!("{}{}", Self::LOGIN_FAILURE_PREFIX, scope);
         let mut conn = self.conn.clone();
-        let count: u64 = conn
-            .incr(&key, 1)
-            .await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}")))?;
+        let count: u64 = conn.incr(&key, 1).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}"))
+        })?;
         if count == 1 {
             let _: () = conn
                 .expire(&key, window_seconds.max(1) as i64)
                 .await
-                .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}")))?;
+                .map_err(|e| {
+                    crate::error::AppError::InternalServerError(format!("Redis 写入失败: {e}"))
+                })?;
         }
         Ok(count)
     }
@@ -186,10 +194,9 @@ impl RedisClient {
     pub async fn clear_login_failures(&self, scope: &str) -> Result<()> {
         let key = format!("{}{}", Self::LOGIN_FAILURE_PREFIX, scope);
         let mut conn = self.conn.clone();
-        let _: () = conn
-            .del(key)
-            .await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 删除失败: {e}")))?;
+        let _: () = conn.del(key).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis 删除失败: {e}"))
+        })?;
         Ok(())
     }
 
@@ -213,20 +220,21 @@ impl RedisClient {
         let mut conn = self.conn.clone();
 
         // 原子递增，返回递增后的值
-        let current: u64 = conn.incr(&key, 1).await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis INCR 失败: {e}")))?;
+        let current: u64 = conn.incr(&key, 1).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis INCR 失败: {e}"))
+        })?;
 
         // 首次访问时设置过期时间
         if current == 1 {
-            let _: () = conn.expire(&key, window_seconds as i64).await
-                .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis EXPIRE 失败: {e}")))?;
+            let _: () = conn
+                .expire(&key, window_seconds as i64)
+                .await
+                .map_err(|e| {
+                    crate::error::AppError::InternalServerError(format!("Redis EXPIRE 失败: {e}"))
+                })?;
         }
 
-        let remaining = if current >= max_requests {
-            0
-        } else {
-            max_requests - current
-        };
+        let remaining = max_requests.saturating_sub(current);
 
         Ok(RateLimitResult {
             allowed: current <= max_requests,
@@ -254,107 +262,27 @@ impl RedisClient {
     /// 取字符串值
     pub async fn get_string(&self, key: &str) -> Result<Option<String>> {
         let mut conn = self.conn.clone();
-        conn.get(key).await
+        conn.get(key)
+            .await
             .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis GET失败: {e}")))
     }
 
     /// 设置字符串值（含过期时间）
     pub async fn set_string(&self, key: &str, value: &str, ttl_seconds: u64) -> Result<()> {
         let mut conn = self.conn.clone();
-        let _: () = conn.set_ex(key, value, ttl_seconds).await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis SET失败: {e}")))?;
+        let _: () = conn.set_ex(key, value, ttl_seconds).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis SET失败: {e}"))
+        })?;
         Ok(())
     }
 
-    // ──────────────────────────────────────────────
-    // 高级缓存策略：热点数据 + 自动刷新 + 击穿防护
-    // ──────────────────────────────────────────────
-
-    /// 缓存 TTL（秒）
-    const CACHE_SHORT_TTL: u64 = 60;      // 1 分钟
-    const CACHE_MEDIUM_TTL: u64 = 300;    // 5 分钟
-    const CACHE_LONG_TTL: u64 = 3600;     // 1 小时
-    const CACHE_REFRESH_AHEAD: u64 = 60;  // 提前刷新时间（秒）
-
-    /// 获取缓存，支持自动刷新
-    ///
-    /// 当缓存即将过期（剩余 TTL < CACHE_REFRESH_AHEAD）时，
-    /// 返回旧值的同时异步刷新缓存，避免缓存雪崩。
-    pub async fn get_cache_with_auto_refresh<F, Fut>(
-        &self,
-        key: &str,
-        ttl: u64,
-        fetch_fn: F,
-    ) -> Result<String>
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<String>> + Send,
-    {
+    /// 删除任意键（用于字典等业务缓存失效）
+    pub async fn delete_key(&self, key: &str) -> Result<()> {
         let mut conn = self.conn.clone();
-
-        // 1. 先尝试读缓存
-        let cached: Option<String> = conn.get(key).await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis GET 失败: {e}")))?;
-
-        if let Some(ref value) = cached {
-            // 2. 检查剩余 TTL，如果接近过期则异步刷新
-            let ttl_remaining: Option<i64> = conn.ttl(key).await.ok();
-            if let Some(remaining) = ttl_remaining {
-                if remaining > 0 && remaining as u64 <= Self::CACHE_REFRESH_AHEAD {
-                    // 异步刷新缓存，不阻塞当前响应
-                    let key_owned = key.to_string();
-                    let redis_clone = self.clone();
-                    tokio::spawn(async move {
-                        match fetch_fn().await {
-                            Ok(new_value) => {
-                                let _ = redis_clone.set_string(&key_owned, &new_value, ttl).await;
-                                tracing::debug!("缓存自动刷新: {}", key_owned);
-                            }
-                            Err(e) => {
-                                tracing::warn!("缓存自动刷新失败: {}: {}", key_owned, e);
-                            }
-                        }
-                    });
-                }
-            }
-            return Ok(value.clone());
-        }
-
-        // 3. 缓存穿透：使用 SETNX 实现互斥锁防止击穿
-        let lock_key = format!("{}:lock", key);
-        let lock_acquired: bool = conn.set_nx(&lock_key, "1").await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis SETNX 失败: {e}")))?;
-
-        if lock_acquired {
-            // 当前线程获得锁，执行回源查询
-            conn.expire::<_, ()>(&lock_key, 10).await.ok(); // 锁 10 秒自动释放
-            let value = fetch_fn().await?;
-            self.set_string(key, &value, ttl).await?;
-            conn.del::<_, ()>(&lock_key).await.ok(); // 释放锁
-            Ok(value)
-        } else {
-            // 其他线程等待锁释放后重试
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            // 重试读缓存
-            let retry: Option<String> = conn.get(key).await
-                .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 重试失败: {e}")))?;
-            Ok(retry.unwrap_or_default())
-        }
-    }
-
-    /// 批量预热缓存
-    pub async fn warmup_cache<K, V>(
-        &self,
-        entries: Vec<(K, V)>,
-        ttl: u64,
-    ) where
-        K: AsRef<str>,
-        V: AsRef<str>,
-    {
-        for (key, value) in &entries {
-            let _ = self.set_string(key.as_ref(), value.as_ref(), ttl).await;
-        }
-        tracing::info!("缓存预热完成: {} 条", entries.len());
+        let _: () = conn.del(key).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis DEL 失败: {e}"))
+        })?;
+        Ok(())
     }
 
     /// 检查用户级限流
