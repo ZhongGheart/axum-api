@@ -40,6 +40,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # 创建非 root 用户
@@ -47,20 +48,18 @@ RUN groupadd -r app && useradd -r -g app -d /app -s /sbin/nologin app
 
 WORKDIR /app
 
-# 复制编译产物和运行时文件
+# 复制编译产物（迁移脚本已由 sqlx::migrate! 嵌入二进制）
+# 运行配置一律通过环境变量注入，不把 .env 打进镜像
 COPY --from=builder /app/target/release/axum-api /app/axum-api
-COPY --from=builder /app/.env.example /app/.env
-COPY --from=builder /app/migrations /app/migrations
 
 # 安全配置
-RUN chown -R app:app /app && \
-    chmod 500 /app/axum-api && \
-    chmod 400 /app/.env
+RUN chown -R app:app /app && chmod 500 /app/axum-api
 
 USER app
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-    CMD ["/app/axum-api"]
+# 探测真实健康端点（任一依赖不可用时返回 503）
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/api/health || exit 1
 
 EXPOSE 8080
 

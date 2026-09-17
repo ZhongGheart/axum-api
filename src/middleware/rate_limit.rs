@@ -28,6 +28,11 @@ pub async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Result<impl IntoResponse, Response> {
+    // 健康检查不得被限流依赖阻断：依赖故障时仍需可探活
+    if req.uri().path() == "/api/health" {
+        return Ok(next.run(req).await);
+    }
+
     let client_ip = req
         .headers()
         .get("X-Forwarded-For")
@@ -46,13 +51,14 @@ pub async fn rate_limit_middleware(
             rate_limit_config.ip_window_seconds,
         )
         .await
-        .map_err(|_| {
+        .map_err(|e| {
+            tracing::error!("限流依赖不可用（IP 维度）: {e}");
             let body = Json(json!({
-                "code": 500,
-                "message": "限流检查失败",
+                "code": 503,
+                "message": "限流服务不可用",
                 "data": null,
             }));
-            (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+            (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
         })?;
 
     if !ip_result.allowed {
@@ -75,13 +81,14 @@ pub async fn rate_limit_middleware(
                 rate_limit_config.user_window_seconds,
             )
             .await
-            .map_err(|_| {
+            .map_err(|e| {
+                tracing::error!("限流依赖不可用（用户维度）: {e}");
                 let body = Json(json!({
-                    "code": 500,
-                    "message": "限流检查失败",
+                    "code": 503,
+                    "message": "限流服务不可用",
                     "data": null,
                 }));
-                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+                (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
             })?;
 
         if !user_result.allowed {

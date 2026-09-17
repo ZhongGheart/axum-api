@@ -2,11 +2,14 @@
 # Docker Compose 全栈编排
 # ============================================
 # 启动方式:
+#   cp .env.example .env   # 按需修改 DB_PASSWORD / JWT_SECRET
 #   docker compose up -d
-#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# 说明:
+#   - 数据库迁移由 API 启动时自动执行（MIGRATE_ON_STARTUP=true）
+#   - DB_PASSWORD / JWT_SECRET 必须显式提供，不提供弱默认值
+#   - postgres / redis 默认不对宿主机暴露端口，仅在同网络内可达
 # ============================================
-
-version: "3.9"
 
 services:
   # ── PostgreSQL 数据库 ─────────────────────
@@ -17,9 +20,7 @@ services:
     environment:
       POSTGRES_DB: axum_api
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD 未设置，请先 cp .env.example .env 并修改}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -33,8 +34,6 @@ services:
     image: redis:7-alpine
     container_name: axum-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -53,16 +52,24 @@ services:
     environment:
       SERVER_HOST: "0.0.0.0"
       SERVER_PORT: "8080"
-      DATABASE_URL: "postgres://postgres:${DB_PASSWORD:-password}@postgres:5432/axum_api"
+      DATABASE_URL: "postgres://postgres:${DB_PASSWORD:?}@postgres:5432/axum_api"
       REDIS_URL: "redis://redis:6379"
-      JWT_SECRET: ${JWT_SECRET:-your-super-secret-jwt-key-change-in-production}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 未设置，请先 cp .env.example .env 并生成强密钥}
       JWT_EXPIRATION_SECONDS: "604800"
+      APP_ENV: "production"
+      MIGRATE_ON_STARTUP: "true"
       RUST_LOG: "info"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
 
   # ── Vue 前端管理面板 ──────────────────────
   web:
@@ -74,7 +81,8 @@ services:
     ports:
       - "80:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
 volumes:
   pgdata:

@@ -2,7 +2,9 @@
 //!
 //! 封装异步 Redis 客户端，提供连接管理、Token 黑名单、限流计数等通用能力。
 
-use redis::aio::ConnectionManager;
+use std::time::Duration;
+
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::AsyncCommands;
 
 use crate::config::RedisConfig;
@@ -38,26 +40,44 @@ impl std::fmt::Debug for RedisClient {
     }
 }
 
+/// Redis 连接与操作的时间上限
+///
+/// redis-rs 默认 `response_timeout = None`：Redis 不可用时操作会一直等待重连，
+/// 使所有经过限流/黑名单校验的请求挂起。这里给出明确上限，
+/// 让依赖故障快速以 503 暴露，而不是拖垮整个服务。
+fn redis_manager_config() -> ConnectionManagerConfig {
+    ConnectionManagerConfig::new()
+        .set_number_of_retries(3)
+        .set_factor(50)
+        .set_exponent_base(2)
+        .set_max_delay(200)
+        .set_connection_timeout(Duration::from_secs(1))
+        .set_response_timeout(Duration::from_secs(2))
+}
+
 impl RedisClient {
     /// 从配置创建 Redis 客户端连接
     pub async fn new(config: &RedisConfig) -> Result<Self> {
         let client = redis::Client::open(config.url.as_str())
             .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 连接失败: {e}")))?;
 
-        let conn = ConnectionManager::new(client)
+        let conn = ConnectionManager::new_with_config(client, redis_manager_config())
             .await
             .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 连接管理初始化失败: {e}")))?;
 
         Ok(Self { conn })
     }
 
-    /// 从已存在的客户端构建（用于共享同一客户端）
-    #[allow(dead_code)]
-    pub async fn from_client(client: redis::Client) -> Result<Self> {
-        let conn = ConnectionManager::new(client)
+    /// 健康检查：向 Redis 发送 PING
+    pub async fn ping(&self) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let _: String = redis::cmd("PING")
+            .query_async(&mut conn)
             .await
-            .map_err(|e| crate::error::AppError::InternalServerError(format!("Redis 连接管理初始化失败: {e}")))?;
-        Ok(Self { conn })
+            .map_err(|e| {
+                crate::error::AppError::InternalServerError(format!("Redis PING 失败: {e}"))
+            })?;
+        Ok(())
     }
 
     // ──────────────────────────────────────────────

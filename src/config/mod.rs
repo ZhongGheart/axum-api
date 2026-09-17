@@ -74,6 +74,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// 验证码配置
     pub captcha_enabled: bool,
+    /// 启动时是否自动执行数据库迁移
+    pub migrate_on_startup: bool,
 }
 
 impl Config {
@@ -154,6 +156,11 @@ impl Config {
             ),
         };
 
+        // 启动时自动执行数据库迁移（关闭后需由独立迁移步骤保证表结构）
+        let migrate_on_startup = env::var("MIGRATE_ON_STARTUP")
+            .unwrap_or_else(|_| "true".to_string())
+            != "false";
+
         // 验证码
         let captcha_enabled = env::var("CAPTCHA_ENABLED")
             .unwrap_or_else(|_| "false".to_string()) == "true";
@@ -191,6 +198,7 @@ impl Config {
             crypto,
             database,
             captcha_enabled,
+            migrate_on_startup,
         }
     }
 }

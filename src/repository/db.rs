@@ -56,6 +56,18 @@ impl DatabasePool {
         })
     }
 
+    /// 执行数据库迁移
+    ///
+    /// 迁移文件在编译期通过 `sqlx::migrate!` 嵌入二进制，
+    /// 因此运行镜像无需携带 `migrations/` 目录。
+    pub async fn run_migrations(&self) -> Result<(), AppError> {
+        sqlx::migrate!("./migrations")
+            .run(&self.writer)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("数据库迁移失败: {e}")))?;
+        Ok(())
+    }
+
     /// 获取读连接池
     pub fn reader(&self) -> &PgPool {
         if self.use_read_replica {

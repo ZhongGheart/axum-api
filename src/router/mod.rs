@@ -53,6 +53,13 @@ pub struct AppState {
 pub async fn create_router(config: Config) -> Result<Router, AppError> {
     // ── 初始化读写分离数据库连接池 ────────────────────────
     let db_pool = DatabasePool::new(&config.database).await?;
+
+    // ── 启动时执行数据库迁移（空库自动建表） ──────────────────
+    if config.migrate_on_startup {
+        db_pool.run_migrations().await?;
+        tracing::info!("数据库迁移已应用");
+    }
+
     let pool = db_pool.writer(); // 主库用于初始化
 
     // ── 初始化 Redis 客户端 ────────────────────────────────────

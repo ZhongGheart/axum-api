@@ -2,7 +2,8 @@
 //!
 //! 处理认证相关的 HTTP 请求，包括注册、登录、获取当前用户信息、登出。
 
-use axum::{extract::State, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use serde::Serialize;
 
 use crate::error::AppError;
 use crate::middleware::auth::AuthenticatedUser;
@@ -50,7 +51,48 @@ pub async fn logout(
     Ok(Json(ApiResponse::success("登出成功")))
 }
 
+/// 健康检查响应体
+#[derive(Debug, Serialize)]
+pub struct HealthPayload {
+    /// 总体状态：`ok` / `degraded`
+    pub status: &'static str,
+    /// 数据库连通性：`up` / `down`
+    pub database: &'static str,
+    /// Redis 连通性：`up` / `down`
+    pub redis: &'static str,
+}
+
 /// GET /api/health — 健康检查
-pub async fn health() -> Json<ApiResponse<&'static str>> {
-    Json(ApiResponse::success("服务运行正常"))
+///
+/// 真实探测数据库与 Redis：任一依赖不可用时返回 503，
+/// 以便容器编排与负载均衡摘除该实例。
+pub async fn health(State(state): State<AppState>) -> axum::response::Response {
+    let database_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(state.db_pool.writer())
+        .await
+        .is_ok();
+    let redis_ok = state.redis_client.ping().await.is_ok();
+    let healthy = database_ok && redis_ok;
+
+    let payload = HealthPayload {
+        status: if healthy { "ok" } else { "degraded" },
+        database: if database_ok { "up" } else { "down" },
+        redis: if redis_ok { "up" } else { "down" },
+    };
+
+    let (status, message) = if healthy {
+        (StatusCode::OK, "服务运行正常")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "依赖服务不可用")
+    };
+
+    (
+        status,
+        Json(ApiResponse {
+            code: status.as_u16(),
+            message: message.to_string(),
+            data: Some(payload),
+        }),
+    )
+        .into_response()
 }
