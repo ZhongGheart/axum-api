@@ -7,6 +7,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::middleware::auth::AuthenticatedUser;
 use crate::model::{
     ApiResponse, AssignMenuRequest, CreateMenuRequest, Menu, MenuNode, UpdateMenuRequest,
 };
@@ -40,6 +41,41 @@ pub async fn list_menus(
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct MenuQuery {
     pub role_id: Option<String>,
+}
+
+/// GET /api/auth/menus — 当前登录用户可见的导航菜单树
+///
+/// 前端据此动态生成路由与侧栏，因此只返回：
+/// 该用户所有角色关联的、`is_visible = true` 的非按钮菜单。
+#[utoipa::path(
+    get,
+    path = "/api/auth/menus",
+    tag = "认证",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "当前用户的导航菜单树", body = ApiResponse<Vec<MenuNode>>))
+)]
+pub async fn my_menus(
+    State(state): State<AppState>,
+    auth_user: AuthenticatedUser,
+) -> Result<Json<ApiResponse<Vec<MenuNode>>>, AppError> {
+    let mut role_ids = Vec::with_capacity(auth_user.roles.len());
+    for role_name in &auth_user.roles {
+        if let Some(role) = state.auth_service.role_repo.find_by_name(role_name).await? {
+            role_ids.push(role.id);
+        }
+    }
+
+    if role_ids.is_empty() {
+        tracing::warn!(
+            "用户 {} 未匹配到任何角色，返回空菜单: {:?}",
+            auth_user.user_id,
+            auth_user.roles
+        );
+        return Ok(Json(ApiResponse::success(Vec::new())));
+    }
+
+    let tree = state.menu_repo.find_tree_for_roles(&role_ids).await?;
+    Ok(Json(ApiResponse::success(tree)))
 }
 
 /// POST /api/admin/menus — 新增菜单

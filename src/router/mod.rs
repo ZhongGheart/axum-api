@@ -130,6 +130,8 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::me))
         .route("/api/auth/logout", post(auth::logout))
+        // 当前用户的导航菜单：前端据此动态生成路由与侧栏
+        .route("/api/auth/menus", get(crate::controller::menu::my_menus))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             audit_log_middleware,

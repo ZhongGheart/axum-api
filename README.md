@@ -4,8 +4,8 @@
 
 基于 **Rust Axum** 后端 + **Vue 3** 前端的企业级全栈管理平台。
 
-> v0.2.0 的定位是「闭环与可部署基线」：不新增业务模块，而是把此前**声明了但未接线**的能力
-> 补齐或删除，并建立可回归的验证边界。变更明细见 [CHANGELOG.md](CHANGELOG.md)。
+> v0.3.0 补齐了此前遗留的两项「声明与实现差距」：**OpenAPI 由代码生成**、
+> **前端导航由后端菜单驱动**。变更明细见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 能力清单（与运行时一致）
 
@@ -17,11 +17,11 @@
 | 限流 | ✅ | 基于 Redis 的固定窗口限流（IP 维度） |
 | 操作日志 | ✅ | 受保护路由写入 `audit_logs`（仅方法/路径/查询串，不记录请求体） |
 | 数据字典 | ✅ | Redis 缓存 + 写操作真实失效；读取接口对**任意已登录用户**开放 |
-| 菜单管理 | ⚠️ | 后端 CRUD 与角色关联已实现；前端导航仍为静态路由表，未由菜单数据驱动 |
+| 菜单管理 | ✅ | 菜单是导航的唯一来源：`/api/auth/menus` 决定侧栏与前端动态路由 |
 | 用户管理 | ✅ | 增删改查、批量删除、状态切换、重置密码；含"最后一个管理员"保护 |
 | 系统监控 | ✅ | CPU/内存/磁盘、DB/Redis 状态、接口耗时统计（进程内，重启丢失） |
 | Excel 导出 | ✅ | 用户列表、操作日志、系统信息 |
-| OpenAPI 文档 | ⚠️ | 手写规范 + "文档中每条路由都必须真实存在"的集成测试（尚未由代码生成） |
+| OpenAPI 文档 | ✅ | utoipa 从 handler 注解与 DTO 派生生成；双向覆盖测试保证文档与路由同步 |
 | 按钮级权限 | ⚠️ | 前端为**基于角色**的显隐（`PermissionButton`）；无独立权限码体系 |
 
 > 表中 ⚠️ 项是明确的能力边界，不再作为"已实现"宣传。
@@ -59,6 +59,7 @@ axum-api/
 | **缓存** | Redis | 7 |
 | **前端** | Vue 3 + TypeScript + Vite | 3.5 / 6 |
 | **UI** | Naive UI | 2.41 |
+| **接口文档** | utoipa | 5.5 |
 | **测试** | cargo test + Vitest | — |
 | **部署** | Docker + Docker Compose + Nginx | — |
 
@@ -166,6 +167,7 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | Method | Path | 说明 |
 |--------|------|------|
 | GET | `/api/auth/me` | 当前用户信息（含角色列表） |
+| GET | `/api/auth/menus` | 当前用户可见的导航菜单树（前端动态路由与侧栏的数据源） |
 | POST | `/api/auth/logout` | 注销**当前令牌** |
 | GET | `/api/dict/{code}/items` | 读取字典项（任意已登录用户） |
 
@@ -180,7 +182,7 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | POST | `/api/admin/users/{id}/reset-password` | 重置密码（并吊销会话） |
 | GET/POST | `/api/admin/users/{id}/roles` | 查询 / 追加用户角色 |
 | GET/POST | `/api/admin/roles`、`PUT/DELETE /api/admin/roles/{id}` | 角色管理 |
-| GET/POST | `/api/admin/menus`、`PUT/DELETE /api/admin/menus/{id}` | 菜单管理 |
+| GET/POST | `/api/admin/menus`、`PUT/DELETE /api/admin/menus/{id}` | 菜单管理（改动即时影响前端导航） |
 | PUT | `/api/admin/roles/{id}/menus` | 角色-菜单关联 |
 | GET/POST | `/api/admin/dict/types`、`PUT/DELETE /api/admin/dict/types/{id}` | 字典类型管理 |
 | GET/POST | `/api/admin/dict/items`、`PUT/DELETE /api/admin/dict/items/{id}` | 字典项管理 |
@@ -191,6 +193,17 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | GET | `/api/openapi.json`、`/api/swagger-ui/index.html` | OpenAPI 规范与 Swagger UI |
 
 > 完整字段定义见 Swagger UI。集成测试会校验"文档里声明的每条路由都真实存在"。
+
+## 新增一个页面（菜单驱动）
+
+前端不再有静态业务路由表，加页面只需两步：
+
+1. 在 `frontend/src/views/` 下新增 `.vue` 文件，例如 `views/report/index.vue`
+2. 在「菜单管理」里新增一条菜单：`path` = `/report`，`component` = `report/index`，
+   并分配给它应有的角色
+
+登录后 `/api/auth/menus` 会返回该菜单，前端据此注册路由并渲染侧栏；无需改前端路由代码。
+`component` 解析不到页面文件时会跳过并告警（前端有契约测试提前拦截这类错配）。
 
 ## 测试与质量门禁
 
@@ -217,7 +230,11 @@ pnpm build
 ```
 
 集成测试覆盖：空库自动迁移、登录/登出与**旧令牌不复活**、错误口令 401、登录锁定 429、
-普通用户越权 403、用户 CRUD 与角色投影、最后管理员保护、审计日志落库、文档路由覆盖。
+普通用户越权 403、用户 CRUD 与角色投影、最后管理员保护、审计日志落库、
+**角色化菜单树**、文档路由双向覆盖。
+
+前端测试覆盖：请求缓存与本地存储、**菜单→路由转换**、动态路由注册/撤销、
+菜单种子 component 与页面文件的一致性。
 
 ## 生产部署建议
 

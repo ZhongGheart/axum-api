@@ -7,6 +7,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { getToken } from '@/utils/storage'
+import { useMenuStore } from '@/stores/menu'
+import { buildRoutesFromMenus } from './menuRoutes'
 
 /** 白名单路由（无需登录 + 无侧栏） */
 const WHITE_LIST = ['/login', '/register']
@@ -51,92 +53,14 @@ const routes: RouteRecordRaw[] = [
     ],
   },
 
-  // ── 需要登录的路由（MainLayout） ──────────────────────────
+  // ── 需要登录的布局壳（业务页面由后端菜单动态注册） ──────────
+  // 具体页面路由在登录后由 registerMenuRoutes() 依据 /api/auth/menus 注册，
+  // 菜单增删不再需要改前端路由表。
   {
     path: '/',
+    name: 'Root',
     component: () => import('@/layouts/MainLayout.vue'),
-    children: [
-      {
-        path: '',
-        name: 'Home',
-        component: () => import('@/views/home/index.vue'),
-        meta: { title: '首页' },
-      },
-      {
-        path: 'demo',
-        name: 'Demo',
-        component: () => import('@/views/demo/index.vue'),
-        meta: { title: '组件示例' },
-      },
-      {
-        path: 'demo/backend',
-        name: 'DemoBackend',
-        component: () => import('@/views/demo/backend.vue'),
-        meta: { title: '后端能力' },
-      },
-      {
-        path: 'demo/dict',
-        name: 'DemoDict',
-        component: () => import('@/views/demo/dict.vue'),
-        meta: { title: '字典组件' },
-      },
-      {
-        path: 'system',
-        name: 'System',
-        redirect: '/system/user',
-        meta: { title: '系统管理', roles: ['admin'] },
-        children: [
-          {
-            path: 'user',
-            name: 'SystemUser',
-            component: () => import('@/views/system/user/index.vue'),
-            meta: { title: '用户管理', roles: ['admin'] },
-          },
-          {
-            path: 'role',
-            name: 'SystemRole',
-            component: () => import('@/views/system/role/index.vue'),
-            meta: { title: '角色管理', roles: ['admin'] },
-          },
-          {
-            path: 'menu',
-            name: 'SystemMenu',
-            component: () => import('@/views/system/menu/index.vue'),
-            meta: { title: '菜单管理', roles: ['admin'] },
-          },
-          {
-            path: 'log',
-            name: 'SystemLog',
-            component: () => import('@/views/system/log/index.vue'),
-            meta: { title: '系统日志', roles: ['admin'] },
-          },
-          {
-            path: 'api-docs',
-            name: 'ApiDocs',
-            component: () => import('@/views/system/api-docs/index.vue'),
-            meta: { title: '接口文档', roles: ['admin'] },
-          },
-          {
-            path: 'monitor/system',
-            name: 'MonitorSystem',
-            component: () => import('@/views/monitor/system/index.vue'),
-            meta: { title: '系统监控', roles: ['admin'] },
-          },
-          {
-            path: 'monitor/api',
-            name: 'MonitorApi',
-            component: () => import('@/views/monitor/api/index.vue'),
-            meta: { title: '接口监控', roles: ['admin'] },
-          },
-          {
-            path: 'dict',
-            name: 'SystemDict',
-            component: () => import('@/views/system/dict/index.vue'),
-            meta: { title: '字典管理', roles: ['admin'] },
-          },
-        ],
-      },
-    ],
+    children: [],
   },
 ]
 
@@ -147,7 +71,29 @@ const router = createRouter({
 })
 
 // ============================================
-// 路由守卫：鉴权 + Token 过期 + 角色检测
+// 动态菜单路由
+// ============================================
+
+/** 已注册动态路由的移除函数，登出/换账号时统一撤销 */
+const removeDynamicRoutes: Array<() => void> = []
+
+/** 按菜单树注册业务路由（登录后调用，可重复调用） */
+export function registerMenuRoutes(menus: Parameters<typeof buildRoutesFromMenus>[0]): void {
+  resetDynamicRoutes()
+  for (const route of buildRoutesFromMenus(menus)) {
+    removeDynamicRoutes.push(router.addRoute('Root', route))
+  }
+}
+
+/** 撤销全部动态菜单路由 */
+export function resetDynamicRoutes(): void {
+  while (removeDynamicRoutes.length > 0) {
+    removeDynamicRoutes.pop()?.()
+  }
+}
+
+// ============================================
+// 路由守卫：鉴权 + Token 过期 + 菜单加载
 // ============================================
 
 /** 解析 JWT payload */
@@ -168,7 +114,7 @@ function isTokenExpired(token: string): boolean {
   return claims.exp - 30 <= Math.floor(Date.now() / 1000)
 }
 
-router.beforeEach((to, _from, next) => {
+router.beforeEach(async (to, _from, next) => {
   document.title = `${to.meta.title || 'Axum Admin'}`
   const token = getToken()
 
@@ -187,15 +133,19 @@ router.beforeEach((to, _from, next) => {
   // 未登录拦截
   if (!token) return next('/login')
 
-  // ── 角色权限检测 ───────────────────────────────────────────
-  const requiredRoles = to.meta.roles as string[] | undefined
-  if (requiredRoles && requiredRoles.length > 0) {
-    const claims = parseJwtPayload(token)
-    const userRoles = claims?.roles || (claims?.role ? [claims.role] : [])
-    const hasRole = requiredRoles.some((r) => userRoles.includes(r))
-    if (!hasRole) {
-      return next('/')
+  // ── 加载菜单并注册动态路由 ─────────────────────────────────
+  // 首次进入（含刷新）时业务路由尚未注册，必须先加载菜单再重新匹配当前地址，
+  // 否则会先落到 404 匹配结果上。
+  const menuStore = useMenuStore()
+  if (!menuStore.loaded) {
+    try {
+      const menus = await menuStore.load()
+      registerMenuRoutes(menus)
+    } catch {
+      // 加载失败已由 store 弹出提示；这里放行，由 404 页面兜底，避免守卫死循环
+      return next()
     }
+    return next({ ...to, replace: true })
   }
 
   next()

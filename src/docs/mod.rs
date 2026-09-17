@@ -27,6 +27,7 @@ use utoipa::OpenApi as _;
         crate::controller::auth::login,
         crate::controller::auth::me,
         crate::controller::auth::logout,
+        crate::controller::menu::my_menus,
         crate::controller::rbac::admin_test,
         crate::controller::user::list_users,
         crate::controller::user::create_user,

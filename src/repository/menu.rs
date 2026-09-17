@@ -55,6 +55,37 @@ impl MenuRepository {
         Ok(build_tree(filtered, None))
     }
 
+    /// 查询多个角色可见的**导航菜单树**
+    ///
+    /// - 合并用户所有角色的菜单并去重
+    /// - 只返回 `is_visible = true` 且非按钮（`type <> 'button'`）的节点，
+    ///   按钮型菜单是权限标记，不应出现在导航里
+    /// - 排序沿用 `sort_order`
+    pub async fn find_tree_for_roles(&self, role_ids: &[Uuid]) -> Result<Vec<MenuNode>, AppError> {
+        if role_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let menus = sqlx::query_as::<_, Menu>(
+            r#"
+            SELECT DISTINCT m.id, m.parent_id, m.name, m.path, m.component, m.icon,
+                   m.sort_order, m.type, m.permission, m.is_visible, m.created_at, m.updated_at
+            FROM menus m
+            JOIN role_menus rm ON rm.menu_id = m.id
+            WHERE rm.role_id = ANY($1)
+              AND m.is_visible = TRUE
+              AND m.type <> 'button'
+            ORDER BY m.sort_order ASC
+            "#,
+        )
+        .bind(role_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询用户菜单失败: {e}")))?;
+
+        Ok(build_tree(menus, None))
+    }
+
     /// 新增菜单
     pub async fn create(&self, menu: &Menu) -> Result<Menu, AppError> {
         sqlx::query_as::<_, Menu>(
