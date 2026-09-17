@@ -79,7 +79,6 @@
 import { computed, h } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { NIcon } from 'naive-ui'
-import { getToken } from '@/utils/storage'
 import {
   MenuOutline as MenuIcon,
   SunnyOutline as SunnyIcon,
@@ -93,12 +92,15 @@ import {
 import type { MenuOption } from 'naive-ui'
 import { useAppStore } from '@/stores/app'
 import { useUserStore } from '@/stores/user'
+import { useMenuStore } from '@/stores/menu'
+import type { MenuNode } from '@/api/menu'
 import { showConfirm } from '@/utils/message'
 
 const router = useRouter()
 const route = useRoute()
 const appStore = useAppStore()
 const userStore = useUserStore()
+const menuStore = useMenuStore()
 
 // 挂载时尝试获取用户信息（不阻塞渲染，失败也无影响）
 userStore.fetchUserInfo().catch(() => {})
@@ -118,120 +120,31 @@ function renderIcon(icon: unknown) {
   return () => h(NIcon, null, { default: () => h(icon as never) })
 }
 
-const menuOptions: MenuOption[] = [
-  {
-    label: '首页',
-    key: '/',
-    icon: renderIcon(HomeIcon),
-  },
-  {
-    label: '组件示例',
-    key: '/demo',
-    icon: renderIcon(SettingsIcon),
-    children: [
-      {
-        label: '前端组件',
-        key: '/demo',
-        icon: renderIcon(SettingsIcon),
-      },
-      {
-        label: '后端能力',
-        key: '/demo/backend',
-        icon: renderIcon(SettingsIcon),
-      },
-      {
-        label: '字典组件',
-        key: '/demo/dict',
-        icon: renderIcon(SettingsIcon),
-      },
-    ],
-  },
-  {
-    label: '系统管理',
-    key: '/system',
-    icon: renderIcon(SettingsIcon),
-    roles: ['admin'],
-    children: [
-      {
-        label: '用户管理',
-        key: '/system/user',
-        icon: renderIcon(UserIcon),
-      },
-      {
-        label: '角色管理',
-        key: '/system/role',
-        icon: renderIcon(RoleIcon),
-      },
-      {
-        label: '菜单管理',
-        key: '/system/menu',
-        icon: renderIcon(SettingsIcon),
-      },
-      {
-        label: '系统日志',
-        key: '/system/log',
-        icon: renderIcon(SettingsIcon),
-      },
-      {
-        label: '接口文档',
-        key: '/system/api-docs',
-        icon: renderIcon(SettingsIcon),
-      },
-      {
-        label: '系统监控',
-        key: '/system/monitor/system',
-        icon: renderIcon(SettingsIcon),
-      },
-      {
-        label: '接口监控',
-        key: '/system/monitor/api',
-        icon: renderIcon(SettingsIcon),
-      },
-      {
-        label: '字典管理',
-        key: '/system/dict',
-        icon: renderIcon(SettingsIcon),
-      },
-    ],
-  },
-]
-
-/** 从 JWT 中提取用户角色列表（不依赖 fetchUserInfo） */
-function getUserRolesFromToken(): string[] {
-  const token = getToken()
-  if (!token) return []
-  try {
-    const parts = token.split('.')
-    if (parts.length !== 3) return []
-    const claims = JSON.parse(atob(parts[1]))
-    return claims?.roles || (claims?.role ? [claims.role] : [])
-  } catch {
-    return []
-  }
+/** 后端菜单图标名 → 组件（未识别的图标回退到齿轮） */
+const MENU_ICONS: Record<string, unknown> = {
+  home: HomeIcon,
+  grid: SettingsIcon,
+  settings: SettingsIcon,
+  user: UserIcon,
+  role: RoleIcon,
 }
 
-/** 过滤菜单（根据 JWT 中的用户角色） */
-function filterMenu(options: MenuOption[]): MenuOption[] {
-  let userRoles = getUserRolesFromToken()
-  if (userRoles.length === 0) {
-    // fallback: 尝试从 userStore 读取
-    const storeRoles =
-      userStore.userInfo?.roles || (userStore.userInfo?.role ? [userStore.userInfo.role] : [])
-    if (storeRoles.length > 0) userRoles = storeRoles
-  }
-  return options
-    .filter((item) => {
-      const roles = (item as { roles?: string[] }).roles
-      if (!roles || roles.length === 0) return true
-      return roles.some((r) => userRoles.includes(r))
+/** 菜单树 → naive-ui 导航选项（导航完全由后端菜单驱动） */
+function toMenuOptions(nodes: MenuNode[]): MenuOption[] {
+  return nodes
+    .filter((node) => Boolean(node.path))
+    .map((node) => {
+      const children = node.children?.length ? toMenuOptions(node.children) : []
+      return {
+        label: node.name,
+        key: node.path as string,
+        icon: renderIcon(MENU_ICONS[node.icon ?? ''] ?? SettingsIcon),
+        children: children.length > 0 ? children : undefined,
+      }
     })
-    .map((item) => ({
-      ...item,
-      children: item.children ? filterMenu(item.children as MenuOption[]) : undefined,
-    }))
 }
 
-const filteredMenu = computed(() => filterMenu(menuOptions))
+const filteredMenu = computed(() => toMenuOptions(menuStore.menus))
 
 function onMenuSelect(key: string) {
   router.push(key)

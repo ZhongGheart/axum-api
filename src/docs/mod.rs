@@ -1,492 +1,133 @@
-//! OpenAPI 3.0 接口文档
+//! OpenAPI 接口文档（由代码生成）
 //!
-//! 手动构建 OpenAPI 规范 JSON，避免 utoipa 过程宏兼容性问题。
-//! 端点：GET /api/openapi.json
+//! 规范由 utoipa 从 handler 上的 `#[utoipa::path]` 与 DTO 上的 `ToSchema`
+//! 派生生成，不再手写 JSON —— 文档与实现不会漂移。
+//!
+//! 新增接口时必须：
+//! 1. 在 handler 上添加 `#[utoipa::path(...)]`
+//! 2. 在下方 `paths(...)` 中登记该 handler
+//! 3. 若引入新 DTO，确保其派生 `utoipa::ToSchema`（被 request_body/body 引用即自动登记）
+//!
+//! 端点：`GET /api/openapi.json`；Swagger UI：`GET /api/swagger-ui/index.html`
 
 use axum::http::{header, Response, StatusCode};
-use serde_json::json;
+use utoipa::OpenApi as _;
 
-/// 列出 OpenAPI 文档中声明的所有路由
+/// 由代码生成的 OpenAPI 文档
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(
+        title = "Axum Admin API",
+        version = "0.3.0",
+        description = "基于 Axum + SQLx + JWT 的管理后台 API。规范由代码生成，与实现保持同步。",
+    ),
+    paths(
+        crate::controller::auth::health,
+        crate::controller::auth::register,
+        crate::controller::auth::login,
+        crate::controller::auth::me,
+        crate::controller::auth::logout,
+        crate::controller::menu::my_menus,
+        crate::controller::rbac::admin_test,
+        crate::controller::user::list_users,
+        crate::controller::user::create_user,
+        crate::controller::user::update_user,
+        crate::controller::user::delete_user,
+        crate::controller::user::batch_delete_users,
+        crate::controller::user::toggle_user_status,
+        crate::controller::user::reset_user_password,
+        crate::controller::role::list_roles,
+        crate::controller::role::create_role,
+        crate::controller::role::update_role,
+        crate::controller::role::delete_role,
+        crate::controller::role::get_user_roles,
+        crate::controller::role::assign_user_role,
+        crate::controller::menu::list_menus,
+        crate::controller::menu::create_menu,
+        crate::controller::menu::update_menu,
+        crate::controller::menu::delete_menu,
+        crate::controller::menu::assign_role_menus,
+        crate::controller::dict::list_types,
+        crate::controller::dict::create_type,
+        crate::controller::dict::update_type,
+        crate::controller::dict::delete_type,
+        crate::controller::dict::list_items,
+        crate::controller::dict::create_item,
+        crate::controller::dict::update_item,
+        crate::controller::dict::delete_item,
+        crate::controller::dict::get_items_by_code,
+        crate::controller::dict::list_all_cached,
+        crate::controller::dict::refresh_cache,
+        crate::controller::demo::export_users,
+        crate::controller::demo::validate_test,
+        crate::controller::demo::list_audit_logs,
+        crate::controller::demo::export_audit_logs,
+        crate::controller::monitor::system_info,
+        crate::controller::monitor::api_metrics,
+        crate::controller::monitor::alerts,
+        crate::controller::monitor::reset_metrics,
+        crate::controller::monitor::export_system,
+    )
+)]
+pub struct ApiDoc;
+
+/// 构建 OpenAPI 文档（含 Bearer 安全方案）
 ///
-/// 返回 `(path, methods)`，用于路由覆盖率测试：
-/// 文档里写了但实际不存在的接口会被测试发现。
+/// utoipa 5.5 的 `#[openapi(components(...))]` 只接受 `schemas`/`responses`，
+/// 安全方案需要在生成后以编程方式注入。
+pub fn api_doc() -> utoipa::openapi::OpenApi {
+    use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+
+    let mut doc = ApiDoc::openapi();
+    let components = doc.components.get_or_insert_with(Default::default);
+
+    let mut bearer = Http::new(HttpAuthScheme::Bearer);
+    bearer.bearer_format = Some("JWT".to_string());
+    bearer.description = Some("登录后取得的 JWT，放在 Authorization: Bearer <token>".to_string());
+    components.add_security_scheme("bearer_auth", SecurityScheme::Http(bearer));
+
+    doc
+}
+
+/// 生成 OpenAPI 规范 JSON
+pub fn openapi_json() -> serde_json::Value {
+    serde_json::to_value(api_doc()).expect("OpenAPI 规范序列化失败")
+}
+
+/// 列出文档中声明的所有路由 `(path, methods)`
+///
+/// 供集成测试校验"文档里声明的每条路由都真实存在"：
+/// utoipa 的 `path = "..."` 是手写字符串，写错编译器不会发现，由该测试兜底。
 pub fn documented_paths() -> Vec<(String, Vec<String>)> {
-    let spec = openapi_json();
-    let mut routes = Vec::new();
-
-    if let Some(paths) = spec.get("paths").and_then(|v| v.as_object()) {
-        for (path, item) in paths {
-            let methods = item
-                .as_object()
-                .map(|ops| {
-                    ops.keys()
-                        .filter(|k| {
-                            matches!(
-                                k.as_str(),
-                                "get" | "post" | "put" | "patch" | "delete" | "head"
-                            )
-                        })
-                        .map(|k| k.to_uppercase())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            routes.push((path.clone(), methods));
-        }
-    }
-
+    let doc = api_doc();
+    let mut routes: Vec<(String, Vec<String>)> = doc
+        .paths
+        .paths
+        .iter()
+        .map(|(path, item)| {
+            let methods: Vec<String> = [
+                ("GET", item.get.is_some()),
+                ("PUT", item.put.is_some()),
+                ("POST", item.post.is_some()),
+                ("DELETE", item.delete.is_some()),
+                ("PATCH", item.patch.is_some()),
+                ("HEAD", item.head.is_some()),
+                ("OPTIONS", item.options.is_some()),
+                ("TRACE", item.trace.is_some()),
+            ]
+            .into_iter()
+            .filter(|(_, present)| *present)
+            .map(|(method, _): (&str, bool)| method.to_string())
+            .collect();
+            (path.clone(), methods)
+        })
+        .collect();
     routes.sort();
     routes
 }
 
-/// 返回完整的 OpenAPI 3.0 规范 JSON
-pub fn openapi_json() -> serde_json::Value {
-    json!({
-        "openapi": "3.0.3",
-        "info": {
-            "title": "Axum Admin API",
-            "version": "1.0.0",
-            "description": "基于 Axum + SQLx + JWT 的生产级 Rust 后端 API"
-        },
-        "servers": [
-            { "url": "/api", "description": "当前服务器" }
-        ],
-        "paths": {
-            // ── 系统 ──
-            "/api/health": {
-                "get": {
-                    "tags": ["系统"],
-                    "summary": "健康检查",
-                    "responses": {
-                        "200": { "description": "服务正常", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse_String" } } } }
-                    }
-                }
-            },
-            "/api/admin/test": {
-                "get": {
-                    "tags": ["系统"],
-                    "summary": "管理员权限测试",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "管理员测试接口" } }
-                }
-            },
-            // ── 认证 ──
-            "/api/auth/register": {
-                "post": {
-                    "tags": ["认证"],
-                    "summary": "用户注册",
-                    "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RegisterRequest" } } } },
-                    "responses": {
-                        "200": { "description": "注册成功", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse_UserInfo" } } } },
-                        "400": { "description": "参数错误" },
-                        "409": { "description": "用户名或邮箱冲突" }
-                    }
-                }
-            },
-            "/api/auth/login": {
-                "post": {
-                    "tags": ["认证"],
-                    "summary": "用户登录",
-                    "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/LoginRequest" } } } },
-                    "responses": {
-                        "200": { "description": "登录成功", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse_LoginResponse" } } } },
-                        "401": { "description": "用户名或密码错误" }
-                    }
-                }
-            },
-            "/api/auth/me": {
-                "get": {
-                    "tags": ["认证"],
-                    "summary": "获取当前用户信息",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": {
-                        "200": { "description": "用户信息", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiResponse_UserInfo" } } } }
-                    }
-                }
-            },
-            "/api/auth/logout": {
-                "post": {
-                    "tags": ["认证"],
-                    "summary": "用户登出",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "登出成功" } }
-                }
-            },
-            // ── 用户管理 ──
-            "/api/admin/users": {
-                "get": {
-                    "tags": ["用户管理"],
-                    "summary": "用户列表（分页）",
-                    "parameters": [
-                        { "name": "page", "in": "query", "schema": { "type": "integer" }, "description": "页码" },
-                        { "name": "page_size", "in": "query", "schema": { "type": "integer" }, "description": "每页条数" }
-                    ],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": {
-                        "200": { "description": "用户列表" },
-                        "403": { "description": "权限不足" }
-                    }
-                },
-                "post": {
-                    "tags": ["用户管理"],
-                    "summary": "创建用户",
-                    "security": [{ "bearer_auth": [] }],
-                    "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UserManageRequest" } } } },
-                    "responses": {
-                        "200": { "description": "创建成功" },
-                        "400": { "description": "参数错误" }
-                    }
-                }
-            },
-            "/api/admin/users/{id}": {
-                "put": {
-                    "tags": ["用户管理"],
-                    "summary": "更新用户",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "更新成功" } }
-                },
-                "delete": {
-                    "tags": ["用户管理"],
-                    "summary": "删除用户",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "删除成功" } }
-                }
-            },
-            "/api/admin/users/batch-delete": {
-                "post": {
-                    "tags": ["用户管理"], "summary": "批量删除",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "批量删除成功" } }
-                }
-            },
-            "/api/admin/users/{id}/status": {
-                "put": {
-                    "tags": ["用户管理"], "summary": "切换状态",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "状态已更新" } }
-                }
-            },
-            "/api/admin/users/{id}/reset-password": {
-                "post": {
-                    "tags": ["用户管理"], "summary": "重置密码",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "密码已重置" } }
-                }
-            },
-            "/api/admin/users/{id}/roles": {
-                "get": {
-                    "tags": ["角色管理"], "summary": "用户角色列表",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "角色列表" } }
-                },
-                "post": {
-                    "tags": ["角色管理"], "summary": "为用户分配角色",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "角色分配成功" } }
-                },
-                "put": {
-                    "tags": ["用户管理"], "summary": "全量角色分配",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "角色分配成功" } }
-                }
-            },
-            // ── 角色管理 ──
-            "/api/admin/roles": {
-                "get": {
-                    "tags": ["角色管理"], "summary": "角色列表",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "角色列表 (含用户数)" } }
-                },
-                "post": {
-                    "tags": ["角色管理"], "summary": "新增角色",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "角色创建成功" } }
-                }
-            },
-            "/api/admin/roles/{id}": {
-                "put": {
-                    "tags": ["角色管理"], "summary": "更新角色",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "角色更新成功" } }
-                },
-                "delete": {
-                    "tags": ["角色管理"], "summary": "删除角色",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "角色删除成功" } }
-                }
-            },
-            "/api/admin/roles/{id}/menus": {
-                "put": {
-                    "tags": ["菜单管理"], "summary": "分配菜单权限",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "权限分配成功" } }
-                }
-            },
-            // ── 菜单管理 ──
-            "/api/admin/menus": {
-                "get": {
-                    "tags": ["菜单管理"], "summary": "获取菜单树",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "菜单树" } }
-                },
-                "post": {
-                    "tags": ["菜单管理"], "summary": "新增菜单",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "创建成功" } }
-                }
-            },
-            "/api/admin/menus/{id}": {
-                "put": {
-                    "tags": ["菜单管理"], "summary": "更新菜单",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "更新成功" } }
-                },
-                "delete": {
-                    "tags": ["菜单管理"], "summary": "删除菜单",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "删除成功" } }
-                }
-            },
-            // ── 数据字典 ──
-            "/api/admin/dict/types": {
-                "get": {
-                    "tags": ["数据字典"], "summary": "字典类型列表",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "字典类型列表" } }
-                },
-                "post": {
-                    "tags": ["数据字典"], "summary": "新增字典类型",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "创建成功" } }
-                }
-            },
-            "/api/admin/dict/types/{id}": {
-                "put": {
-                    "tags": ["数据字典"], "summary": "更新字典类型",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "更新成功" } }
-                },
-                "delete": {
-                    "tags": ["数据字典"], "summary": "删除字典类型",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "删除成功" } }
-                }
-            },
-            "/api/dict/{code}/items": {
-                "get": {
-                    "tags": ["数据字典"], "summary": "获取字典项",
-                    "parameters": [{ "name": "code", "in": "path", "required": true, "schema": { "type": "string" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "字典项列表" } }
-                }
-            },
-            "/api/admin/dict/items": {
-                "get": {
-                    "tags": ["数据字典"], "summary": "字典项列表（按类型）",
-                    "parameters": [{ "name": "dict_type_id", "in": "query", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "字典项列表" } }
-                },
-                "post": {
-                    "tags": ["数据字典"], "summary": "新增字典项",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "创建成功" } }
-                }
-            },
-            "/api/admin/dict/items/{id}": {
-                "put": {
-                    "tags": ["数据字典"], "summary": "更新字典项",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "更新成功" } }
-                },
-                "delete": {
-                    "tags": ["数据字典"], "summary": "删除字典项",
-                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "删除成功" } }
-                }
-            },
-            "/api/admin/dict/cached": {
-                "get": {
-                    "tags": ["数据字典"], "summary": "所有字典及项（缓存）",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "字典数据" } }
-                }
-            },
-            "/api/admin/dict/refresh": {
-                "post": {
-                    "tags": ["数据字典"], "summary": "刷新缓存",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "缓存已刷新" } }
-                }
-            },
-            // ── 系统监控 ──
-            "/api/admin/monitor/system": {
-                "get": {
-                    "tags": ["系统监控"], "summary": "系统信息",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "CPU/内存/磁盘/DB/Redis" } }
-                }
-            },
-            "/api/admin/monitor/api-metrics": {
-                "get": {
-                    "tags": ["系统监控"], "summary": "API 接口指标",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "接口性能指标" } }
-                }
-            },
-            "/api/admin/monitor/alerts": {
-                "get": {
-                    "tags": ["系统监控"], "summary": "告警信息",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "告警列表" } }
-                }
-            },
-            "/api/admin/monitor/metrics/reset": {
-                "post": {
-                    "tags": ["系统监控"], "summary": "重置指标",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "指标已重置" } }
-                }
-            },
-            "/api/admin/monitor/system/export": {
-                "get": {
-                    "tags": ["系统监控"], "summary": "导出监控数据",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "Excel 文件下载" } }
-                }
-            },
-            // ── 操作日志 ──
-            "/api/admin/audit-logs": {
-                "get": {
-                    "tags": ["系统"], "summary": "操作日志（分页）",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "操作日志列表" } }
-                }
-            },
-            "/api/admin/logs/audit/export": {
-                "get": {
-                    "tags": ["系统"], "summary": "导出操作日志",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "Excel 文件下载" } }
-                }
-            },
-            "/api/admin/export/users": {
-                "get": {
-                    "tags": ["系统"], "summary": "导出用户列表",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "Excel 文件下载" } }
-                }
-            },
-            "/api/admin/validate": {
-                "post": {
-                    "tags": ["系统"], "summary": "参数校验测试",
-                    "security": [{ "bearer_auth": [] }],
-                    "responses": { "200": { "description": "校验结果" } }
-                }
-            }
-        },
-        "components": {
-            "securitySchemes": {
-                "bearer_auth": {
-                    "type": "http",
-                    "scheme": "bearer",
-                    "bearerFormat": "JWT"
-                }
-            },
-            "schemas": {
-                "ApiResponse_String": {
-                    "type": "object",
-                    "properties": {
-                        "code": { "type": "integer" },
-                        "message": { "type": "string" },
-                        "data": { "type": "string", "nullable": true }
-                    }
-                },
-                "ApiResponse_UserInfo": {
-                    "type": "object",
-                    "properties": {
-                        "code": { "type": "integer" },
-                        "message": { "type": "string" },
-                        "data": { "$ref": "#/components/schemas/UserInfo" }
-                    }
-                },
-                "ApiResponse_LoginResponse": {
-                    "type": "object",
-                    "properties": {
-                        "code": { "type": "integer" },
-                        "message": { "type": "string" },
-                        "data": { "$ref": "#/components/schemas/LoginResponse" }
-                    }
-                },
-                "LoginRequest": {
-                    "type": "object",
-                    "required": ["username", "password"],
-                    "properties": {
-                        "username": { "type": "string", "description": "用户名" },
-                        "password": { "type": "string", "description": "密码" }
-                    }
-                },
-                "LoginResponse": {
-                    "type": "object",
-                    "properties": {
-                        "token": { "type": "string", "description": "JWT 令牌" },
-                        "token_type": { "type": "string", "description": "令牌类型" }
-                    }
-                },
-                "RegisterRequest": {
-                    "type": "object",
-                    "required": ["username", "email", "password"],
-                    "properties": {
-                        "username": { "type": "string" },
-                        "email": { "type": "string", "format": "email" },
-                        "password": { "type": "string", "minLength": 6 }
-                    }
-                },
-                "UserInfo": {
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string", "format": "uuid" },
-                        "username": { "type": "string" },
-                        "email": { "type": "string" },
-                        "role": { "type": "string" },
-                        "is_active": { "type": "boolean" },
-                        "created_at": { "type": "string", "format": "date-time" }
-                    }
-                },
-                "UserManageRequest": {
-                    "type": "object",
-                    "required": ["username", "email", "role"],
-                    "properties": {
-                        "username": { "type": "string" },
-                        "email": { "type": "string" },
-                        "password": { "type": "string" },
-                        "role": { "type": "string" },
-                        "is_active": { "type": "boolean" }
-                    }
-                }
-            }
-        }
-    })
-}
-
-/// Swagger UI 静态页面处理
+/// Swagger UI 页面
 ///
-/// 返回一个完整的 HTML 页面，通过 CDN 加载 Swagger UI 渲染引擎，
 /// 指向同源的 `/api/openapi.json` 作为数据源。
 /// 同源服务避免了 iframe 跨域限制，CDN 加载避免了前端打包体积膨胀。
 pub async fn swagger_ui_handler(
@@ -541,4 +182,65 @@ pub async fn swagger_ui_handler(
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(html.to_string())
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 文档页面/规范端点自身不属于业务 API，不纳入覆盖检查
+    const META_ENDPOINTS: [&str; 2] = ["/api/openapi.json", "/api/swagger-ui/{*path}"];
+
+    /// 路由注册表里出现的路径必须全部同步到 OpenAPI 文档
+    ///
+    /// 这是反向检查：集成测试只覆盖"文档里有、实现里没有"，
+    /// 该用例覆盖"实现里有、文档里没有"（新增接口忘写注解的典型漏项）。
+    /// axum 没有路由自省 API，因此这里解析路由注册源码。
+    #[test]
+    fn every_registered_route_is_documented() {
+        let router_src = include_str!("../router/mod.rs");
+        let mut registered: Vec<String> = Vec::new();
+        let mut rest = router_src;
+        // 逐个 `.route(` 取紧随其后的字符串字面量；
+        // 这样同时覆盖 `.route("/a", ..)` 与 `.route(\n "/a", ..)` 两种书写
+        while let Some(idx) = rest.find(".route(") {
+            rest = &rest[idx + ".route(".len()..];
+            if let Some(quote) = rest.find('"') {
+                let after = &rest[quote + 1..];
+                if let Some(end) = after.find('"') {
+                    registered.push(after[..end].to_string());
+                }
+            }
+        }
+        registered.retain(|path| !META_ENDPOINTS.contains(&path.as_str()));
+        registered.sort();
+        registered.dedup();
+
+        assert!(!registered.is_empty(), "未解析到任何路由注册，检查解析逻辑");
+
+        let documented: std::collections::HashSet<String> = documented_paths()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        let missing: Vec<&String> = registered
+            .iter()
+            .filter(|path| !documented.contains(*path))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "以下已注册路由未出现在 OpenAPI 文档中（请在 handler 上补 #[utoipa::path] 并登记到 ApiDoc）: {missing:?}"
+        );
+    }
+
+    /// 规范必须包含 Bearer 安全方案，否则 Swagger UI 无法携带令牌调试
+    #[test]
+    fn security_scheme_is_present() {
+        let doc = api_doc();
+        let schemes = doc.components.expect("缺少 components").security_schemes;
+        assert!(
+            schemes.contains_key("bearer_auth"),
+            "缺少 bearer_auth 安全方案"
+        );
+    }
 }

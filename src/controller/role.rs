@@ -11,7 +11,7 @@ use crate::model::ApiResponse;
 use crate::router::AppState;
 
 /// 角色列表项
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct RoleItem {
     pub id: Uuid,
     pub name: String,
@@ -21,7 +21,7 @@ pub struct RoleItem {
 }
 
 /// 分配角色请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct AssignRoleRequest {
     #[allow(dead_code)]
     pub user_id: Uuid,
@@ -29,6 +29,13 @@ pub struct AssignRoleRequest {
 }
 
 /// GET /api/admin/roles — 角色列表（含用户数）
+#[utoipa::path(
+    get,
+    path = "/api/admin/roles",
+    tag = "角色管理",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "角色列表（含关联用户数）", body = ApiResponse<Vec<RoleItem>>))
+)]
 pub async fn list_roles(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<Vec<RoleItem>>>, AppError> {
@@ -47,6 +54,14 @@ pub async fn list_roles(
 }
 
 /// GET /api/admin/users/:id/roles — 获取用户已分配的角色
+#[utoipa::path(
+    get,
+    path = "/api/admin/users/{user_id}/roles",
+    tag = "角色管理",
+    security(("bearer_auth" = [])),
+    params(("user_id" = Uuid, Path, description = "用户 ID")),
+    responses((status = 200, description = "用户当前角色名列表", body = ApiResponse<Vec<String>>))
+)]
 pub async fn get_user_roles(
     State(state): State<AppState>,
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
@@ -60,6 +75,18 @@ pub async fn get_user_roles(
 }
 
 /// POST /api/admin/users/:id/roles — 为用户分配角色
+#[utoipa::path(
+    post,
+    path = "/api/admin/users/{user_id}/roles",
+    tag = "角色管理",
+    security(("bearer_auth" = [])),
+    params(("user_id" = Uuid, Path, description = "用户 ID")),
+    request_body = AssignRoleRequest,
+    responses(
+        (status = 200, description = "角色已追加", body = ApiResponse<String>),
+        (status = 404, description = "角色不存在"),
+    )
+)]
 pub async fn assign_user_role(
     State(state): State<AppState>,
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
@@ -74,6 +101,14 @@ pub async fn assign_user_role(
 }
 
 /// POST /api/admin/roles — 新增角色
+#[utoipa::path(
+    post,
+    path = "/api/admin/roles",
+    tag = "角色管理",
+    security(("bearer_auth" = [])),
+    request_body = CreateRoleReq,
+    responses((status = 200, description = "创建成功", body = ApiResponse<RoleItem>))
+)]
 pub async fn create_role(
     State(state): State<AppState>,
     Json(req): Json<CreateRoleReq>,
@@ -96,6 +131,15 @@ pub async fn create_role(
 }
 
 /// PUT /api/admin/roles/:id — 更新角色
+#[utoipa::path(
+    put,
+    path = "/api/admin/roles/{id}",
+    tag = "角色管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "角色 ID")),
+    request_body = CreateRoleReq,
+    responses((status = 200, description = "更新成功", body = ApiResponse<RoleItem>))
+)]
 pub async fn update_role(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
@@ -118,6 +162,14 @@ pub async fn update_role(
 }
 
 /// DELETE /api/admin/roles/:id — 删除角色
+#[utoipa::path(
+    delete,
+    path = "/api/admin/roles/{id}",
+    tag = "角色管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "角色 ID")),
+    responses((status = 200, description = "删除成功", body = ApiResponse<String>))
+)]
 pub async fn delete_role(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
@@ -135,7 +187,7 @@ pub async fn delete_role(
     Ok(Json(ApiResponse::success("角色删除成功")))
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct CreateRoleReq {
     pub name: String,
     pub description: Option<String>,

@@ -10,7 +10,7 @@ use uuid::Uuid;
 ///
 /// 角色数据的唯一来源是 `user_roles` 表；本枚举只用于对外表达"主角色"，
 /// 权限判定必须使用 `UserInfo::roles`，不要依赖该枚举。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// 管理员
@@ -61,7 +61,7 @@ pub struct User {
 }
 
 /// 用户注册请求体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct RegisterRequest {
     /// 用户名（3-50 个字符）
     pub username: String,
@@ -72,7 +72,7 @@ pub struct RegisterRequest {
 }
 
 /// 用户登录请求体
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct LoginRequest {
     /// 用户名或邮箱
     pub username: String,
@@ -81,7 +81,7 @@ pub struct LoginRequest {
 }
 
 /// 登录成功响应
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct LoginResponse {
     /// JWT 访问令牌
     pub token: String,
@@ -90,7 +90,7 @@ pub struct LoginResponse {
 }
 
 /// 当前用户信息（对外暴露，不含密码）
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct UserInfo {
     /// 用户唯一标识
     pub id: Uuid,

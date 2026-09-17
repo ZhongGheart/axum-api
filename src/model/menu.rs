@@ -22,7 +22,8 @@ pub struct Menu {
 }
 
 /// 菜单树节点（含子节点）
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[schema(no_recursion)]
 pub struct MenuNode {
     pub id: Uuid,
     pub parent_id: Option<Uuid>,
@@ -58,7 +59,7 @@ impl From<Menu> for MenuNode {
 }
 
 /// 创建菜单请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateMenuRequest {
     pub parent_id: Option<Uuid>,
     pub name: String,
@@ -72,7 +73,7 @@ pub struct CreateMenuRequest {
 }
 
 /// 更新菜单请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateMenuRequest {
     pub parent_id: Option<Uuid>,
     pub name: Option<String>,
@@ -86,7 +87,7 @@ pub struct UpdateMenuRequest {
 }
 
 /// 分配菜单权限请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct AssignMenuRequest {
     pub menu_ids: Vec<Uuid>,
 }

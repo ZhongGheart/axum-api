@@ -12,6 +12,17 @@ use crate::model::{ApiResponse, LoginRequest, LoginResponse, RegisterRequest, Us
 use crate::router::AppState;
 
 /// POST /api/auth/register — 用户注册
+#[utoipa::path(
+    post,
+    path = "/api/auth/register",
+    tag = "认证",
+    request_body = RegisterRequest,
+    responses(
+        (status = 200, description = "注册成功", body = ApiResponse<UserInfo>),
+        (status = 400, description = "参数不合法"),
+        (status = 409, description = "用户名或邮箱已存在"),
+    )
+)]
 pub async fn register(
     State(state): State<AppState>,
     Json(req): Json<RegisterRequest>,
@@ -21,6 +32,17 @@ pub async fn register(
 }
 
 /// POST /api/auth/login — 用户登录
+#[utoipa::path(
+    post,
+    path = "/api/auth/login",
+    tag = "认证",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "登录成功", body = ApiResponse<LoginResponse>),
+        (status = 401, description = "用户名或密码错误"),
+        (status = 429, description = "登录失败次数过多，已临时锁定"),
+    )
+)]
 pub async fn login(
     State(state): State<AppState>,
     client_ip: ClientIp,
@@ -34,6 +56,13 @@ pub async fn login(
 }
 
 /// GET /api/auth/me — 获取当前用户信息（含角色列表）
+#[utoipa::path(
+    get,
+    path = "/api/auth/me",
+    tag = "认证",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "当前用户信息（含角色列表）", body = ApiResponse<UserInfo>))
+)]
 pub async fn me(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
@@ -53,6 +82,13 @@ pub async fn me(
 }
 
 /// POST /api/auth/logout — 用户登出（仅注销当前令牌）
+#[utoipa::path(
+    post,
+    path = "/api/auth/logout",
+    tag = "认证",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "登出成功（仅当前令牌失效）", body = ApiResponse<String>))
+)]
 pub async fn logout(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
@@ -69,7 +105,7 @@ pub async fn logout(
 }
 
 /// 健康检查响应体
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct HealthPayload {
     /// 总体状态：`ok` / `degraded`
     pub status: &'static str,
@@ -83,6 +119,15 @@ pub struct HealthPayload {
 ///
 /// 真实探测数据库与 Redis：任一依赖不可用时返回 503，
 /// 以便容器编排与负载均衡摘除该实例。
+#[utoipa::path(
+    get,
+    path = "/api/health",
+    tag = "系统",
+    responses(
+        (status = 200, description = "服务正常", body = ApiResponse<HealthPayload>),
+        (status = 503, description = "依赖服务不可用", body = ApiResponse<HealthPayload>),
+    )
+)]
 pub async fn health(State(state): State<AppState>) -> axum::response::Response {
     let database_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(state.db_pool.writer())

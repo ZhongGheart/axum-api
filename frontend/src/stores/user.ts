@@ -10,7 +10,8 @@ import { authApi } from '@/api/auth'
 import { handleError } from '@/api/helper'
 import { getToken, removeToken, setToken, setUserInfo, removeUserInfo, getUserInfo } from '@/utils/storage'
 import { requestCache } from '@/utils/cache'
-import router from '@/router'
+import router, { resetDynamicRoutes } from '@/router'
+import { useMenuStore } from './menu'
 
 export const useUserStore = defineStore('user', () => {
   /** JWT 令牌 */
@@ -59,6 +60,9 @@ export const useUserStore = defineStore('user', () => {
       removeToken()
       removeUserInfo()
       requestCache.invalidate()
+      // 撤销按上一个账号注册的动态菜单路由，避免换账号后残留可访问页面
+      resetDynamicRoutes()
+      useMenuStore().reset()
       router.push('/login')
     }
   }

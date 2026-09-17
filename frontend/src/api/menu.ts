@@ -29,6 +29,11 @@ export interface CreateMenuReq {
 }
 
 export const menuApi = {
+  /** GET /api/auth/menus — 当前登录用户可见的导航菜单（前端动态路由的数据源） */
+  myMenus() {
+    return http.get<MenuNode[]>('/auth/menus')
+  },
+
   /** GET /api/admin/menus */
   list() {
     return http.get<MenuNode[]>('/admin/menus')

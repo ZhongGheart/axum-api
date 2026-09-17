@@ -11,6 +11,13 @@ use crate::router::AppState;
 use crate::service::monitor::MonitorService;
 
 /// GET /api/admin/monitor/system — 系统信息
+#[utoipa::path(
+    get,
+    path = "/api/admin/monitor/system",
+    tag = "系统监控",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "CPU/内存/磁盘/数据库/Redis 状态", body = ApiResponse<serde_json::Value>))
+)]
 pub async fn system_info(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
@@ -27,6 +34,13 @@ pub async fn system_info(
 }
 
 /// GET /api/admin/monitor/api-metrics — API 接口性能指标
+#[utoipa::path(
+    get,
+    path = "/api/admin/monitor/api-metrics",
+    tag = "系统监控",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "接口调用次数与耗时统计", body = ApiResponse<serde_json::Value>))
+)]
 pub async fn api_metrics(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
@@ -56,6 +70,13 @@ pub async fn api_metrics(
 }
 
 /// GET /api/admin/monitor/alerts — 告警信息
+#[utoipa::path(
+    get,
+    path = "/api/admin/monitor/alerts",
+    tag = "系统监控",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "告警检查结果", body = ApiResponse<serde_json::Value>))
+)]
 pub async fn alerts(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
@@ -73,6 +94,13 @@ pub async fn alerts(
 }
 
 /// POST /api/admin/monitor/metrics/reset — 重置指标
+#[utoipa::path(
+    post,
+    path = "/api/admin/monitor/metrics/reset",
+    tag = "系统监控",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "指标已重置", body = ApiResponse<String>))
+)]
 pub async fn reset_metrics(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
@@ -81,6 +109,13 @@ pub async fn reset_metrics(
 }
 
 /// GET /api/admin/monitor/system/export — 导出系统监控数据
+#[utoipa::path(
+    get,
+    path = "/api/admin/monitor/system/export",
+    tag = "导出",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "系统信息 Excel 文件（二进制）"))
+)]
 pub async fn export_system(
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, AppError> {

@@ -26,14 +26,14 @@ const ASSIGNABLE_ROLES: [&str; 2] = ["admin", "user"];
 const ADMIN_ROLE: &str = "admin";
 
 /// 用户列表查询参数
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UserListParams {
     pub page: Option<i64>,
     pub page_size: Option<i64>,
 }
 
 /// 创建/更新用户请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UserManageRequest {
     pub username: String,
     pub email: String,
@@ -43,7 +43,7 @@ pub struct UserManageRequest {
 }
 
 /// 用户列表响应
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct UserListResponse {
     pub items: Vec<UserInfo>,
     pub total: i64,
@@ -111,6 +111,17 @@ fn same_role_set(a: &[String], b: &[String]) -> bool {
 }
 
 /// GET /api/admin/users — 用户列表（分页）
+#[utoipa::path(
+    get,
+    path = "/api/admin/users",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    params(
+        ("page" = Option<i64>, Query, description = "页码（从 1 开始）"),
+        ("page_size" = Option<i64>, Query, description = "每页条数（1-200）"),
+    ),
+    responses((status = 200, description = "用户列表（含角色）", body = ApiResponse<UserListResponse>))
+)]
 pub async fn list_users(
     State(state): State<AppState>,
     Query(params): Query<UserListParams>,
@@ -149,6 +160,18 @@ pub async fn list_users(
 }
 
 /// POST /api/admin/users — 创建用户（含角色分配）
+#[utoipa::path(
+    post,
+    path = "/api/admin/users",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    request_body = UserManageRequest,
+    responses(
+        (status = 200, description = "创建成功", body = ApiResponse<UserInfo>),
+        (status = 400, description = "参数不合法"),
+        (status = 409, description = "用户名或邮箱已存在"),
+    )
+)]
 pub async fn create_user(
     State(state): State<AppState>,
     Json(req): Json<UserManageRequest>,
@@ -203,6 +226,18 @@ pub async fn create_user(
 }
 
 /// PUT /api/admin/users/:id — 更新用户（含主角色）
+#[utoipa::path(
+    put,
+    path = "/api/admin/users/{id}",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "用户 ID")),
+    request_body = UserManageRequest,
+    responses(
+        (status = 200, description = "更新成功", body = ApiResponse<UserInfo>),
+        (status = 400, description = "参数不合法或试图移除最后一名管理员"),
+    )
+)]
 pub async fn update_user(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -248,6 +283,17 @@ pub async fn update_user(
 }
 
 /// DELETE /api/admin/users/:id — 删除用户
+#[utoipa::path(
+    delete,
+    path = "/api/admin/users/{id}",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "用户 ID")),
+    responses(
+        (status = 200, description = "删除成功", body = ApiResponse<String>),
+        (status = 400, description = "不能删除当前账号或最后一名管理员"),
+    )
+)]
 pub async fn delete_user(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
@@ -277,6 +323,17 @@ pub async fn delete_user(
 }
 
 /// POST /api/admin/users/batch-delete — 批量删除
+#[utoipa::path(
+    post,
+    path = "/api/admin/users/batch-delete",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    request_body = BatchDeleteRequest,
+    responses(
+        (status = 200, description = "批量删除成功", body = ApiResponse<String>),
+        (status = 400, description = "包含当前账号或会删除全部管理员"),
+    )
+)]
 pub async fn batch_delete_users(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
@@ -328,12 +385,24 @@ pub async fn batch_delete_users(
     Ok(Json(ApiResponse::success("批量删除成功")))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct BatchDeleteRequest {
     pub ids: Vec<Uuid>,
 }
 
 /// PUT /api/admin/users/:id/status — 切换状态
+#[utoipa::path(
+    put,
+    path = "/api/admin/users/{id}/status",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "用户 ID")),
+    request_body = ToggleStatusRequest,
+    responses(
+        (status = 200, description = "状态已更新（停用会吊销该用户全部会话）", body = ApiResponse<UserInfo>),
+        (status = 400, description = "不能停用当前登录账号"),
+    )
+)]
 pub async fn toggle_user_status(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
@@ -367,12 +436,24 @@ pub async fn toggle_user_status(
     Ok(Json(ApiResponse::success(UserInfo::new(updated, roles))))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ToggleStatusRequest {
     pub is_active: bool,
 }
 
 /// POST /api/admin/users/:id/reset-password — 重置密码
+#[utoipa::path(
+    post,
+    path = "/api/admin/users/{id}/reset-password",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "用户 ID")),
+    request_body = ResetPasswordRequest,
+    responses(
+        (status = 200, description = "密码重置成功并吊销该用户全部会话", body = ApiResponse<String>),
+        (status = 400, description = "新密码不合法"),
+    )
+)]
 pub async fn reset_user_password(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -402,7 +483,7 @@ pub async fn reset_user_password(
     Ok(Json(ApiResponse::success("密码重置成功")))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ResetPasswordRequest {
     pub password: String,
 }

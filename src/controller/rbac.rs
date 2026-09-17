@@ -12,6 +12,13 @@ use crate::router::AppState;
 /// GET /api/admin/test — 管理员权限测试
 ///
 /// 需要 `admin` 角色才能访问（通过中间件拦截）。
+#[utoipa::path(
+    get,
+    path = "/api/admin/test",
+    tag = "系统",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "管理员权限校验通过", body = ApiResponse<String>))
+)]
 pub async fn admin_test(
     _state: State<AppState>,
     auth_user: AuthenticatedUser,

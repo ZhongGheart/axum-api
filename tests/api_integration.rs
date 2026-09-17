@@ -449,6 +449,81 @@ async fn admin_requests_are_written_to_audit_log() {
 }
 
 // ──────────────────────────────────────────────
+// 菜单驱动的导航
+// ──────────────────────────────────────────────
+
+/// 递归收集菜单树里的所有名称
+fn collect_menu_names(value: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(nodes) = value.as_array() {
+        for node in nodes {
+            if let Some(name) = node["name"].as_str() {
+                names.push(name.to_string());
+            }
+            names.extend(collect_menu_names(&node["children"]));
+        }
+    }
+    names
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn current_user_menu_tree_follows_role_assignment() {
+    let app = app().await;
+
+    // 未登录不可读取
+    let (status, _) = send(&app, request("GET", "/api/auth/menus", None, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // admin：包含系统管理及其子页面
+    let admin = admin_token(&app).await;
+    let (status, body) = send(&app, request("GET", "/api/auth/menus", Some(&admin), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let admin_menus = collect_menu_names(&body["data"]);
+    assert!(!admin_menus.is_empty(), "菜单种子未生效: {body}");
+    for expected in ["首页", "组件示例", "系统管理", "用户管理", "菜单管理"] {
+        assert!(
+            admin_menus.iter().any(|n| n == expected),
+            "admin 应看到「{expected}」: {admin_menus:?}"
+        );
+    }
+
+    // 普通用户：只有通用页面，不含系统管理
+    let username = unique("menu_user");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "user1234"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let user = login_token(&app, &username, "user1234").await;
+    let (status, body) = send(&app, request("GET", "/api/auth/menus", Some(&user), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let user_menus = collect_menu_names(&body["data"]);
+
+    assert!(
+        user_menus.iter().any(|n| n == "首页"),
+        "普通用户应看到首页: {user_menus:?}"
+    );
+    assert!(
+        !user_menus.iter().any(|n| n == "系统管理"),
+        "普通用户不应看到系统管理: {user_menus:?}"
+    );
+    // 不同角色拿到的菜单必须真的有差异，而不是都返回全量
+    assert!(user_menus.len() < admin_menus.len());
+}
+
+// ──────────────────────────────────────────────
 // 接口文档契约
 // ──────────────────────────────────────────────
 
@@ -465,6 +540,8 @@ async fn every_documented_route_is_implemented() {
         // 路径参数替换为合法值，避免因参数解析失败而误判
         let concrete = path
             .replace("{id}", "00000000-0000-0000-0000-000000000000")
+            .replace("{user_id}", "00000000-0000-0000-0000-000000000000")
+            .replace("{role_id}", "00000000-0000-0000-0000-000000000000")
             .replace("{code}", "probe")
             .replace("{*path}", "index.html");
 

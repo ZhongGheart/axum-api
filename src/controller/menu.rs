@@ -7,6 +7,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::middleware::auth::AuthenticatedUser;
 use crate::model::{
     ApiResponse, AssignMenuRequest, CreateMenuRequest, Menu, MenuNode, UpdateMenuRequest,
 };
@@ -14,6 +15,14 @@ use crate::router::AppState;
 use crate::utils::validation;
 
 /// GET /api/admin/menus — 获取菜单树
+#[utoipa::path(
+    get,
+    path = "/api/admin/menus",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    params(("role_id" = Option<String>, Query, description = "按角色过滤菜单树")),
+    responses((status = 200, description = "菜单树", body = ApiResponse<Vec<MenuNode>>))
+)]
 pub async fn list_menus(
     State(state): State<AppState>,
     Query(params): Query<MenuQuery>,
@@ -29,12 +38,55 @@ pub async fn list_menus(
     Ok(Json(ApiResponse::success(tree)))
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct MenuQuery {
     pub role_id: Option<String>,
 }
 
+/// GET /api/auth/menus — 当前登录用户可见的导航菜单树
+///
+/// 前端据此动态生成路由与侧栏，因此只返回：
+/// 该用户所有角色关联的、`is_visible = true` 的非按钮菜单。
+#[utoipa::path(
+    get,
+    path = "/api/auth/menus",
+    tag = "认证",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "当前用户的导航菜单树", body = ApiResponse<Vec<MenuNode>>))
+)]
+pub async fn my_menus(
+    State(state): State<AppState>,
+    auth_user: AuthenticatedUser,
+) -> Result<Json<ApiResponse<Vec<MenuNode>>>, AppError> {
+    let mut role_ids = Vec::with_capacity(auth_user.roles.len());
+    for role_name in &auth_user.roles {
+        if let Some(role) = state.auth_service.role_repo.find_by_name(role_name).await? {
+            role_ids.push(role.id);
+        }
+    }
+
+    if role_ids.is_empty() {
+        tracing::warn!(
+            "用户 {} 未匹配到任何角色，返回空菜单: {:?}",
+            auth_user.user_id,
+            auth_user.roles
+        );
+        return Ok(Json(ApiResponse::success(Vec::new())));
+    }
+
+    let tree = state.menu_repo.find_tree_for_roles(&role_ids).await?;
+    Ok(Json(ApiResponse::success(tree)))
+}
+
 /// POST /api/admin/menus — 新增菜单
+#[utoipa::path(
+    post,
+    path = "/api/admin/menus",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    request_body = CreateMenuRequest,
+    responses((status = 200, description = "创建成功", body = ApiResponse<MenuNode>))
+)]
 pub async fn create_menu(
     State(state): State<AppState>,
     Json(req): Json<CreateMenuRequest>,
@@ -58,6 +110,15 @@ pub async fn create_menu(
 }
 
 /// PUT /api/admin/menus/:id — 更新菜单
+#[utoipa::path(
+    put,
+    path = "/api/admin/menus/{id}",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "菜单 ID")),
+    request_body = UpdateMenuRequest,
+    responses((status = 200, description = "更新成功", body = ApiResponse<MenuNode>))
+)]
 pub async fn update_menu(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -68,6 +129,14 @@ pub async fn update_menu(
 }
 
 /// DELETE /api/admin/menus/:id — 删除菜单
+#[utoipa::path(
+    delete,
+    path = "/api/admin/menus/{id}",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "菜单 ID")),
+    responses((status = 200, description = "删除成功", body = ApiResponse<String>))
+)]
 pub async fn delete_menu(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -77,6 +146,15 @@ pub async fn delete_menu(
 }
 
 /// PUT /api/admin/roles/:id/menus — 分配角色菜单权限
+#[utoipa::path(
+    put,
+    path = "/api/admin/roles/{role_id}/menus",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    params(("role_id" = Uuid, Path, description = "角色 ID")),
+    request_body = AssignMenuRequest,
+    responses((status = 200, description = "角色菜单已更新", body = ApiResponse<String>))
+)]
 pub async fn assign_role_menus(
     State(state): State<AppState>,
     Path(role_id): Path<Uuid>,
