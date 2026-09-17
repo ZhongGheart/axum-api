@@ -85,17 +85,13 @@ impl MetricsCollector {
                     call_count: m.call_count,
                     error_count: m.error_count,
                     total_duration_ms: m.total_duration_ms,
-                    avg_duration_ms: if m.call_count > 0 {
-                        m.total_duration_ms / m.call_count
-                    } else {
-                        0
-                    },
+                    avg_duration_ms: m.total_duration_ms.checked_div(m.call_count).unwrap_or(0),
                     max_duration_ms: m.max_duration_ms,
                     min_duration_ms: m.min_duration_ms,
                 }
             })
             .collect();
-        result.sort_by(|a, b| b.call_count.cmp(&a.call_count));
+        result.sort_by_key(|m| std::cmp::Reverse(m.call_count));
         result
     }
 

@@ -35,12 +35,8 @@ pub async fn api_metrics(
     // 计算聚合数据
     let total_calls: u64 = snapshot.iter().map(|m| m.call_count).sum();
     let total_errors: u64 = snapshot.iter().map(|m| m.error_count).sum();
-    let avg_response: u64 = if total_calls > 0 {
-        let total_duration: u64 = snapshot.iter().map(|m| m.total_duration_ms).sum();
-        total_duration / total_calls
-    } else {
-        0
-    };
+    let total_duration: u64 = snapshot.iter().map(|m| m.total_duration_ms).sum();
+    let avg_response: u64 = total_duration.checked_div(total_calls).unwrap_or(0);
 
     let result = serde_json::json!({
         "metrics": snapshot,
