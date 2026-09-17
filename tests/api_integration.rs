@@ -465,6 +465,8 @@ async fn every_documented_route_is_implemented() {
         // 路径参数替换为合法值，避免因参数解析失败而误判
         let concrete = path
             .replace("{id}", "00000000-0000-0000-0000-000000000000")
+            .replace("{user_id}", "00000000-0000-0000-0000-000000000000")
+            .replace("{role_id}", "00000000-0000-0000-0000-000000000000")
             .replace("{code}", "probe")
             .replace("{*path}", "index.html");
 

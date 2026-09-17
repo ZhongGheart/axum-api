@@ -14,6 +14,14 @@ use crate::router::AppState;
 use crate::utils::validation;
 
 /// GET /api/admin/menus — 获取菜单树
+#[utoipa::path(
+    get,
+    path = "/api/admin/menus",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    params(("role_id" = Option<String>, Query, description = "按角色过滤菜单树")),
+    responses((status = 200, description = "菜单树", body = ApiResponse<Vec<MenuNode>>))
+)]
 pub async fn list_menus(
     State(state): State<AppState>,
     Query(params): Query<MenuQuery>,
@@ -29,12 +37,20 @@ pub async fn list_menus(
     Ok(Json(ApiResponse::success(tree)))
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct MenuQuery {
     pub role_id: Option<String>,
 }
 
 /// POST /api/admin/menus — 新增菜单
+#[utoipa::path(
+    post,
+    path = "/api/admin/menus",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    request_body = CreateMenuRequest,
+    responses((status = 200, description = "创建成功", body = ApiResponse<MenuNode>))
+)]
 pub async fn create_menu(
     State(state): State<AppState>,
     Json(req): Json<CreateMenuRequest>,
@@ -58,6 +74,15 @@ pub async fn create_menu(
 }
 
 /// PUT /api/admin/menus/:id — 更新菜单
+#[utoipa::path(
+    put,
+    path = "/api/admin/menus/{id}",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "菜单 ID")),
+    request_body = UpdateMenuRequest,
+    responses((status = 200, description = "更新成功", body = ApiResponse<MenuNode>))
+)]
 pub async fn update_menu(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -68,6 +93,14 @@ pub async fn update_menu(
 }
 
 /// DELETE /api/admin/menus/:id — 删除菜单
+#[utoipa::path(
+    delete,
+    path = "/api/admin/menus/{id}",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "菜单 ID")),
+    responses((status = 200, description = "删除成功", body = ApiResponse<String>))
+)]
 pub async fn delete_menu(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -77,6 +110,15 @@ pub async fn delete_menu(
 }
 
 /// PUT /api/admin/roles/:id/menus — 分配角色菜单权限
+#[utoipa::path(
+    put,
+    path = "/api/admin/roles/{role_id}/menus",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    params(("role_id" = Uuid, Path, description = "角色 ID")),
+    request_body = AssignMenuRequest,
+    responses((status = 200, description = "角色菜单已更新", body = ApiResponse<String>))
+)]
 pub async fn assign_role_menus(
     State(state): State<AppState>,
     Path(role_id): Path<Uuid>,

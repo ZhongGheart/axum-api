@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// 字典类型实体
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct DictType {
     pub id: Uuid,
     pub code: String,
@@ -18,7 +18,7 @@ pub struct DictType {
 }
 
 /// 字典项实体
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct DictItem {
     pub id: Uuid,
     pub dict_type_id: Uuid,
@@ -33,7 +33,7 @@ pub struct DictItem {
 }
 
 /// 字典类型 + 项（给前端一次性返回）
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DictTypeWithItems {
     pub id: Uuid,
     pub code: String,
@@ -45,7 +45,7 @@ pub struct DictTypeWithItems {
 }
 
 /// 字典项响应
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DictItemResponse {
     pub id: Uuid,
     pub label: String,
@@ -57,7 +57,7 @@ pub struct DictItemResponse {
 }
 
 /// 字典类型请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateDictTypeRequest {
     pub code: String,
     pub name: String,
@@ -67,7 +67,7 @@ pub struct CreateDictTypeRequest {
 }
 
 /// 字典项请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateDictItemRequest {
     pub dict_type_id: Option<Uuid>,
     pub label: String,

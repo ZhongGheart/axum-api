@@ -66,5 +66,7 @@ axum-extra = { version = "0.10", features = ["typed-header"] }
 
 # 系统监控（CPU/内存/磁盘/进程）
 sysinfo = "0.33"
+# OpenAPI 规范由代码生成（handler 注解 + DTO 派生）
+utoipa = { version = "5.5.0", features = ["axum_extras", "uuid", "chrono"] }
 
 

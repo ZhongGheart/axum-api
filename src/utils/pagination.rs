@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 统一分页请求参数
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, utoipa::ToSchema)]
 pub struct PaginationParams {
     /// 页码（从 1 开始）
     pub page: Option<i64>,
@@ -51,7 +51,7 @@ impl PaginationParams {
 }
 
 /// 统一分页响应数据
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PaginatedResponse<T: Serialize> {
     pub items: Vec<T>,
     pub total: i64,

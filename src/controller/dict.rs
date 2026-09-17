@@ -14,6 +14,13 @@ use crate::model::{
 use crate::router::AppState;
 
 /// GET /api/admin/dict/types — 字典类型列表
+#[utoipa::path(
+    get,
+    path = "/api/admin/dict/types",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "字典类型列表", body = ApiResponse<Vec<DictType>>))
+)]
 pub async fn list_types(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<Vec<DictType>>>, AppError> {
@@ -22,6 +29,14 @@ pub async fn list_types(
 }
 
 /// POST /api/admin/dict/types — 新增字典类型
+#[utoipa::path(
+    post,
+    path = "/api/admin/dict/types",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    request_body = CreateDictTypeRequest,
+    responses((status = 200, description = "创建成功", body = ApiResponse<DictType>))
+)]
 pub async fn create_type(
     State(state): State<AppState>,
     Json(req): Json<CreateDictTypeRequest>,
@@ -41,6 +56,15 @@ pub async fn create_type(
 }
 
 /// PUT /api/admin/dict/types/:id — 更新字典类型
+#[utoipa::path(
+    put,
+    path = "/api/admin/dict/types/{id}",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "字典类型 ID")),
+    request_body = CreateDictTypeRequest,
+    responses((status = 200, description = "更新成功", body = ApiResponse<DictType>))
+)]
 pub async fn update_type(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -51,6 +75,14 @@ pub async fn update_type(
 }
 
 /// DELETE /api/admin/dict/types/:id — 删除字典类型（级联删除项）
+#[utoipa::path(
+    delete,
+    path = "/api/admin/dict/types/{id}",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "字典类型 ID")),
+    responses((status = 200, description = "删除成功", body = ApiResponse<String>))
+)]
 pub async fn delete_type(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -60,6 +92,14 @@ pub async fn delete_type(
 }
 
 /// GET /api/admin/dict/:code/items — 获取字典项（直接从缓存或数据库）
+#[utoipa::path(
+    get,
+    path = "/api/dict/{code}/items",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    params(("code" = String, Path, description = "字典编码")),
+    responses((status = 200, description = "字典项（带 Redis 缓存）", body = ApiResponse<Vec<DictItemResponse>>))
+)]
 pub async fn get_items_by_code(
     State(state): State<AppState>,
     Path(code): Path<String>,
@@ -69,6 +109,14 @@ pub async fn get_items_by_code(
 }
 
 /// GET /api/admin/dict/items?dict_type_id=xxx — 根据类型 ID 获取项
+#[utoipa::path(
+    get,
+    path = "/api/admin/dict/items",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    params(("dict_type_id" = Uuid, Query, description = "字典类型 ID")),
+    responses((status = 200, description = "字典项列表", body = ApiResponse<Vec<DictItem>>))
+)]
 pub async fn list_items(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<DictItemQuery>,
@@ -77,12 +125,20 @@ pub async fn list_items(
     Ok(Json(ApiResponse::success(items)))
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct DictItemQuery {
     pub dict_type_id: Uuid,
 }
 
 /// POST /api/admin/dict/items — 新增字典项
+#[utoipa::path(
+    post,
+    path = "/api/admin/dict/items",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    request_body = CreateDictItemRequest,
+    responses((status = 200, description = "创建成功", body = ApiResponse<DictItem>))
+)]
 pub async fn create_item(
     State(state): State<AppState>,
     Json(req): Json<CreateDictItemRequest>,
@@ -107,6 +163,15 @@ pub async fn create_item(
 }
 
 /// PUT /api/admin/dict/items/:id — 更新字典项
+#[utoipa::path(
+    put,
+    path = "/api/admin/dict/items/{id}",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "字典项 ID")),
+    request_body = CreateDictItemRequest,
+    responses((status = 200, description = "更新成功", body = ApiResponse<DictItem>))
+)]
 pub async fn update_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -117,6 +182,17 @@ pub async fn update_item(
 }
 
 /// DELETE /api/admin/dict/items/:id — 删除字典项
+#[utoipa::path(
+    delete,
+    path = "/api/admin/dict/items/{id}",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "字典项 ID")),
+    responses(
+        (status = 200, description = "删除成功", body = ApiResponse<String>),
+        (status = 404, description = "字典项不存在"),
+    )
+)]
 pub async fn delete_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -126,6 +202,13 @@ pub async fn delete_item(
 }
 
 /// GET /api/admin/dict/cached — 查询所有字典（含项）并缓存
+#[utoipa::path(
+    get,
+    path = "/api/admin/dict/cached",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "全部字典及字典项", body = ApiResponse<Vec<DictTypeWithItems>>))
+)]
 pub async fn list_all_cached(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<Vec<DictTypeWithItems>>>, AppError> {
@@ -134,6 +217,13 @@ pub async fn list_all_cached(
 }
 
 /// POST /api/admin/dict/refresh — 刷新缓存（清空后重新写入）
+#[utoipa::path(
+    post,
+    path = "/api/admin/dict/refresh",
+    tag = "数据字典",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "缓存已刷新", body = ApiResponse<String>))
+)]
 pub async fn refresh_cache(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {

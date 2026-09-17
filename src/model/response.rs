@@ -15,7 +15,7 @@ use serde::Serialize;
 ///   "data": { ... }
 /// }
 /// ```
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ApiResponse<T: Serialize> {
     /// 状态码，与 HTTP 状态码一致
     pub code: u16,

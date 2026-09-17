@@ -146,7 +146,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route("/api/admin/users/{id}", axum::routing::put(user::update_user).delete(user::delete_user))
         .route("/api/admin/roles", get(role::list_roles).post(role::create_role))
         .route("/api/admin/roles/{id}", axum::routing::put(role::update_role).delete(role::delete_role))
-        .route("/api/admin/users/{id}/roles", get(role::get_user_roles).post(role::assign_user_role))
+        .route("/api/admin/users/{user_id}/roles", get(role::get_user_roles).post(role::assign_user_role))
         .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware))
         .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
             async move { crate::middleware::auth::require_role("admin", req, next).await }
@@ -164,7 +164,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
             axum::routing::put(menu::update_menu).delete(menu::delete_menu),
         )
         .route(
-            "/api/admin/roles/{id}/menus",
+            "/api/admin/roles/{role_id}/menus",
             axum::routing::put(menu::assign_role_menus),
         )
         .layer(middleware::from_fn_with_state(

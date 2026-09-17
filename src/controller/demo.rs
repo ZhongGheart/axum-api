@@ -16,14 +16,14 @@ use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 use crate::utils::validation;
 
 /// 校验测试请求
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ValidateTestRequest {
     pub username: String,
     pub email: Option<String>,
 }
 
 /// 校验测试响应
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ValidateTestResponse {
     pub username_valid: bool,
     pub username_message: String,
@@ -32,6 +32,13 @@ pub struct ValidateTestResponse {
 }
 
 /// GET /api/admin/export/users — 导出用户列表（Excel）
+#[utoipa::path(
+    get,
+    path = "/api/admin/export/users",
+    tag = "导出",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "用户列表 Excel 文件（二进制）"))
+)]
 pub async fn export_users(
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, AppError> {
@@ -107,6 +114,14 @@ pub async fn export_users(
 }
 
 /// POST /api/admin/validate — 参数校验演示
+#[utoipa::path(
+    post,
+    path = "/api/admin/validate",
+    tag = "系统",
+    security(("bearer_auth" = [])),
+    request_body = ValidateTestRequest,
+    responses((status = 200, description = "校验结果", body = ApiResponse<ValidateTestResponse>))
+)]
 pub async fn validate_test(
     Json(req): Json<ValidateTestRequest>,
 ) -> Result<Json<ApiResponse<ValidateTestResponse>>, AppError> {
@@ -141,6 +156,13 @@ pub async fn validate_test(
 }
 
 /// GET /api/admin/logs/audit/export — 导出操作日志（Excel）
+#[utoipa::path(
+    get,
+    path = "/api/admin/logs/audit/export",
+    tag = "导出",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "操作日志 Excel 文件（二进制）"))
+)]
 pub async fn export_audit_logs(
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, AppError> {
@@ -211,6 +233,19 @@ pub async fn export_audit_logs(
 }
 
 /// GET /api/admin/audit-logs — 查询操作日志（分页）
+#[utoipa::path(
+    get,
+    path = "/api/admin/audit-logs",
+    tag = "操作日志",
+    security(("bearer_auth" = [])),
+    params(
+        ("page" = Option<i64>, Query, description = "页码"),
+        ("page_size" = Option<i64>, Query, description = "每页条数"),
+        ("sort_by" = Option<String>, Query, description = "排序字段"),
+        ("sort_order" = Option<String>, Query, description = "排序方向 asc/desc"),
+    ),
+    responses((status = 200, description = "操作日志分页", body = ApiResponse<PaginatedResponse<crate::model::AuditLog>>))
+)]
 pub async fn list_audit_logs(
     State(state): State<AppState>,
     Query(params): Query<PaginationParams>,
