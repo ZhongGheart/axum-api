@@ -1,8 +1,11 @@
 /**
- * 用户表单「角色」下拉的选项拼装
+ * 用户表单「角色」多选框的选项拼装
  *
  * v0.5.0 PR-2 起角色是数据库里的数据（`GET /api/admin/roles`），不再是一份
  * 写死在前端的 [admin, user] 清单——角色管理页新建一个角色，这里立刻就能选到。
+ * v0.6.0 起这里是**多选**：数据模型（`user_roles` 表、`UserInfo.roles`）
+ * 一直是多角色的，此前表单只回填 `roles[0]` 并整体覆盖提交，
+ * 会把用户其余角色静默删除。
  *
  * 组件内部状态没法用 vitest 直接覆盖（仓库无 @vue/test-utils），
  * 因此值得测的部分放在这里，沿用 `utils/menu.ts` 的做法。
@@ -35,39 +38,49 @@ export const DEFAULT_ROLE_NAME = 'user'
  */
 export function buildRoleSelectOptions(
   roles: readonly RoleListItem[],
-  current?: string
+  current?: readonly string[]
 ): RoleSelectOption[] {
   const options = roles.map((role) => ({
     label: role.description ? `${role.name}（${role.description}）` : role.name,
     value: role.name,
   }))
-  if (current && !options.some((o) => o.value === current)) {
-    options.push({ label: `${current}（当前角色，已不在角色列表中）`, value: current })
+  for (const name of current ?? []) {
+    if (!options.some((o) => o.value === name)) {
+      options.push({ label: `${name}（当前角色，已不在角色列表中）`, value: name })
+    }
   }
   return options
 }
 
 /**
- * 新建用户时的默认角色
+ * 新建用户时的默认角色（多选框的初始选中项）
  *
  * 优先普通用户（多数新建账号的意图），否则列表首个，都不存在则空串
  * （交给表单的必填校验报错，而不是静默选中一个角色）
  */
-export function pickDefaultRole(roles: readonly RoleListItem[]): string {
-  if (roles.some((r) => r.name === DEFAULT_ROLE_NAME)) return DEFAULT_ROLE_NAME
-  return roles[0]?.name ?? ''
+export function pickDefaultRoles(roles: readonly RoleListItem[]): string[] {
+  if (roles.some((r) => r.name === DEFAULT_ROLE_NAME)) return [DEFAULT_ROLE_NAME]
+  const first = roles[0]?.name
+  return first ? [first] : []
 }
 
 /**
- * 用户当前真正持有的角色名（用于回填编辑表单）
+ * 用户当前真正持有的角色名**集合**（用于回填编辑表单与列表展示）
  *
  * **不能用 `UserInfo.role`**：后端那个字段是只有 admin / user 两值的展示用枚举
  * （`Role::primary_from`，非 admin 一律塌缩成 user），真实角色集合在 `roles` 里。
  * 直接拿 `role` 回填，一个持有自定义角色的用户一打开编辑框就会变成"普通用户"，
- * 一保存就把角色静默改掉了。
+ * 一保存就把角色静默改掉了；只拿 `roles[0]` 同样会丢掉其余角色。
  *
- * 传 `roles` 的第一个；缺失时退回 `role`（兼容只回了主角色的老响应）。
+ * `roles` 为空时退回 `[role]`（兼容只回了展示枚举的老响应）。
+ * 注意此时退回来的是后端 `primary_from(&[])` 的塌缩值 `user`——
+ * 对一个真的没有角色的用户，这不是"他持有 user"，而是"必须至少选一个"，
+ * 而 `user` 是最合理的默认预选（后端也已拒绝提交空角色集合）。
  */
-export function currentRoleName(user: { role?: string; roles?: readonly string[] }): string {
-  return user.roles?.[0] ?? user.role ?? ''
+export function currentRoleNames(user: {
+  role?: string
+  roles?: readonly string[]
+}): string[] {
+  if (user.roles && user.roles.length > 0) return [...user.roles]
+  return user.role ? [user.role] : []
 }

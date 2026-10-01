@@ -779,3 +779,215 @@ tag 本身是对的（`refs/tags/v0.5.0^{commit}` 指向 merge commit），但�
 5. **浏览器端人工回归**：本版前端逻辑未改（路由按权限码动态注册），
    81 个前端测试 + 真实二进制升级验证已覆盖，但**没有做真人浏览器回归**。
    下一版动前端时建议补上
+
+---
+
+# v0.6.0 — 用户角色的多角色表达
+
+## 当前目标
+
+按 v0.5.0 发布后定的后续计划**顺序**执行。第 1 项：
+修掉"多角色用户经用户表单保存会静默丢角色"——本版遗留里唯一会导致
+**静默丢授权**的问题。
+
+## 缺陷（已确认，两个面）
+
+数据模型是多角色的（`user_roles` 表、`UserInfo.roles`、`POST /users/:id/roles`
+追加语义），但用户表单是单角色的，两边对不上：
+
+1. **保存即丢角色**：`currentRoleName(user)` 返回 `roles[0]`，
+   表单 `n-select` 是单选，回填只显示第一个角色；提交 `role: "admin"`，
+   后端 `replace_user_roles(id, &["admin"])` **整体替换**——
+   用户原有的第二个角色被无声删除，且**没有任何提示**
+2. **列表也只显示一个**：`columns` 里角色列同样用 `currentRoleName(r)`，
+   渲染单个 `NTag`。多角色用户在列表里看起来就是单角色，
+   管理员根本看不出这个用户其实有额外权限
+
+## 计划（PR-1）
+
+### 后端
+
+- `UserManageRequest`：`role: String` → `role: Option<String>`（兼容别名，标 deprecated）
+  \+ 新增 `roles: Option<Vec<String>>`（**权威字段**）。
+  两者至少给一个；都给时以 `roles` 为准
+- 新增 `resolve_roles(state, &[String]) -> Result<Vec<String>>` 取代 `resolve_role`：
+  逐个归一化 → 去重 → 校验角色真实存在 → **要求非空**
+  （零角色的用户是"建得出、没人能用"的死数据，与 PR-1 修的半成品用户同类）
+- `create_user` / `update_user` 改用 `resolve_roles`，
+  授权下界守卫直接传整个 `new_roles` 切片（`ensure_can_grant_roles`
+  本来就是按切片比码集，无需改动语义）
+- `ensure_not_last_admin` / `same_role_set` 本来就吃切片，天然支持多角色
+
+### 前端
+
+- 表单角色项改 `n-select multiple`，`formData.roles: string[]`
+- `utils/role.ts`：`currentRoleName` → `currentRoleNames`（返回数组，
+  兼容只回 `role` 的老响应）；`buildRoleSelectOptions` 的 `current`
+  收数组，把**所有**不在列表里的当前角色补进去；
+  `pickDefaultRole` → `pickDefaultRoles`
+- 列表角色列渲染**全部**角色为多个 tag（admin 用 warning 色，其余 info）
+- `api/user.ts` 的 `create`/`update` 请求体发 `roles: string[]`
+
+### 测试
+
+- 后端：多角色建号落库；更新时保留未在表单里体现的角色（**回归核心**）；
+  空 `roles` 拒绝；未知角色拒绝且不留半成品；重复角色去重；
+  授权下界对多个角色逐个生效（持 `user:create` 建多角色含 admin → 403）
+- 前端：`currentRoleNames` 与选项补全的契约测试
+- 兼容：`role` 单数字段仍可用（既有客户端与既有测试不改）
+
+## 起始 git 状态
+
+- 分支 `v0.6.0`（从 master 切出），工作区干净
+- HEAD = `cf8cbdde docs(handoff): 记录 v0.5.0 发布结果与分支/tag 同名的 ref 歧义坑`
+- 上一版：v0.5.0 已发布（tag `v0.5.0` → merge commit `8768cd7c`）
+
+## 后续（本次不做，按序排在后面）
+
+2. 权限码清空后的恢复路径
+3. 补前端入口（`system:monitor:export`、`system:test:access`）
+4. 运维债：审计日志保留策略、接口耗时跨副本聚合
+
+---
+
+## PR-1 完成记录（实现 + 验证全绿，待发布）
+
+### 落地决策
+
+1. **修的是"静默丢授权"**：v0.5.0 遗留里唯一会导致静默数据丢失的问题。
+ 数据模型一直多角色，但写入口是单数 + 整体替换语义
+2. **两个面都修了**：表单（多选框）+ 列表列（此前只渲染 `roles[0]`，
+ 多角色用户看起来就是单角色）
+3. **`role` 保留为兼容别名**（标 `#[deprecated]`，配 `#[allow(deprecated)]` 读取），
+ `roles` 为权威字段；都给时 `roles` 优先。既有客户端与既有测试零改动——
+ `the_legacy_single_role_field_still_assigns_one_role` 未作任何改动即通过，
+ 这是向后兼容的直接证据
+4. **`resolve_roles` 要求非空**：零角色用户是"建得出、没人能用"的死数据。
+ 去重保序，**先全校验再写**（原子）
+5. `ensure_can_grant_roles` / `ensure_not_last_admin` / `same_role_set`
+ 本来就吃切片，**无需改动语义**——多角色不会放宽授权
+
+### 测试数字
+
+| 项目 | v0.5.0 | v0.6.0 |
+|------|--------|---------|
+| `cargo test --lib` | 49 | 49 |
+| `cargo test --test api_integration`（`--include-ignored --test-threads=1`） | 44 | **51**（+7） |
+| 前端单测 | 81 | **84**（+3） |
+| `cargo fmt --check` | clean | clean |
+| `cargo clippy --all-targets --all-features -- -D warnings` | clean | clean |
+| 前端 typecheck / lint | clean / 0 error | clean / 0 error（1 个 `env.d.ts` 历史 warning） |
+
+新增 7 条集成测试：`creating_a_user_with_several_roles_assigns_all_of_them`、
+`updating_a_user_round_trips_every_role`、`an_empty_role_list_is_rejected_and_changes_nothing`、
+`one_unknown_role_rejects_the_whole_list`、`duplicate_roles_are_collapsed`、
+`the_legacy_single_role_field_still_assigns_one_role`、
+`granting_several_roles_at_once_still_hits_the_superset_rule`
+
+### 缺陷注入验证（新测试确实能抓到该缺陷）
+
+把 `requested_roles` 改成 `vec![roles.first()...]`（模拟旧单角色行为）后：
+
+- `creating_a_user_with_several_roles_assigns_all_of_them` **FAILED**，
+ 输出 `left: ["role_a_…"] right: ["role_a_…", "role_b_…"]`——真实只落 1 个角色
+- `updating_a_user_round_trips_every_role` **FAILED**，`left: 1 right: 3`
+- `duplicate_roles_are_collapsed` 仍通过（正确：3 个相同折叠成 1，结果相同）
+
+已还原（`roles.clone()`，`src/controller/user.rs:115`）。
+
+### 测试库清理方式（**注意：不要做手术式 DELETE**）
+
+注入失败那轮留下了 `multi_role_user_*` 用户和 `role_a_*`/`role_b_*`/`rt_*`/`dup_*` 角色。
+上一轮曾因 `DELETE FROM menus WHERE type<>'button'` 误删 16 个种子目录菜单。
+
+**本轮改为整库重建**（`dropdb` + `createdb` + `redis-cli flushall`），
+然后在**完全空库（0 张表）**上重跑全量集成测试：51 全绿。
+这样既清干净，又顺带验证了空库迁移 + 种子数据引导。
+`scripts/test_env.sh stop` 本来就是 `rm -rf $PGDATA`——这个测试库是完全一次性的。
+
+重建后种子数据核验：
+
+```
+menu_total=42   dir_menus=14   button_menus=28
+buttons_no_permission=0        tmp_leftover=0
+roles=15        admin_role=1   distinct_admin_users=1
+admin_granted_perm_codes=28
+```
+
+红线（若确实需要手术式清理菜单时）：只按
+`type='button' AND (permission IS NULL OR permission='')` 清理，
+**绝不带 `type<>'button'`**。
+
+### 本次收尾的文档/版本改动
+
+- `CHANGELOG.md`：新增 `[0.6.0]` 段（修复 / 变更 / 破坏性变更 / 测试）
+- `README.md`：版本导语补 v0.6.0 多角色；能力清单"用户管理"行补**多角色分配**
+- `Cargo.toml` + `frontend/package.json`：`0.5.0` → `0.6.0`
+
+### 尚未完成
+
+1. 提交 + push 分支 → 开 PR → CI 三 job（rust / frontend / docker）全绿
+2. merge commit → annotated tag `v0.6.0` → `gh release create --notes-file --verify-tag`
+3. 删分支（用全 refspec `:refs/heads/v0.6.0`）
+4. 可选但推荐：升级路径实测（v0.5.0 → v0.6.0）。v0.6.0 **无新迁移**，
+ 成本低；v0.5.0 的发布流程里做了，保持一致
+
+---
+
+## 升级路径验证（v0.5.0 → v0.6.0，真实二进制 + 真实存量库）
+
+方法沿用 v0.4→v0.5：`git worktree add /tmp/axum-v050 v0.5.0` → 编译 release →
+单独开库 `axum_api_upgrade` → v0.5.0 造数据 → 停掉 → **v0.6.0 二进制启动同一个库**。
+全程用 PTY 会话起服务（`nohup ... &` 会被 exec shell 退出回收）。
+
+### v0.5.0 侧：先复现缺陷（本版要修的正是它）
+
+v0.5.0 有追加语义的 `POST /api/admin/users/{user_id}/roles`，
+所以**真实 v0.5.0 库里确实存在多角色用户**，不是理论问题。
+用该端点把 `multi_v050` 造成 `user` + `auditor` 两个角色，再用表单保存：
+
+    PUT /api/admin/users/{id}  {"role":"user"}    ← 模拟前端只回填 roles[0]
+      -> HTTP 200  {"message":"success"}
+    SELECT r.name FROM user_roles ...            -> 只剩 user
+
+`auditor` 被静默删除，**接口返回成功**。这是升级前真实存在的状态。
+
+### 数据快照对照（升级前后逐项比对）
+
+| 项 | v0.5.0 | v0.6.0 启动后 |
+|---|---|---|
+| 迁移版本 | 008 | 008（**v0.6.0 无新迁移**） |
+| 菜单 / 按钮 / 权限码 | 42 / 28 / 28 | 42 / 28 / 28，**逐项未变** |
+| 角色 / 用户 | 3 / 3 | 3 / 3，**未变** |
+| 存量多角色用户 `multi_ok` | `["user","auditor"]` | `["user","auditor"]`，**完整保留** |
+
+### v0.6.0 侧行为验证（同一存量库）
+
+| 场景 | 结果 |
+|---|---|
+| 新写法 `roles:["user","auditor"]` 保存 | 200，两个角色**都在** |
+| 给受损的 `multi_v050` 加回 `auditor` | 200 → `["user","auditor"]`（v0.5.0 做不到） |
+| 三角色 `["user","auditor","viewer"]` | 200 → 三个都在 |
+| 旧客户端只发 `role:"user"` | 200 → `["user"]`，**整体替换，与 v0.5.0 完全一致** |
+| 空 `roles:[]` | 400「至少需要指定一个角色：没有角色的用户登录后没有任何权限」 |
+| `role` 与 `roles` 都给 | `roles` 优先 → 三个角色 |
+| 重复角色 `["user","user","auditor","user"]` | 折叠为 `["user","auditor"]`，库内 2 行（无重复行） |
+| 未知角色 `["user","nonexistent_zzz"]` | 400 点名该角色；角色行数 before=2 after=2，**原子拒绝** |
+| admin 全部管理接口（users/roles/menus/audit-logs/monitor） | 全 200，**无 403 回归** |
+| 多角色并集越界 `roles:["user","admin"]` | 403，文案点名缺 `system:dict:create`；`evil2` 建号数 **0** |
+| 唯一 admin（持 `admin`+`user`）改成只留 `user` | 400「不能移除最后一名管理员的 admin 角色」 |
+| 删除唯一 admin | 400「不能删除当前登录账号」 |
+
+授权下界对**多角色并集**依然成立：持 `system:user:create`+`system:user:list`
+的角色能建 `user`（无权限码的角色），但建 `user`+`admin` 被拒，
+且 403 文案点名缺哪个码。
+
+### 复用要点
+
+- 升级验证的库要**单独开一个**（本轮 `axum_api_upgrade`），验证完 `dropdb`，
+  否则会污染 `axum_api_test`，症状记到别人头上
+- 同一端口串行跑两个版本：v0.5.0 与 v0.6.0 都用 8083，停干净再起下一个
+  （`curl` 返回 000 才算真停）
+- `assign_role_menus` 的 `menu_ids` 必须是**带引号的 UUID 数组**；
+  用 shell 拼字符串时漏了逗号会报 `invalid type: integer`，容易被误读成授权失败
+- zsh 里**不要用 `UID` 作变量名**（是只读的当前用户 id），本轮踩过

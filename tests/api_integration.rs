@@ -1783,6 +1783,338 @@ async fn append_role_endpoint_normalizes_the_role_name() {
     assert_eq!(roles, expected, "{body}");
 }
 
+// ──────────────────────────────────────────────
+// v0.6.0 PR-1：多角色用户
+//
+// 数据模型一直是多角色的（`user_roles` 表 + `UserInfo.roles`），
+// 但 `UserManageRequest` 只有单数 `role`，而它是**整体替换**语义：
+// 前端只回填 `roles[0]`，一保存就把用户其余角色静默删掉。
+// 这一组测试钉住"多角色必须能整体提交、整体回显、整体校验"。
+// ──────────────────────────────────────────────
+
+/// 直接查库读某用户持有的角色名（按名排序，顺序无关的比较需要它）
+async fn role_names_in_db(user_id: uuid::Uuid) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT r.name FROM user_roles ur JOIN roles r ON r.id = ur.role_id \
+         WHERE ur.user_id = $1 ORDER BY r.name ASC",
+    )
+    .bind(user_id)
+    .fetch_all(&pool().await)
+    .await
+    .expect("查询用户角色失败")
+}
+
+/// 删除测试用户（避免在共享库里留下带自定义角色的账号）
+async fn delete_user_via_api(app: &Router, token: &str, user_id: uuid::Uuid) {
+    let (status, body) = send(
+        app,
+        request(
+            "DELETE",
+            &format!("/api/admin/users/{user_id}"),
+            Some(token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除测试用户失败: {body}");
+}
+
+/// 建号并断言落库的是**全部**角色，随后清理（用户 + 角色）
+async fn create_user_with_roles(
+    app: &Router,
+    token: &str,
+    roles: &[String],
+) -> (uuid::Uuid, String) {
+    let username = unique("multi_role_user");
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(token),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "user1234",
+                "roles": roles,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "多角色建号失败: {body}");
+    let id = body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("响应里没有可解析的用户 id: {body}"));
+    (id, username)
+}
+
+/// 多角色建号：`roles` 里的每个角色都必须真的落库
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn creating_a_user_with_several_roles_assigns_all_of_them() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let a = unique("role_a");
+    let b = unique("role_b");
+    let ida = create_role_via_api(&app, &token, &a).await;
+    let idb = create_role_via_api(&app, &token, &b).await;
+
+    let (uid, _) = create_user_with_roles(&app, &token, &[a.clone(), b.clone()]).await;
+
+    let mut expected = vec![a.clone(), b.clone()];
+    expected.sort();
+    assert_eq!(role_names_in_db(uid).await, expected, "两个角色都应落库");
+
+    delete_user_via_api(&app, &token, uid).await;
+    let _ = delete_role(&app, &token, ida).await;
+    let _ = delete_role(&app, &token, idb).await;
+}
+
+/// **核心回归**：整体提交后角色集合不变，且响应把**全部**角色回显出来。
+///
+/// v0.6.0 之前响应里虽有 `roles`，前端却只取 `roles[0]` 填表单、
+/// 再以单数 `role` 整体覆盖提交——用户其余角色被无声删除。
+/// 这条断言正是前端多选框"能正确回填"的前提。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn updating_a_user_round_trips_every_role() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let a = unique("rt_a");
+    let b = unique("rt_b");
+    let c = unique("rt_c");
+    let ida = create_role_via_api(&app, &token, &a).await;
+    let idb = create_role_via_api(&app, &token, &b).await;
+    let idc = create_role_via_api(&app, &token, &c).await;
+
+    let (uid, username) =
+        create_user_with_roles(&app, &token, &[a.clone(), b.clone(), c.clone()]).await;
+
+    // 模拟"管理员打开编辑框、只改了邮箱就保存"：角色原样回传
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{uid}"),
+            Some(&token),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "roles": [a, b, c],
+                "is_active": true,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "多角色整体更新失败: {body}");
+
+    let echoed: Vec<String> = body["data"]["roles"]
+        .as_array()
+        .expect("roles 应为数组")
+        .iter()
+        .map(|v| v.as_str().expect("角色名应为字符串").to_string())
+        .collect();
+    let mut expected = echoed.clone();
+    expected.sort();
+    assert_eq!(
+        role_names_in_db(uid).await,
+        expected,
+        "只改邮箱不应丢掉任何角色"
+    );
+    assert_eq!(
+        echoed.len(),
+        3,
+        "响应必须回显全部 3 个角色，前端多选框要靠它回填: {body}"
+    );
+
+    delete_user_via_api(&app, &token, uid).await;
+    let _ = delete_role(&app, &token, ida).await;
+    let _ = delete_role(&app, &token, idb).await;
+    let _ = delete_role(&app, &token, idc).await;
+}
+
+/// 空角色集合必须被拒，且**不能**留下"角色被清空"的半成品
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_empty_role_list_is_rejected_and_changes_nothing() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let a = unique("empty_a");
+    let ida = create_role_via_api(&app, &token, &a).await;
+    let (uid, _) = create_user_with_roles(&app, &token, std::slice::from_ref(&a)).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{uid}"),
+            Some(&token),
+            Some(json!({
+                "username": unique("empty_user"),
+                "email": format!("{}@example.com", unique("empty_email")),
+                "roles": [],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "空角色集合应被拒: {body}");
+
+    assert_eq!(
+        role_names_in_db(uid).await,
+        vec![a.clone()],
+        "被拒的请求不应动到既有角色（replace 是整体替换语义，最怕清空）"
+    );
+
+    delete_user_via_api(&app, &token, uid).await;
+    let _ = delete_role(&app, &token, ida).await;
+}
+
+/// 角色列表里有一个不存在 → **整体**拒绝，不能"先写合法的那个"
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn one_unknown_role_rejects_the_whole_list() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let a = unique("atomic_a");
+    let ida = create_role_via_api(&app, &token, &a).await;
+    let (uid, _) = create_user_with_roles(&app, &token, &["user".to_string()]).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{uid}"),
+            Some(&token),
+            Some(json!({
+                "username": unique("atomic_user"),
+                "email": format!("{}@example.com", unique("atomic_email")),
+                "roles": [a.clone(), "不存在的角色"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "含未知角色的列表应被整体拒绝: {body}"
+    );
+
+    assert_eq!(
+        role_names_in_db(uid).await,
+        vec!["user".to_string()],
+        "列表中合法的那个角色也不该被写入——要么全成要么全不成"
+    );
+
+    delete_user_via_api(&app, &token, uid).await;
+    let _ = delete_role(&app, &token, ida).await;
+}
+
+/// 重复角色去重：`user_roles` 的唯一约束是 `(user_id, role_id)`
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn duplicate_roles_are_collapsed() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let a = unique("dup_a");
+    let ida = create_role_via_api(&app, &token, &a).await;
+    let (uid, _) = create_user_with_roles(&app, &token, &[a.clone(), a.clone(), a.clone()]).await;
+
+    assert_eq!(
+        role_names_in_db(uid).await,
+        vec![a.clone()],
+        "重复角色应去重"
+    );
+
+    delete_user_via_api(&app, &token, uid).await;
+    let _ = delete_role(&app, &token, ida).await;
+}
+
+/// 兼容：单数 `role` 字段仍然可用，既有客户端不必改
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_legacy_single_role_field_still_assigns_one_role() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let a = unique("legacy_a");
+    let ida = create_role_via_api(&app, &token, &a).await;
+    let username = unique("legacy_user");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&token),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "user1234",
+                "role": a,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "单数 role 字段应仍可用: {body}");
+
+    let uid = body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap();
+    assert_eq!(
+        role_names_in_db(uid).await.len(),
+        1,
+        "单数字段应只赋一个角色"
+    );
+
+    delete_user_via_api(&app, &token, uid).await;
+    let _ = delete_role(&app, &token, ida).await;
+}
+
+/// 授权下界对**多个**角色同时生效：只持 `user:create` 的角色，
+/// 建一个 `roles=[user, admin]` 的账号必须被拒
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn granting_several_roles_at_once_still_hits_the_superset_rule() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    // 只给 user:create —— 能过接口级守卫，但码集远小于 admin
+    let (tok, _role_id, _uid) =
+        operator_with_codes(&app, &admin_tok, "hr", &[permission::USER_CREATE]).await;
+
+    let username = unique("multi_escalate");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "user1234",
+                // 第一个角色无权限码、第二个是 admin：
+                // 逐个校验就能发现越权，不能只校验最后一个或只看有没有 admin
+                "roles": ["user", "admin"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "多角色里藏 admin 同样应被拦: {body}"
+    );
+    assert!(!user_exists(&username).await, "被拒后不应留下半成品用户");
+}
+
 /// 契约测试：每个 `/api/admin/*` handler 都必须声明类型化权限码守卫。
 ///
 /// 防止将来新增管理接口时漏接守卫，从而绕过授权体系。守卫是签名里的提取器参数

@@ -47,12 +47,14 @@
         <n-form-item v-if="!isEditing" label="密码" path="password">
           <n-input v-model:value="formData.password" type="password" />
         </n-form-item>
-        <n-form-item label="角色" path="role">
+        <n-form-item label="角色" path="roles">
           <n-select
-            v-model:value="formData.role"
+            v-model:value="formData.roles"
+            multiple
+            clearable
             :options="roleOptions"
             :disabled="!!rolesUnavailable"
-            :placeholder="rolesUnavailable ? '角色列表不可用' : '请选择角色'"
+            :placeholder="rolesUnavailable ? '角色列表不可用' : '请选择角色（可多选）'"
           />
           <div v-if="rolesUnavailable" style="color: #d03050; font-size: 12px; margin-top: 4px">
             {{ rolesUnavailable }}
@@ -89,9 +91,8 @@ import { roleApi, type RoleItem } from '@/api/role'
 import type { RoleListItem, RoleSelectOption } from '@/utils/role'
 import {
   buildRoleSelectOptions,
-  currentRoleName,
-  DEFAULT_ROLE_NAME,
-  pickDefaultRole,
+  currentRoleNames,
+  pickDefaultRoles,
 } from '@/utils/role'
 
 // ── 状态 ────────────────────────────────────────────────────────
@@ -132,7 +133,8 @@ interface UserForm {
   username: string
   email: string
   password: string
-  role: string
+  /** 权威字段：多角色。v0.6.0 之前是单数 `role`，见后端 UserManageRequest */
+  roles: string[]
   is_active: boolean
 }
 
@@ -140,7 +142,7 @@ const formData = ref<UserForm>({
   username: '',
   email: '',
   password: '',
-  role: DEFAULT_ROLE_NAME,
+  roles: [],
   is_active: true,
 })
 
@@ -155,7 +157,10 @@ const formRules: FormRules = {
     { type: 'email', message: '邮箱格式不正确' },
   ],
   password: [{ min: 6, message: '密码至少 6 个字符', trigger: 'blur' }],
-  role: [{ required: true, message: '请选择角色' }],
+  // 多选：naive-ui 的 `required` 对数组不生效，必须配 `type:'array'` + `min`
+  roles: [
+    { required: true, type: 'array', min: 1, message: '请至少选择一个角色' },
+  ],
 }
 
 // ── 表格列 ──────────────────────────────────────────────────────
@@ -165,13 +170,28 @@ const columns: DataTableColumn[] = [
   { title: '邮箱', key: 'email', width: 200 },
   {
     title: '角色',
-    key: 'role',
-    width: 100,
+    key: 'roles',
+    width: 160,
     render(row: Record<string, unknown>) {
       const r = row as unknown as UserInfo
-      // 显示真实角色集合：r.role 是两值枚举，自定义角色会被塌缩成 "user"
-      const name = currentRoleName(r)
-      return h(NTag, { type: name === ADMIN_ROLE_NAME ? 'warning' : 'info', size: 'small' }, () => name)
+      // 显示**全部**真实角色：r.role 是两值枚举，自定义角色会被塌缩成 "user"，
+      // 且 v0.6.0 之前只渲染 roles[0]，多角色用户看起来就是单角色——
+      // 管理员根本看不出这个人其实还持有别的权限
+      const names = currentRoleNames(r)
+      return h(
+        'div',
+        { style: 'display:flex;gap:4px;flex-wrap:wrap' },
+        names.map((name) =>
+          h(
+            NTag,
+            {
+              type: name === ADMIN_ROLE_NAME ? 'warning' : 'info',
+              size: 'small',
+            },
+            () => name,
+          ),
+        ),
+      )
     },
   },
   {
@@ -246,7 +266,7 @@ async function openCreate() {
     username: '',
     email: '',
     password: '',
-    role: pickDefaultRole(availableRoles.value),
+    roles: pickDefaultRoles(availableRoles.value),
     is_active: true,
   }
   showModal.value = true
@@ -256,16 +276,16 @@ async function openEdit(user: UserInfo) {
   await ensureRolesLoaded()
   isEditing.value = true
   editingId.value = user.id
-  // 必须取真实角色集合，不能用 user.role：后者是非 admin 一律塌缩成 "user"
-  // 的展示枚举，回填它会把自定义角色静默改掉
-  const current = currentRoleName(user)
-  // 带上当前角色：它可能不在列表里（历史遗留的非归一化角色名）
+  // 必须取**全部**真实角色，不能用 user.role：后者是非 admin 一律塌缩成 "user"
+  // 的展示枚举；也不能只取 roles[0]——那会把其余角色静默删掉
+  const current = currentRoleNames(user)
+  // 带上全部当前角色：任一可能不在列表里（历史遗留的非归一化角色名）
   roleOptions.value = buildRoleSelectOptions(availableRoles.value, current)
   formData.value = {
     username: user.username,
     email: user.email,
     password: '',
-    role: current,
+    roles: current,
     is_active: user.is_active,
   }
   showModal.value = true
@@ -280,7 +300,7 @@ async function handleSubmit() {
       await userApi.update(editingId.value, {
         username: formData.value.username,
         email: formData.value.email,
-        role: formData.value.role,
+        roles: formData.value.roles,
         is_active: formData.value.is_active,
       })
       showSuccess('用户更新成功')
@@ -289,7 +309,7 @@ async function handleSubmit() {
         username: formData.value.username,
         email: formData.value.email,
         password: formData.value.password || undefined,
-        role: formData.value.role,
+        roles: formData.value.roles,
       })
       showSuccess('用户创建成功')
     }
