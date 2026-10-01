@@ -187,44 +187,26 @@ impl MenuRepository {
         .map_err(|e| AppError::InternalServerError(format!("更新菜单失败: {e}")))
     }
 
-    /// 删除菜单（级联删除子节点 + role_menus）
+    /// 删除菜单
+    ///
+    /// 子节点与 `role_menus` 的清理**交给数据库外键级联**：
+    /// `menus.parent_id` 与 `role_menus.menu_id` 都声明了 `ON DELETE CASCADE`，
+    /// 单条 DELETE 即原子地删掉整棵子树及其全部角色授权。
+    ///
+    /// 早期实现在这里手写递归删除子节点，且每条语句都用 `.ok()` 吞掉错误：
+    /// 那些语句既多余（外键已经级联），又把真实错误藏了起来。
     pub async fn delete(&self, id: Uuid) -> Result<(), AppError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-        sqlx::query("DELETE FROM role_menus WHERE menu_id = $1")
+        // 不存在的菜单返回 404，而不是"删除成功"——UI 上的删除按钮需要能区分两者
+        let rows = sqlx::query("DELETE FROM menus WHERE id = $1")
             .bind(id)
-            .execute(&mut *tx)
-            .await
-            .ok();
-        // 递归删除子节点
-        let children: Vec<(Uuid,)> = sqlx::query_as("SELECT id FROM menus WHERE parent_id = $1")
-            .bind(id)
-            .fetch_all(&mut *tx)
-            .await
-            .unwrap_or_default();
-        for (cid,) in children {
-            sqlx::query("DELETE FROM role_menus WHERE menu_id = $1")
-                .bind(cid)
-                .execute(&mut *tx)
-                .await
-                .ok();
-            sqlx::query("DELETE FROM menus WHERE id = $1")
-                .bind(cid)
-                .execute(&mut *tx)
-                .await
-                .ok();
-        }
-        sqlx::query("DELETE FROM menus WHERE id = $1")
-            .bind(id)
-            .execute(&mut *tx)
+            .execute(&self.pool)
             .await
             .map_err(|e| AppError::InternalServerError(format!("删除菜单失败: {e}")))?;
-        tx.commit()
-            .await
-            .map_err(|e| AppError::InternalServerError(e.to_string()))
+
+        if rows.rows_affected() == 0 {
+            return Err(AppError::NotFound("菜单不存在".into()));
+        }
+        Ok(())
     }
 
     /// 根据 ID 查询
@@ -240,11 +222,31 @@ impl MenuRepository {
     }
 
     /// 分配角色菜单权限（全量替换）
+    ///
+    /// 全量替换语义：先清空该角色的全部授权，再写入新集合。
+    /// 三步在同一事务内，**任何一步失败都整体回滚**。
+    ///
+    /// 早期实现对 DELETE / INSERT 都用 `.ok()` 吞掉错误却仍然 `commit()`，后果是：
+    /// - 撤销静默失效——取消勾选、保存成功，权限其实还在
+    /// - 传入"合法 + 非法"混合 ID 时静默**部分**授权，却返回"权限分配成功"
+    ///
+    /// 授权写路径必须"要么完整成功、要么整体失败"：半吊子的授权比没有授权更危险，
+    /// 因为管理员会以为撤销已经生效。
     pub async fn assign_role_menus(
         &self,
         role_id: Uuid,
         menu_ids: &[Uuid],
     ) -> Result<(), AppError> {
+        // 角色不存在要给出明确的 404，而不是等外键约束报错
+        let role_exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM roles WHERE id = $1")
+            .bind(role_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("查询角色失败: {e}")))?;
+        if role_exists.is_none() {
+            return Err(AppError::NotFound("角色不存在".into()));
+        }
+
         let mut tx = self
             .pool
             .begin()
@@ -254,17 +256,24 @@ impl MenuRepository {
             .bind(role_id)
             .execute(&mut *tx)
             .await
-            .ok();
-        for mid in menu_ids {
+            .map_err(|e| AppError::InternalServerError(format!("清空角色原有授权失败: {e}")))?;
+
+        if !menu_ids.is_empty() {
+            // 单条 `INSERT ... SELECT unnest` 取代逐条循环：一次往返而非 N 次，
+            // 且任一 ID 非法（外键不存在）会让整条语句失败 → 事务回滚，
+            // 不会留下"只授权了一半"的中间态。
             sqlx::query(
-                "INSERT INTO role_menus (role_id, menu_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                "INSERT INTO role_menus (role_id, menu_id)
+                 SELECT $1, unnest($2::uuid[])
+                 ON CONFLICT DO NOTHING",
             )
             .bind(role_id)
-            .bind(mid)
+            .bind(menu_ids)
             .execute(&mut *tx)
             .await
-            .ok();
+            .map_err(map_menu_fk_error)?;
         }
+
         tx.commit()
             .await
             .map_err(|e| AppError::InternalServerError(e.to_string()))
@@ -281,4 +290,18 @@ fn build_tree(all: Vec<Menu>, parent: Option<Uuid>) -> Vec<MenuNode> {
             node
         })
         .collect()
+}
+
+/// 把菜单授权写入时的数据库错误翻译成可操作的提示
+///
+/// `role_menus.menu_id` 有指向 `menus(id)` 的外键，因此传入不存在的菜单 ID 会触发
+/// `23503`（foreign_key_violation）。这类错误是**调用方的问题**（传错了 ID），
+/// 应返回 400 而不是让人从"服务器内部错误: ..."里猜。
+fn map_menu_fk_error(e: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(db_err) = &e {
+        if db_err.code().as_deref() == Some("23503") {
+            return AppError::BadRequest("提交的菜单 ID 不存在，请刷新后重试".into());
+        }
+    }
+    AppError::InternalServerError(format!("写入角色授权失败: {e}"))
 }

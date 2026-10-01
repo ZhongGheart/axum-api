@@ -10,7 +10,7 @@ use crate::error::AppError;
 use crate::middleware::permission::{
     PermRoleCreate, PermRoleDelete, PermRoleList, PermRoleUpdate, PermUserList, PermUserUpdate,
 };
-use crate::model::ApiResponse;
+use crate::model::{ApiResponse, BUILTIN_ROLES};
 use crate::router::AppState;
 
 /// 角色列表项
@@ -183,16 +183,52 @@ pub async fn delete_role(
     _perm: PermRoleDelete,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    sqlx::query("DELETE FROM user_roles WHERE role_id = $1")
-        .bind(id)
-        .execute(&state.auth_service.user_repo.pool)
+    let mut tx = state
+        .auth_service
+        .user_repo
+        .pool
+        .begin()
         .await
-        .ok();
+        .map_err(|e| AppError::InternalServerError(format!("事务开启失败: {e}")))?;
+
+    // FOR UPDATE：并发删除时先锁住这一行，避免两个请求同时通过下面的校验
+    let name: Option<(String,)> = sqlx::query_as("SELECT name FROM roles WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询角色失败: {e}")))?;
+    let Some((name,)) = name else {
+        return Err(AppError::NotFound("角色不存在".into()));
+    };
+
+    // 内置角色不可删除：角色种子只在 roles 表为空时写入，删掉不会被重建
+    if BUILTIN_ROLES.contains(&name.as_str()) {
+        return Err(AppError::BadRequest(format!("内置角色「{name}」不可删除")));
+    }
+
+    // 仍有用户持有该角色时拒绝删除：user_roles 的 ON DELETE CASCADE 会
+    // 静默剥掉这些用户的角色，让人变成"没有任何角色"的用户而不自知
+    let (user_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM user_roles WHERE role_id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("统计角色用户数失败: {e}")))?;
+    if user_count > 0 {
+        return Err(AppError::BadRequest(format!(
+            "仍有 {user_count} 个用户使用该角色，请先调整这些用户的角色"
+        )));
+    }
+
+    // role_menus 由 role_id 外键的 ON DELETE CASCADE 一并清理，无需手工删除
     sqlx::query("DELETE FROM roles WHERE id = $1")
         .bind(id)
-        .execute(&state.auth_service.user_repo.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| AppError::InternalServerError(format!("删除角色失败: {e}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("事务提交失败: {e}")))?;
     Ok(Json(ApiResponse::success("角色删除成功")))
 }
 

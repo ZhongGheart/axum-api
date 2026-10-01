@@ -17,14 +17,16 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::permission::{PermUserCreate, PermUserDelete, PermUserList, PermUserUpdate};
-use crate::model::{ApiResponse, UserInfo};
+use crate::model::{ApiResponse, UserInfo, ADMIN_ROLE};
 use crate::router::AppState;
 use crate::utils::validation;
 
 /// 允许通过用户表单分配的内置角色
+///
+/// 与 `model::role::BUILTIN_ROLES` 当前取值相同，但**语义不同**：
+/// 那个常量约束"哪些角色不可删除"，这个约束"哪些角色可分配给用户"。
+/// 权限码体系铺开后（后续版本）本白名单会被移除，届时两者取值将分叉。
 const ASSIGNABLE_ROLES: [&str; 2] = ["admin", "user"];
-/// 管理员角色标识
-const ADMIN_ROLE: &str = "admin";
 
 /// 用户列表查询参数
 #[derive(Debug, Deserialize, utoipa::ToSchema)]

@@ -6,6 +6,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// 管理员角色标识
+pub const ADMIN_ROLE: &str = "admin";
+
+/// 内置角色：允许分配给用户，但**不可删除**
+///
+/// `RbacService::init_defaults` 只在 `roles` 表为空时才写入这两个角色。
+/// 一旦删掉且表中仍有其他角色，种子不会重建它们——系统将**永久**失去该角色，
+/// 再也无法把任何用户设为管理员。因此删除接口必须拒绝内置角色。
+pub const BUILTIN_ROLES: [&str; 2] = [ADMIN_ROLE, "user"];
+
 /// 角色表记录实体
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RoleRow {

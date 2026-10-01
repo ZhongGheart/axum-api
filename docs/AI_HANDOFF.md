@@ -175,3 +175,87 @@
   端到端只能交给 CI；本地用 `scripts/test_env.sh`（真实 Postgres + Redis，无 Docker）验证。
 - Chrome 存在；**未安装 Playwright**（全局与 `~/Library/Caches/ms-playwright` 均为空）。
   端到端验证需先解决驱动来源（Chrome CDP 直连或安装 Playwright chromium）。
+
+---
+
+# v0.5.0 — 角色与授权闭环
+
+## 当前目标
+
+**PR-1：让"按角色分配权限码"这件事真正可用。**
+
+v0.4.0 把权限码变成了强制鉴权，但**没有任何一条正常路径能把权限码授给 admin 以外的角色**。
+这是一条四环死链（PR-1 打通前三环，第四环留给 PR-3）：
+
+| 环节 | 位置 | 状态 |
+|---|---|---|
+| 角色管理页只读（63 行表格，无增删改、无授权入口） | `frontend/src/views/system/role/index.vue` | ❌ PR-1 修 |
+| 前端从未调用 `PUT /roles/{id}/menus` | `frontend/src/api/role.ts` | ❌ PR-1 修 |
+| 后端拒绝分配自定义角色（400） | `src/controller/user.rs:25,57-66` `ASSIGNABLE_ROLES` | ⏸ PR-2 |
+| `require_role("admin")` 整体挡住非 admin 角色 | `src/router/mod.rs` 5 处 | ⏸ PR-3 |
+
+## 动手前发现的缺陷（必须先修，否则不能接线 UI）
+
+**授权写路径用 `.ok()` 吞掉所有错误。** `src/repository/menu.rs` 与 `src/controller/role.rs`
+共 6 处 `.ok()`，模式一致：`BEGIN` → 吞错的 DELETE/INSERT → `COMMIT`。
+
+1. **`assign_role_menus`（`src/repository/menu.rs:253-267`）——安全相关。**
+   DELETE 的 `.ok()` 吞错后事务照样提交 → **撤销权限码可能静默失败**
+   （取消勾选 → 保存 → 权限还在）。INSERT 的 `.ok()` 吞错后循环继续 →
+   传入"合法 + 非法"混合 ID 时**静默部分授权**，却返回"权限分配成功"。
+   这个函数实际上永远不会因业务失败而失败。
+2. **`delete_role`（`src/controller/role.rs:186-197`）。** 吞掉 `user_roles` 删除错误；
+   两条语句非事务；**无任何守卫**——可以把 `admin` 角色删掉，
+   或删掉仍被大量用户持有的角色（FK `ON DELETE CASCADE` 会静默让这些用户失去角色）。
+3. **`delete_menu` 递归删除（`src/repository/menu.rs:198-224`）。** 子节点删除吞错 +
+   父节点照样提交 → 留下 `parent_id` 指向已删父节点的孤儿菜单
+   （导航树里不可见的脏数据）。
+
+> 结论：**先修吞错，再接 UI。** 否则"取消勾选后保存"这种最普通的操作会静默失效，
+> 而 UI 会让人以为撤销成功了。
+
+## 当前计划
+
+| 步骤 | 内容 | 状态 |
+|---|---|---|
+| 0 | 建立 `v0.5.0` 分支、记录计划 | ✅ |
+| 1 | 修 `assign_role_menus`：去 `.ok()`，错误上抛，保持单事务 | 🔄 |
+| 2 | 修 `delete_role`：单事务 + 禁止删内置 admin + 报告影响用户数 | ⬜ |
+| 3 | 修 `delete_menu` 递归吞错（同一根因，避免只修一半） | ⬜ |
+| 4 | 后端集成测试：撤销生效 / 非法 ID 报错 / 拒绝删内置角色 | ⬜ |
+| 5 | 前端 `roleApi` 补 create/update/delete/assignMenus | ⬜ |
+| 6 | 角色管理页可写 + 菜单/权限码授权树 | ⬜ |
+| 7 | 新按钮按权限码 gate（`system:role:*`、`system:menu:grant`） | ⬜ |
+| 8 | 前端测试 + 全量回归 | ⬜ |
+| 9 | 文档（CHANGELOG / README / 版本号） | ⬜ |
+
+## 起始 git 状态
+
+- 分支：`v0.5.0`（从 master `2a3443e7` 切出）
+- 工作区：干净
+- v0.4.0 已发布：https://github.com/ZhongGheart/axum-api/releases/tag/v0.4.0
+
+## 关键设计决定
+
+1. **PR-1 不碰安全语义**。`ASSIGNABLE_ROLES` 与 `require_role("admin")` 分属 PR-2/PR-3，
+   本 PR 保持原样——只把"已有后端能力"接上 UI 并修好它的写路径。
+2. **授权写路径要么完整成功、要么整体失败**。半吊子的授权比没有授权更危险，
+   因为用户会以为撤销生效了。
+3. **拒绝删除内置 `admin` 角色**：与既有 `ensure_not_last_admin`（防止最后一名管理员被降级）
+   属同一类保护——防止把系统改造成无人能管理的状态。
+4. 授权树直接用 `GET /api/admin/menus`（`find_tree()` 不做类型过滤，返回含 button 节点），
+   数据已现成，无需新接口。
+
+## 后续版本候选
+
+- `system:monitor:export`、`system:test:access` 后端有码但前端无入口——按"要么接线要么删除"
+  的既有原则二选一，别悬着
+- `api_metrics` 仍在进程内 `Arc<RwLock<HashMap>>`：重启丢失、多副本不聚合
+- `audit_logs` 无保留/清理策略
+- Prettier 未进 CI
+
+## E2E 脚本备忘
+
+上一会话的 `/tmp/e2e-perm.mjs` 用 Node 22 内置 `WebSocket` 直连 Chrome CDP（零依赖）。
+踩过的坑：**模板字符串里的 `\s` 不是正则转义**，会被折叠成字母 `s`，
+要写成 `\\s`；`JSON.stringify` 会把 SQL 换行转义成字面量 `\n`，需先压掉换行。
