@@ -428,6 +428,8 @@ v0.4.0 把权限码变成了强制鉴权，但**没有任何一条正常路径�
 
 #### 后端：角色名成为单一数据源
 
+> 成果 commit：`e20be0ed` feat(role): 拆掉 ASSIGNABLE_ROLES，角色从常量变成数据
+
 - `model/role.rs` 新增 `normalize_role_name`（trim + 小写 + 非空 + ≤50 字符 + 无控制字符）。
   五处写入/取值路径共用它，不允许各处各写一份。
 - 删掉 `controller/user.rs` 的 `ASSIGNABLE_ROLES`；`resolve_role` 改为
