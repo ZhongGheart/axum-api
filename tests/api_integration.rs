@@ -1007,32 +1007,21 @@ async fn deleting_a_role_still_held_by_users_is_refused() {
     let role_name = unique("role_inuse");
     let role_id = create_role_via_api(&app, &token, &role_name).await;
 
-    // 用户表单目前只允许分配内置角色（ASSIGNABLE_ROLES），因此直接写库构造占用
+    // 经用户表单分配该自定义角色（v0.5.0 PR-2 起自定义角色可分配）
     let username = unique("user_inuse");
-    let (status, created) = send(
-        &app,
-        request(
-            "POST",
-            "/api/admin/users",
-            Some(&token),
-            Some(json!({
-                "username": username,
-                "email": format!("{username}@example.com"),
-                "password": "user1234",
-                "role": "user"
-            })),
-        ),
-    )
-    .await;
+    let (status, created) = create_user_via_api(&app, &token, &username, &role_name).await;
     assert_eq!(status, StatusCode::OK, "创建测试用户失败: {created}");
     let user_id = uuid::Uuid::parse_str(created["data"]["id"].as_str().unwrap()).unwrap();
 
-    sqlx::query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)")
-        .bind(user_id)
-        .bind(role_id)
-        .execute(&pool().await)
-        .await
-        .expect("构造角色占用失败");
+    // 该用户确实持有这个自定义角色（否则"被占用"的前提不成立）
+    let held: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM user_roles WHERE user_id = $1 AND role_id = $2")
+            .bind(user_id)
+            .bind(role_id)
+            .fetch_one(&pool().await)
+            .await
+            .expect("查询角色占用失败");
+    assert_eq!(held.0, 1, "测试前提：用户应持有该自定义角色");
 
     let (status, body) = delete_role(&app, &token, role_id).await;
     assert_eq!(
@@ -1317,6 +1306,477 @@ async fn role_menu_query_keeps_grants_whose_ancestors_are_not_granted() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "清理临时目录失败");
+}
+
+// ──────────────────────────────────────────────
+// 角色即数据：自定义角色可分配（v0.5.0 PR-2 拆掉 ASSIGNABLE_ROLES）
+// ──────────────────────────────────────────────
+
+/// 建用户请求（角色可任意指定，由被测用例决定）
+fn user_payload(username: &str, role: &str) -> Value {
+    json!({
+        "username": username,
+        "email": format!("{username}@example.com"),
+        "password": "user1234",
+        "role": role,
+    })
+}
+
+async fn create_user_via_api(
+    app: &Router,
+    token: &str,
+    username: &str,
+    role: &str,
+) -> (StatusCode, Value) {
+    send(
+        app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(token),
+            Some(user_payload(username, role)),
+        ),
+    )
+    .await
+}
+
+async fn user_exists(username: &str) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)")
+        .bind(username)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询用户失败")
+}
+
+async fn email_in_db(username: &str) -> String {
+    sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE username = $1")
+        .bind(username)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询用户失败")
+}
+
+async fn update_role_via_api(
+    app: &Router,
+    token: &str,
+    role_id: uuid::Uuid,
+    name: &str,
+) -> (StatusCode, Value) {
+    send(
+        app,
+        request(
+            "PUT",
+            &format!("/api/admin/roles/{role_id}"),
+            Some(token),
+            Some(json!({ "name": name, "description": "PR-2 测试" })),
+        ),
+    )
+    .await
+}
+
+async fn role_name_in_db(role_id: uuid::Uuid) -> String {
+    sqlx::query_scalar::<_, String>("SELECT name FROM roles WHERE id = $1")
+        .bind(role_id)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询角色名失败")
+}
+
+/// PR-2 的核心：角色是数据，新建一个角色立刻就能通过用户表单分配。
+/// 拆白名单之前这里是 400，自定义角色永远建不出可用的人。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn custom_role_can_be_assigned_to_a_new_user() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_name = unique("auditor");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+
+    let username = unique("user_auditor");
+    let (status, body) = create_user_via_api(&app, &token, &username, &role_name).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "自定义角色应可分配给新建用户: {body}"
+    );
+    // 注意：`UserInfo.role` 是只有 admin/user 两值的展示用枚举，
+    // 自定义角色在这里一律塌缩成 "user"。真正的角色集合在 `roles`。
+    assert_eq!(
+        body["data"]["roles"][0].as_str(),
+        Some(role_name.as_str()),
+        "响应里的角色集合应是自定义角色: {body}"
+    );
+
+    // 角色关系确实落库（不只是响应里好看）
+    let user_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{user_id}/roles"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let roles: Vec<&str> = body["data"]
+        .as_array()
+        .expect("data 应为数组")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(roles, vec![role_name.as_str()], "{body}");
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 改一个已有用户的角色同样要接受自定义角色（用户表单的 update 路径）。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn custom_role_can_be_assigned_when_updating_a_user() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_name = unique("operator");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+
+    let username = unique("user_promote");
+    let (status, body) = create_user_via_api(&app, &token, &username, "user").await;
+    assert_eq!(status, StatusCode::OK, "创建测试用户失败: {body}");
+    let user_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{user_id}"),
+            Some(&token),
+            Some(user_payload(&username, &role_name)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "更新用户时应接受自定义角色: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{user_id}/roles"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let roles: Vec<&str> = body["data"]
+        .as_array()
+        .expect("data 应为数组")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(roles, vec![role_name.as_str()], "{body}");
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 不存在的角色必须被拒绝，**且不能留下半成品用户**。
+///
+/// `create_user` 先建用户行、再调 `replace_user_roles` 校验角色，两者不在同一事务。
+/// 拆掉白名单后这条路径才真正可达：校验若放在写入之后，就会返回一个 400
+/// 同时在库里留下一个"没有任何角色"的用户。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn unknown_role_is_rejected_without_leaving_a_half_created_user() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let username = unique("user_ghost");
+
+    let (status, body) = create_user_via_api(&app, &token, &username, "ghost_role").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "不存在的角色应返回 400: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ghost_role"),
+        "错误信息应带上实际角色名: {body}"
+    );
+    assert!(
+        !user_exists(&username).await,
+        "请求已失败，用户行不得落库（否则库里多出一个没有任何角色的用户）"
+    );
+}
+
+/// 更新路径同理：角色非法时基础字段也不能被改掉。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn updating_with_unknown_role_changes_nothing() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let username = unique("user_ghost2");
+    let (status, body) = create_user_via_api(&app, &token, &username, "user").await;
+    assert_eq!(status, StatusCode::OK, "创建测试用户失败: {body}");
+    let user_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+    let original_email = email_in_db(&username).await;
+
+    // 故意把邮箱换掉：若角色校验发生在写入之后，这个邮箱就会真的被改掉
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{user_id}"),
+            Some(&token),
+            Some(json!({
+                "username": username,
+                "email": format!("changed-{username}@example.com"),
+                "password": "user1234",
+                "role": "ghost_role",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    assert_eq!(
+        email_in_db(&username).await,
+        original_email,
+        "角色校验失败时不得留下已改过邮箱的半成品: {body}"
+    );
+}
+
+/// 角色名在写入时就归一化，撞名返回 409 而不是 500。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn role_names_are_normalized_on_write_and_conflicts_return_409() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let suffix = unique("n").to_uppercase();
+    let noisy = format!("  MiXeD_{suffix}  ");
+    let canonical = format!("mixed_{}", suffix.to_lowercase());
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/roles",
+            Some(&token),
+            Some(json!({ "name": noisy, "description": "PR-2" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建角色失败: {body}");
+    assert_eq!(
+        body["data"]["name"].as_str(),
+        Some(canonical.as_str()),
+        "角色名应在写入时归一化（trim + 小写）: {body}"
+    );
+    let role_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    // 归一化后同名 → 409（不是 500）。这里必须真的撞上同一个名字：
+    // 建的是 "mixed_<suffix>"，所以第二个名字也得带 MIXED_ 前缀。
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/roles",
+            Some(&token),
+            Some(json!({ "name": format!("MIXED_{}", suffix.to_lowercase()), "description": "PR-2" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "归一化后同名应返回 409: {body}"
+    );
+
+    // 非法名字是 400，不是 500
+    for bad in ["   ", "tab\there", &"a".repeat(51)] {
+        let (status, body) = send(
+            &app,
+            request(
+                "POST",
+                "/api/admin/roles",
+                Some(&token),
+                Some(json!({ "name": bad, "description": "PR-2" })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "非法角色名 {bad:?} 应返回 400: {body}"
+        );
+    }
+
+    // 中间有空格的角色名是合法的（存量库里有这种角色），不能误伤
+    let spaced = unique("senior auditor");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/roles",
+            Some(&token),
+            Some(json!({ "name": spaced, "description": "PR-2" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "中间有空格的角色名应被接受: {body}");
+    assert_eq!(body["data"]["name"].as_str(), Some(spaced.as_str()));
+    let spaced_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+    let _ = delete_role(&app, &token, spaced_id).await;
+
+    // 归一化后的名字可直接用于分配用户
+    let username = unique("user_mixed");
+    let (status, body) = create_user_via_api(&app, &token, &username, &noisy).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "表单传带空格大写的角色名也应命中归一化后的角色: {body}"
+    );
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 内置角色不可改名，也不能把自定义角色改名成内置角色名。
+///
+/// 与「内置角色不可删除」同源：`ADMIN_ROLE = "admin"` 是最后一名管理员保护
+/// （`count_users_with_role`）和权限码种子（`WHERE r.name='admin'`）的查找依据，
+/// 一旦改名这些依据全部落空，系统会变成"没人是管理员"。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn builtin_roles_cannot_be_renamed_or_impersonated() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    // 内置角色改名（含改成自身的小写形式）
+    for name in ["admin", "user"] {
+        let id = role_id_by_name(name).await;
+        for new_name in ["superadmin", &name.to_uppercase()] {
+            let (status, body) = update_role_via_api(&app, &token, id, new_name).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "内置角色 {name} 不应可改名为 {new_name}: {body}"
+            );
+        }
+        assert_eq!(
+            role_name_in_db(id).await,
+            name,
+            "内置角色 {name} 的名字不得被改动"
+        );
+    }
+
+    // 自定义角色改名成内置角色名也要拒绝
+    let role_id = create_role_via_api(&app, &token, &unique("impostor")).await;
+    for builtin in ["admin", "user"] {
+        let (status, body) = update_role_via_api(&app, &token, role_id, builtin).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "不应能改名成内置角色名 {builtin}: {body}"
+        );
+    }
+
+    // 不存在的角色 → 404
+    let (status, body) =
+        update_role_via_api(&app, &token, uuid::Uuid::new_v4(), &unique("ghost_role")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 更新角色返回**真实行**，不是编造的 created_at / user_count。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn updating_a_role_returns_the_real_row() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_name = unique("counted");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+
+    let username = unique("user_counted");
+    let (status, body) = create_user_via_api(&app, &token, &username, &role_name).await;
+    assert_eq!(status, StatusCode::OK, "创建测试用户失败: {body}");
+
+    let (status, updated) = update_role_via_api(&app, &token, role_id, &role_name).await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(
+        updated["data"]["user_count"].as_i64(),
+        Some(1),
+        "该角色有 1 个用户，回读不该编造 user_count=0: {updated}"
+    );
+
+    // created_at 必须是数据库里的原值，而不是"刚刚"
+    let (status, list) = send(&app, request("GET", "/api/admin/roles", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let from_list = list["data"]
+        .as_array()
+        .expect("data 应为数组")
+        .iter()
+        .find(|r| r["id"].as_str() == Some(&role_id.to_string()))
+        .expect("角色列表里应找得到刚更新的角色");
+    assert_eq!(
+        updated["data"]["created_at"].as_str(),
+        from_list["created_at"].as_str(),
+        "更新响应的 created_at 应等于库里的值，不能是 now(): {updated}"
+    );
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// `POST /users/:id/roles` 与用户表单走同一套归一化。
+///
+/// 否则同一个角色经表单提交 "admin" 成功、经本接口提交 "Admin" 却 404。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn append_role_endpoint_normalizes_the_role_name() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_name = unique("appendable");
+    let _role_id = create_role_via_api(&app, &token, &role_name).await;
+
+    let username = unique("user_append");
+    let (status, body) = create_user_via_api(&app, &token, &username, "user").await;
+    assert_eq!(status, StatusCode::OK, "创建测试用户失败: {body}");
+    let user_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{user_id}/roles"),
+            Some(&token),
+            Some(json!({ "user_id": user_id, "role_name": format!("  {}  ", role_name.to_uppercase()) })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "追加角色应先归一化再查库: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{user_id}/roles"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut roles: Vec<String> = body["data"]
+        .as_array()
+        .expect("data 应为数组")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    roles.sort();
+    let mut expected = vec!["user".to_string(), role_name.clone()];
+    expected.sort();
+    assert_eq!(roles, expected, "{body}");
 }
 
 /// 契约测试：每个 `/api/admin/*` handler 都必须声明类型化权限码守卫。

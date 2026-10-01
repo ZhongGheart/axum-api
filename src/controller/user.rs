@@ -17,16 +17,9 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::permission::{PermUserCreate, PermUserDelete, PermUserList, PermUserUpdate};
-use crate::model::{ApiResponse, UserInfo, ADMIN_ROLE};
+use crate::model::{normalize_role_name, ApiResponse, UserInfo, ADMIN_ROLE};
 use crate::router::AppState;
 use crate::utils::validation;
-
-/// 允许通过用户表单分配的内置角色
-///
-/// 与 `model::role::BUILTIN_ROLES` 当前取值相同，但**语义不同**：
-/// 那个常量约束"哪些角色不可删除"，这个约束"哪些角色可分配给用户"。
-/// 权限码体系铺开后（后续版本）本白名单会被移除，届时两者取值将分叉。
-const ASSIGNABLE_ROLES: [&str; 2] = ["admin", "user"];
 
 /// 用户列表查询参数
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -55,16 +48,22 @@ pub struct UserListResponse {
     pub total_pages: i64,
 }
 
-/// 校验并归一化表单角色名
-fn normalize_role(role: &str) -> Result<String, AppError> {
-    let role = role.trim().to_lowercase();
-    if !ASSIGNABLE_ROLES.contains(&role.as_str()) {
-        return Err(AppError::BadRequest(format!(
-            "角色必须是 {} 之一",
-            ASSIGNABLE_ROLES.join(" / ")
-        )));
+/// 校验并归一化表单角色名（v0.5.0 PR-2 起不再有可分配角色白名单）
+///
+/// 判定"可分配"的依据是**该角色在 `roles` 表里真实存在**，而不是某个常量。
+/// 因此 `roles` 表新增一个角色，用户表单立刻就能分配它，无需再改代码。
+async fn resolve_role(state: &AppState, raw: &str) -> Result<String, AppError> {
+    let name = normalize_role_name(raw)?;
+    if state
+        .auth_service
+        .role_repo
+        .find_by_name(&name)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::BadRequest(format!("角色「{name}」不存在")));
     }
-    Ok(role)
+    Ok(name)
 }
 
 /// 批量构建 user_id → 角色列表 映射（避免列表页 N+1 查询）
@@ -185,7 +184,9 @@ pub async fn create_user(
 
     validation::validate_username(&req.username)?;
     validation::validate_email(&req.email)?;
-    let role = normalize_role(&req.role)?;
+    // 角色存在性校验必须在写用户之前：仓库层的校验在 replace_user_roles 里，
+    // 那时用户行已经落库且两者不在同一事务，失败会留下"没有任何角色的用户"
+    let role = resolve_role(&state, &req.role).await?;
 
     let password = req.password.as_deref().unwrap_or("password123");
     validation::validate_password(password)?;
@@ -251,7 +252,7 @@ pub async fn update_user(
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     validation::validate_username(&req.username)?;
     validation::validate_email(&req.email)?;
-    let role = normalize_role(&req.role)?;
+    let role = resolve_role(&state, &req.role).await?;
 
     let current_roles = state
         .auth_service
