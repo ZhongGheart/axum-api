@@ -25,7 +25,8 @@ export const userApi = {
     username: string
     email: string
     password?: string
-    role: string
+    /** 多角色。v0.6.0 起为权威字段（后端另有单数 `role` 兼容别名） */
+    roles: string[]
     is_active?: boolean
   }) {
     return http.post<UserInfo>('/admin/users', data)
@@ -37,7 +38,7 @@ export const userApi = {
     data: {
       username: string
       email: string
-      role: string
+      roles: string[]
       is_active?: boolean
     },
   ) {

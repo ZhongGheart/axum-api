@@ -36,7 +36,19 @@ pub struct UserManageRequest {
     pub username: String,
     pub email: String,
     pub password: Option<String>,
-    pub role: String,
+    /// 单角色兼容字段（v0.6.0 起 deprecated）
+    ///
+    /// 保留是为了不破坏既有客户端；新代码请用 [`Self::roles`]。
+    /// 两者都给时以 `roles` 为准。
+    #[deprecated(note = "角色是多值的，请改用 roles")]
+    pub role: Option<String>,
+    /// 权威字段：该用户应持有的**全部**角色
+    ///
+    /// v0.6.0 之前只有单数的 `role`，而数据模型（`user_roles` 表与
+    /// `UserInfo.roles`）一直是多角色的：单数字段提交上来会被
+    /// `replace_user_roles` **整体替换**成那一个角色，
+    /// 用户原有的其余角色被无声删除。
+    pub roles: Option<Vec<String>>,
     pub is_active: Option<bool>,
 }
 
@@ -50,22 +62,60 @@ pub struct UserListResponse {
     pub total_pages: i64,
 }
 
-/// 校验并归一化表单角色名（v0.5.0 PR-2 起不再有可分配角色白名单）
+/// 校验并归一化表单提交的角色集合
 ///
 /// 判定"可分配"的依据是**该角色在 `roles` 表里真实存在**，而不是某个常量。
 /// 因此 `roles` 表新增一个角色，用户表单立刻就能分配它，无需再改代码。
-async fn resolve_role(state: &AppState, raw: &str) -> Result<String, AppError> {
-    let name = normalize_role_name(raw)?;
-    if state
-        .auth_service
-        .role_repo
-        .find_by_name(&name)
-        .await?
-        .is_none()
-    {
-        return Err(AppError::BadRequest(format!("角色「{name}」不存在")));
+///
+/// v0.6.0：单角色 → 多角色。三个要点：
+///
+/// - **去重但保持顺序**：表单多选可能重复提交同一角色，
+///   `user_roles` 的唯一约束是 `(user_id, role_id)`，重复项会被
+///   `ON CONFLICT DO NOTHING` 静默吞掉——留着无害但没必要
+/// - **要求非空**：零角色的用户登录后没有任何权限码、侧栏也是空的，
+///   属于"建得出、没人能用"的死数据。与 v0.5.0 PR-1 修的半成品用户
+///   同类，不该由接口放行
+/// - **先全部校验再写**：任一角色不存在即整体拒绝，
+///   不留下"部分角色已写入"的中间态
+async fn resolve_roles(state: &AppState, raw: &[String]) -> Result<Vec<String>, AppError> {
+    let mut resolved: Vec<String> = Vec::with_capacity(raw.len());
+    for item in raw {
+        let name = normalize_role_name(item)?;
+        if state
+            .auth_service
+            .role_repo
+            .find_by_name(&name)
+            .await?
+            .is_none()
+        {
+            return Err(AppError::BadRequest(format!("角色「{name}」不存在")));
+        }
+        if !resolved.contains(&name) {
+            resolved.push(name);
+        }
     }
-    Ok(name)
+
+    if resolved.is_empty() {
+        return Err(AppError::BadRequest(
+            "至少需要指定一个角色：没有角色的用户登录后没有任何权限".to_string(),
+        ));
+    }
+
+    Ok(resolved)
+}
+
+/// 从请求体取出权威的角色集合
+///
+/// `roles` 优先；没给才回退到单数的兼容字段 `role`。
+/// 两者都没给返回空切片，交给 [`resolve_roles`] 报"至少一个角色"，
+/// 而不是在这里另写一套错误文案。
+#[allow(deprecated)]
+fn requested_roles(req: &UserManageRequest) -> Vec<String> {
+    match (&req.roles, &req.role) {
+        (Some(roles), _) => roles.clone(),
+        (None, Some(role)) => vec![role.clone()],
+        (None, None) => Vec::new(),
+    }
 }
 
 /// 批量构建 user_id → 角色列表 映射（避免列表页 N+1 查询）
@@ -188,15 +238,15 @@ pub async fn create_user(
     validation::validate_email(&req.email)?;
     // 角色存在性校验必须在写用户之前：仓库层的校验在 replace_user_roles 里，
     // 那时用户行已经落库且两者不在同一事务，失败会留下"没有任何角色的用户"
-    let role = resolve_role(&state, &req.role).await?;
+    let roles = resolve_roles(&state, &requested_roles(&req)).await?;
     // 授权下界（v0.5.0 PR-3）：能创建用户 ≠ 能创建管理员。
     // 闸门撤掉后 `system:user:create` 只说明"可以建号"，建出来的号带什么角色
     // 仍要按"你只能授予自己已持有的权限码"判定。
     ensure_can_grant_roles(
         &state,
         perm.guard(),
-        std::slice::from_ref(&role),
-        &format!("创建用户并赋予角色「{role}」"),
+        &roles,
+        &format!("创建用户并赋予角色 {}", roles.join("、")),
     )
     .await?;
 
@@ -232,15 +282,18 @@ pub async fn create_user(
         .await?;
 
     // 角色写入 user_roles（唯一数据源），事务内完成
-    let assigned = vec![role.clone()];
     state
         .auth_service
         .role_repo
-        .replace_user_roles(user.id, &assigned)
+        .replace_user_roles(user.id, &roles)
         .await?;
 
-    tracing::info!("管理员创建用户: {} (角色: {role})", user.username);
-    Ok(Json(ApiResponse::success(UserInfo::new(user, assigned))))
+    tracing::info!(
+        "管理员创建用户: {} (角色: {})",
+        user.username,
+        roles.join("、")
+    );
+    Ok(Json(ApiResponse::success(UserInfo::new(user, roles))))
 }
 
 /// PUT /api/admin/users/:id — 更新用户（含主角色）
@@ -264,7 +317,7 @@ pub async fn update_user(
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     validation::validate_username(&req.username)?;
     validation::validate_email(&req.email)?;
-    let role = resolve_role(&state, &req.role).await?;
+    let new_roles = resolve_roles(&state, &requested_roles(&req)).await?;
 
     let current_roles = state
         .auth_service
@@ -280,12 +333,10 @@ pub async fn update_user(
     ensure_can_grant_roles(
         &state,
         perm.guard(),
-        std::slice::from_ref(&role),
-        &format!("赋予角色「{role}」"),
+        &new_roles,
+        &format!("赋予角色 {}", new_roles.join("、")),
     )
     .await?;
-
-    let new_roles = vec![role.clone()];
 
     // 先做守卫，避免"基础字段已更新但角色变更被拒绝"的半成品状态
     ensure_not_last_admin(&state, &current_roles, &new_roles).await?;
@@ -309,7 +360,11 @@ pub async fn update_user(
             .await?;
     }
 
-    tracing::info!("管理员更新用户: {} (角色: {role})", updated.username);
+    tracing::info!(
+        "管理员更新用户: {} (角色: {})",
+        updated.username,
+        new_roles.join("、")
+    );
     Ok(Json(ApiResponse::success(UserInfo::new(
         updated, new_roles,
     ))))
