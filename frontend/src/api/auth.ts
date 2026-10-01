@@ -32,4 +32,9 @@ export const authApi = {
   logout() {
     return http.post<null>('/auth/logout')
   },
+
+  /** GET /api/auth/permissions — 当前用户的权限码（与后端 PermissionGuard 同源） */
+  myPermissions() {
+    return http.get<string[]>('/auth/permissions')
+  },
 }

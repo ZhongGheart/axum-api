@@ -5,8 +5,8 @@
 use axum::{extract::State, Json};
 
 use crate::error::AppError;
-use crate::middleware::auth::{AuthenticatedUser, PermissionGuard};
-use crate::model::permission;
+use crate::middleware::auth::AuthenticatedUser;
+use crate::middleware::permission::PermTestAccess;
 use crate::model::ApiResponse;
 use crate::router::AppState;
 
@@ -21,12 +21,10 @@ use crate::router::AppState;
     responses((status = 200, description = "管理员权限校验通过", body = ApiResponse<String>))
 )]
 pub async fn admin_test(
-    perm: PermissionGuard,
+    _perm: PermTestAccess,
     _state: State<AppState>,
     auth_user: AuthenticatedUser,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
-    perm.require(permission::TEST_ACCESS)?;
-
     let msg = format!(
         "管理员访问成功！用户: {}, 角色: {:?}",
         auth_user.user_id, auth_user.roles

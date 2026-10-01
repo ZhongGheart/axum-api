@@ -8,33 +8,26 @@
 /**
  * 权限按钮组件
  *
- * 包装 Naive UI n-button，根据角色自动显隐。
+ * 包装 Naive UI n-button，根据**权限码**自动显隐。
  * 无权限时 DOM 彻底移除（v-if），非 disabled。
  *
  * 使用方式：
- *   <PermissionButton permission="admin" type="primary">新建用户</PermissionButton>
- *   <PermissionButton :permission="['admin']" size="small" @click="fn">编辑</PermissionButton>
+ *   <PermissionButton permission="system:user:create" type="primary">新建用户</PermissionButton>
+ *   <PermissionButton permission="system:user:update" size="small" @click="fn">编辑</PermissionButton>
  */
 import { computed } from 'vue'
 import { NButton } from 'naive-ui'
-import { useUserStore } from '@/stores/user'
+import { usePermissionsStore } from '@/stores/permissions'
 
 const props = withDefaults(
   defineProps<{
-    /** 需要的权限角色 */
+    /** 需要的权限码（任一命中即显示） */
     permission: string | string[]
   }>(),
   {},
 )
 
-const userStore = useUserStore()
+const permissionsStore = usePermissionsStore()
 
-const hasPermission = computed(() => {
-  if (!userStore.userInfo) return false
-  const userRoles = (userStore.userInfo as unknown as { roles?: string[] }).roles || [
-    (userStore.userInfo as unknown as { role: string }).role,
-  ]
-  const required = Array.isArray(props.permission) ? props.permission : [props.permission]
-  return required.some((r: string) => userRoles.includes(r))
-})
+const hasPermission = computed(() => permissionsStore.hasAny(props.permission))
 </script>

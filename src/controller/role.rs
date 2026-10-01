@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::middleware::auth::PermissionGuard;
-use crate::model::permission;
+use crate::middleware::permission::{
+    PermRoleCreate, PermRoleDelete, PermRoleList, PermRoleUpdate, PermUserList, PermUserUpdate,
+};
 use crate::model::ApiResponse;
 use crate::router::AppState;
 
@@ -40,10 +41,8 @@ pub struct AssignRoleRequest {
 )]
 pub async fn list_roles(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermRoleList,
 ) -> Result<Json<ApiResponse<Vec<RoleItem>>>, AppError> {
-    perm.require(permission::ROLE_LIST)?;
-
     let rows = state.auth_service.role_repo.list_all().await?;
     let items: Vec<RoleItem> = rows
         .into_iter()
@@ -69,11 +68,9 @@ pub async fn list_roles(
 )]
 pub async fn get_user_roles(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermUserList,
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, AppError> {
-    perm.require(permission::USER_LIST)?;
-
     let roles = state
         .auth_service
         .role_repo
@@ -97,12 +94,10 @@ pub async fn get_user_roles(
 )]
 pub async fn assign_user_role(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermUserUpdate,
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
     Json(req): Json<AssignRoleRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::USER_UPDATE)?;
-
     state
         .auth_service
         .role_repo
@@ -122,11 +117,9 @@ pub async fn assign_user_role(
 )]
 pub async fn create_role(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermRoleCreate,
     Json(req): Json<CreateRoleReq>,
 ) -> Result<Json<ApiResponse<RoleItem>>, AppError> {
-    perm.require(permission::ROLE_CREATE)?;
-
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO roles (id, name, description) VALUES ($1, $2, $3)")
         .bind(id)
@@ -156,12 +149,10 @@ pub async fn create_role(
 )]
 pub async fn update_role(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermRoleUpdate,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     Json(req): Json<CreateRoleReq>,
 ) -> Result<Json<ApiResponse<RoleItem>>, AppError> {
-    perm.require(permission::ROLE_UPDATE)?;
-
     sqlx::query("UPDATE roles SET name = $1, description = $2 WHERE id = $3")
         .bind(&req.name)
         .bind(&req.description)
@@ -189,11 +180,9 @@ pub async fn update_role(
 )]
 pub async fn delete_role(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermRoleDelete,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::ROLE_DELETE)?;
-
     sqlx::query("DELETE FROM user_roles WHERE role_id = $1")
         .bind(id)
         .execute(&state.auth_service.user_repo.pool)

@@ -15,8 +15,8 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::middleware::auth::{AuthenticatedUser, PermissionGuard};
-use crate::model::permission;
+use crate::middleware::auth::AuthenticatedUser;
+use crate::middleware::permission::{PermUserCreate, PermUserDelete, PermUserList, PermUserUpdate};
 use crate::model::{ApiResponse, UserInfo};
 use crate::router::AppState;
 use crate::utils::validation;
@@ -125,11 +125,9 @@ fn same_role_set(a: &[String], b: &[String]) -> bool {
 )]
 pub async fn list_users(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermUserList,
     Query(params): Query<UserListParams>,
 ) -> Result<Json<ApiResponse<UserListResponse>>, AppError> {
-    perm.require(permission::USER_LIST)?;
-
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(10);
     validation::validate_page(page, page_size)?;
@@ -178,11 +176,9 @@ pub async fn list_users(
 )]
 pub async fn create_user(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermUserCreate,
     Json(req): Json<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
-    perm.require(permission::USER_CREATE)?;
-
     use crate::utils::password::hash_password;
 
     validation::validate_username(&req.username)?;
@@ -247,12 +243,10 @@ pub async fn create_user(
 )]
 pub async fn update_user(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermUserUpdate,
     Path(id): Path<Uuid>,
     Json(req): Json<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
-    perm.require(permission::USER_UPDATE)?;
-
     validation::validate_username(&req.username)?;
     validation::validate_email(&req.email)?;
     let role = normalize_role(&req.role)?;
@@ -306,12 +300,10 @@ pub async fn update_user(
 )]
 pub async fn delete_user(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermUserDelete,
     auth_user: AuthenticatedUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::USER_DELETE)?;
-
     if id == auth_user.user_id {
         return Err(AppError::BadRequest("不能删除当前登录账号".to_string()));
     }
@@ -349,12 +341,10 @@ pub async fn delete_user(
 )]
 pub async fn batch_delete_users(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermUserDelete,
     auth_user: AuthenticatedUser,
     Json(req): Json<BatchDeleteRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::USER_DELETE)?;
-
     if req.ids.is_empty() {
         return Err(AppError::BadRequest("请至少选择一个用户".to_string()));
     }
@@ -421,13 +411,11 @@ pub struct BatchDeleteRequest {
 )]
 pub async fn toggle_user_status(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermUserUpdate,
     auth_user: AuthenticatedUser,
     Path(id): Path<Uuid>,
     Json(req): Json<ToggleStatusRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
-    perm.require(permission::USER_UPDATE)?;
-
     if id == auth_user.user_id && !req.is_active {
         return Err(AppError::BadRequest("不能停用当前登录账号".to_string()));
     }
@@ -475,12 +463,10 @@ pub struct ToggleStatusRequest {
 )]
 pub async fn reset_user_password(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermUserUpdate,
     Path(id): Path<Uuid>,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::USER_UPDATE)?;
-
     use crate::utils::password::hash_password;
 
     // 先确认用户存在（不存在则 404），再校验新口令

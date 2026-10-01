@@ -2,7 +2,7 @@
   <div class="page-container">
     <n-page-header title="系统日志" subtitle="操作记录查询与导出">
       <template #extra>
-        <n-button @click="handleExport">导出 Excel</n-button>
+        <n-button v-permission="PERM.LOG_EXPORT" @click="handleExport">导出 Excel</n-button>
       </template>
     </n-page-header>
 
@@ -36,6 +36,7 @@ import { auditApi } from '@/api/audit'
 import type { AuditLogItem } from '@/api/audit'
 import { showSuccess, showError } from '@/utils/message'
 import { getToken } from '@/utils/storage'
+import { PERM } from '@/constants/permission'
 
 const loading = ref(false)
 const logList = ref<AuditLogItem[]>([])

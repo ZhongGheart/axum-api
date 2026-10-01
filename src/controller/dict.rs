@@ -7,8 +7,9 @@ use axum::{
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::middleware::auth::PermissionGuard;
-use crate::model::permission;
+use crate::middleware::permission::{
+    PermDictCreate, PermDictDelete, PermDictList, PermDictRefresh, PermDictUpdate,
+};
 use crate::model::{
     ApiResponse, CreateDictItemRequest, CreateDictTypeRequest, DictItem, DictItemResponse,
     DictType, DictTypeWithItems,
@@ -25,10 +26,8 @@ use crate::router::AppState;
 )]
 pub async fn list_types(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermDictList,
 ) -> Result<Json<ApiResponse<Vec<DictType>>>, AppError> {
-    perm.require(permission::DICT_LIST)?;
-
     let types = state.dict_repo.list_types().await?;
     Ok(Json(ApiResponse::success(types)))
 }
@@ -44,11 +43,9 @@ pub async fn list_types(
 )]
 pub async fn create_type(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermDictCreate,
     Json(req): Json<CreateDictTypeRequest>,
 ) -> Result<Json<ApiResponse<DictType>>, AppError> {
-    perm.require(permission::DICT_CREATE)?;
-
     let t = DictType {
         id: Uuid::new_v4(),
         code: req.code,
@@ -75,12 +72,10 @@ pub async fn create_type(
 )]
 pub async fn update_type(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermDictUpdate,
     Path(id): Path<Uuid>,
     Json(req): Json<CreateDictTypeRequest>,
 ) -> Result<Json<ApiResponse<DictType>>, AppError> {
-    perm.require(permission::DICT_UPDATE)?;
-
     let saved = state.dict_repo.update_type(id, &req).await?;
     Ok(Json(ApiResponse::success(saved)))
 }
@@ -96,11 +91,9 @@ pub async fn update_type(
 )]
 pub async fn delete_type(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermDictDelete,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::DICT_DELETE)?;
-
     state.dict_repo.delete_type(id).await?;
     Ok(Json(ApiResponse::success("删除成功")))
 }
@@ -135,11 +128,9 @@ pub async fn get_items_by_code(
 )]
 pub async fn list_items(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermDictList,
     axum::extract::Query(params): axum::extract::Query<DictItemQuery>,
 ) -> Result<Json<ApiResponse<Vec<DictItem>>>, AppError> {
-    perm.require(permission::DICT_LIST)?;
-
     let items = state.dict_repo.list_items(params.dict_type_id).await?;
     Ok(Json(ApiResponse::success(items)))
 }
@@ -160,11 +151,9 @@ pub struct DictItemQuery {
 )]
 pub async fn create_item(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermDictCreate,
     Json(req): Json<CreateDictItemRequest>,
 ) -> Result<Json<ApiResponse<DictItem>>, AppError> {
-    perm.require(permission::DICT_CREATE)?;
-
     let type_id = req
         .dict_type_id
         .ok_or(AppError::BadRequest("缺少 dict_type_id".into()))?;
@@ -196,12 +185,10 @@ pub async fn create_item(
 )]
 pub async fn update_item(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermDictUpdate,
     Path(id): Path<Uuid>,
     Json(req): Json<CreateDictItemRequest>,
 ) -> Result<Json<ApiResponse<DictItem>>, AppError> {
-    perm.require(permission::DICT_UPDATE)?;
-
     let saved = state.dict_repo.update_item(id, &req).await?;
     Ok(Json(ApiResponse::success(saved)))
 }
@@ -220,11 +207,9 @@ pub async fn update_item(
 )]
 pub async fn delete_item(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermDictDelete,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::DICT_DELETE)?;
-
     state.dict_repo.delete_item(id).await?;
     Ok(Json(ApiResponse::success("删除成功")))
 }
@@ -239,10 +224,8 @@ pub async fn delete_item(
 )]
 pub async fn list_all_cached(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermDictList,
 ) -> Result<Json<ApiResponse<Vec<DictTypeWithItems>>>, AppError> {
-    perm.require(permission::DICT_LIST)?;
-
     let data = state.dict_repo.list_all_with_items().await?;
     Ok(Json(ApiResponse::success(data)))
 }
@@ -257,10 +240,8 @@ pub async fn list_all_cached(
 )]
 pub async fn refresh_cache(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermDictRefresh,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::DICT_REFRESH)?;
-
     // 清除 Redis 中所有字典缓存（生产环境可用 SCAN）
     let data = state.dict_repo.list_all_with_items().await?;
     for dt in &data {

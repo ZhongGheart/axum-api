@@ -6,8 +6,9 @@
 use axum::{extract::State, Json};
 
 use crate::error::AppError;
-use crate::middleware::auth::PermissionGuard;
-use crate::model::permission;
+use crate::middleware::permission::{
+    PermMonitorAlert, PermMonitorApi, PermMonitorExport, PermMonitorReset, PermMonitorSystem,
+};
 use crate::model::ApiResponse;
 use crate::router::AppState;
 use crate::service::monitor::MonitorService;
@@ -22,10 +23,8 @@ use crate::service::monitor::MonitorService;
 )]
 pub async fn system_info(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermMonitorSystem,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    perm.require(permission::MONITOR_SYSTEM)?;
-
     let sys = MonitorService::get_system_info()?;
     let db = MonitorService::get_database_status(&state).await?;
     let redis = MonitorService::get_redis_status(&state).await?;
@@ -48,10 +47,8 @@ pub async fn system_info(
 )]
 pub async fn api_metrics(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermMonitorApi,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    perm.require(permission::MONITOR_API)?;
-
     let metrics = state.metrics_collector;
     let snapshot = metrics.snapshot().await;
     // 计算聚合数据
@@ -87,10 +84,8 @@ pub async fn api_metrics(
 )]
 pub async fn alerts(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermMonitorAlert,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
-    perm.require(permission::MONITOR_ALERT)?;
-
     let sys = MonitorService::get_system_info()?;
     let snapshot = state.metrics_collector.snapshot().await;
     let alert_list = MonitorService::check_alerts(&sys, &snapshot);
@@ -114,10 +109,8 @@ pub async fn alerts(
 )]
 pub async fn reset_metrics(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermMonitorReset,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::MONITOR_RESET)?;
-
     state.metrics_collector.reset().await;
     Ok(Json(ApiResponse::success("指标已重置")))
 }
@@ -132,10 +125,8 @@ pub async fn reset_metrics(
 )]
 pub async fn export_system(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermMonitorExport,
 ) -> Result<axum::response::Response, AppError> {
-    perm.require(permission::MONITOR_EXPORT)?;
-
     use crate::utils::export::{ExcelColumn, ExcelExport};
 
     let sys = MonitorService::get_system_info()?;

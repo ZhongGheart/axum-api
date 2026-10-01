@@ -707,6 +707,48 @@ async fn revoked_permission_code_blocks_the_interface() {
     .expect("恢复权限码授权失败");
 }
 
+/// **鉴权必须早于入参校验**：无权限 + 畸形请求体也必须返回 403，而不是 422。
+///
+/// 曾经的缺陷：把校验写在 handler 函数体里，而 axum 先解析 `Json`，
+/// 于是缺字段的请求拿到 422，等于把接口的参数结构反馈给了无权限调用者。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn permission_is_checked_before_body_validation() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    assert!(revoke_permission_code("admin", axum_api::model::permission::USER_DELETE).await);
+
+    // 请求体字段名写错（真实字段是 ids），若先解析请求体会得到 422
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users/batch-delete",
+            Some(&token),
+            Some(json!({ "wrong_field": [] })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "应先鉴权后校验入参，实际响应: {body}"
+    );
+
+    let pool = pool().await;
+    sqlx::query(
+        "INSERT INTO role_menus (role_id, menu_id) \
+         SELECT r.id, m.id FROM roles r, menus m \
+         WHERE r.name = 'admin' AND m.permission = $1 \
+         ON CONFLICT (role_id, menu_id) DO NOTHING",
+    )
+    .bind(axum_api::model::permission::USER_DELETE)
+    .execute(&pool)
+    .await
+    .expect("恢复权限码授权失败");
+}
+
 /// 权限码授权的增删改接口本身也受权限码保护（防止越权授予自己权限）
 #[tokio::test]
 #[ignore = "需要真实 Postgres + Redis"]
@@ -758,11 +800,12 @@ async fn permission_grant_endpoint_requires_grant_code() {
     .expect("恢复权限码授权失败");
 }
 
-/// 契约测试：每个 `/api/admin/*` handler 都必须声明权限码。
+/// 契约测试：每个 `/api/admin/*` handler 都必须声明类型化权限码守卫。
 ///
-/// 防止将来新增管理接口时漏接 `perm.require(...)`，从而绕过授权体系。
+/// 防止将来新增管理接口时漏接守卫，从而绕过授权体系。守卫是签名里的提取器参数
+/// （`_perm: PermUserList`），在**提取阶段**完成校验，因此早于 `Json` 入参解析。
 #[test]
-fn every_admin_handler_declares_a_permission_code() {
+fn every_admin_handler_declares_a_permission_guard() {
     let controller_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/controller");
 
     let mut offenders: Vec<String> = Vec::new();
@@ -810,10 +853,11 @@ fn every_admin_handler_declares_a_permission_code() {
             }
             checked += 1;
 
-            let has_require = body.contains("perm.require(permission::");
-            if !has_require {
+            // 守卫是签名里的类型化提取器参数，在提取阶段完成校验
+            let has_guard = signature.contains("_perm: Perm");
+            if !has_guard {
                 offenders.push(format!(
-                    "{}::{name} 未调用 perm.require(permission::…)",
+                    "{}::{name} 未声明类型化权限码守卫（_perm: Perm…）",
                     path.file_name().unwrap().to_string_lossy()
                 ));
             }
@@ -826,7 +870,7 @@ fn every_admin_handler_declares_a_permission_code() {
     );
     assert!(
         offenders.is_empty(),
-        "以下管理接口缺少权限码校验:\n  {}",
+        "以下管理接口缺少权限码守卫:\n  {}",
         offenders.join("\n  ")
     );
 }

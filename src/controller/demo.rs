@@ -9,8 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::middleware::auth::PermissionGuard;
-use crate::model::permission;
+use crate::middleware::permission::{PermExportUser, PermLogExport, PermLogList, PermValidateTest};
 use crate::model::ApiResponse;
 use crate::router::AppState;
 use crate::utils::export::{ExcelColumn, ExcelExport};
@@ -43,10 +42,8 @@ pub struct ValidateTestResponse {
 )]
 pub async fn export_users(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermExportUser,
 ) -> Result<axum::response::Response, AppError> {
-    perm.require(permission::EXPORT_USER)?;
-
     // 查询所有用户（角色来自 user_roles）
     let users = sqlx::query_as::<_, crate::model::User>(
         "SELECT id, username, email, password_hash, is_active, created_at, updated_at          FROM users ORDER BY created_at DESC",
@@ -128,11 +125,9 @@ pub async fn export_users(
     responses((status = 200, description = "校验结果", body = ApiResponse<ValidateTestResponse>))
 )]
 pub async fn validate_test(
-    perm: PermissionGuard,
+    _perm: PermValidateTest,
     Json(req): Json<ValidateTestRequest>,
 ) -> Result<Json<ApiResponse<ValidateTestResponse>>, AppError> {
-    perm.require(permission::VALIDATE_TEST)?;
-
     let mut resp = ValidateTestResponse {
         username_valid: true,
         username_message: String::new(),
@@ -173,10 +168,8 @@ pub async fn validate_test(
 )]
 pub async fn export_audit_logs(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermLogExport,
 ) -> Result<axum::response::Response, AppError> {
-    perm.require(permission::LOG_EXPORT)?;
-
     let logs: Vec<crate::model::AuditLog> = sqlx::query_as(
         "SELECT id, user_id, username, action, method, path, params, result, status_code, client_ip, duration_ms, created_at FROM audit_logs ORDER BY created_at DESC LIMIT 10000"
     )
@@ -259,11 +252,9 @@ pub async fn export_audit_logs(
 )]
 pub async fn list_audit_logs(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermLogList,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<ApiResponse<PaginatedResponse<crate::model::AuditLog>>>, AppError> {
-    perm.require(permission::LOG_LIST)?;
-
     let result = state.audit_log_repo.paginate(&params).await?;
 
     Ok(Json(ApiResponse::success(result)))

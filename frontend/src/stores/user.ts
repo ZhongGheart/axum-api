@@ -12,6 +12,7 @@ import { getToken, removeToken, setToken, setUserInfo, removeUserInfo, getUserIn
 import { requestCache } from '@/utils/cache'
 import router, { resetDynamicRoutes } from '@/router'
 import { useMenuStore } from './menu'
+import { usePermissionsStore } from './permissions'
 
 export const useUserStore = defineStore('user', () => {
   /** JWT 令牌 */
@@ -63,6 +64,8 @@ export const useUserStore = defineStore('user', () => {
       // 撤销按上一个账号注册的动态菜单路由，避免换账号后残留可访问页面
       resetDynamicRoutes()
       useMenuStore().reset()
+      // 权限码同样必须清空：否则新账号会短暂沿用上一账号的按钮级权限
+      usePermissionsStore().reset()
       router.push('/login')
     }
   }

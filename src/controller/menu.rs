@@ -7,8 +7,10 @@ use axum::{
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::middleware::auth::{AuthenticatedUser, PermissionGuard};
-use crate::model::permission;
+use crate::middleware::auth::AuthenticatedUser;
+use crate::middleware::permission::{
+    PermMenuCreate, PermMenuDelete, PermMenuGrant, PermMenuList, PermMenuUpdate,
+};
 use crate::model::{
     ApiResponse, AssignMenuRequest, CreateMenuRequest, Menu, MenuNode, UpdateMenuRequest,
 };
@@ -26,11 +28,9 @@ use crate::utils::validation;
 )]
 pub async fn list_menus(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermMenuList,
     Query(params): Query<MenuQuery>,
 ) -> Result<Json<ApiResponse<Vec<MenuNode>>>, AppError> {
-    perm.require(permission::MENU_LIST)?;
-
     let repo = &state.menu_repo;
     let tree = if let Some(role_id) = params.role_id {
         validation::validate_uuid(&role_id.to_string())?;
@@ -115,11 +115,9 @@ pub async fn my_permissions(
 )]
 pub async fn create_menu(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermMenuCreate,
     Json(req): Json<CreateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
-    perm.require(permission::MENU_CREATE)?;
-
     let menu = Menu {
         id: Uuid::new_v4(),
         parent_id: req.parent_id,
@@ -150,12 +148,10 @@ pub async fn create_menu(
 )]
 pub async fn update_menu(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermMenuUpdate,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
-    perm.require(permission::MENU_UPDATE)?;
-
     let saved = state.menu_repo.update(id, &req).await?;
     Ok(Json(ApiResponse::success(MenuNode::from(saved))))
 }
@@ -171,11 +167,9 @@ pub async fn update_menu(
 )]
 pub async fn delete_menu(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermMenuDelete,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::MENU_DELETE)?;
-
     state.menu_repo.delete(id).await?;
     Ok(Json(ApiResponse::success("删除成功")))
 }
@@ -192,12 +186,10 @@ pub async fn delete_menu(
 )]
 pub async fn assign_role_menus(
     State(state): State<AppState>,
-    perm: PermissionGuard,
+    _perm: PermMenuGrant,
     Path(role_id): Path<Uuid>,
     Json(req): Json<AssignMenuRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    perm.require(permission::MENU_GRANT)?;
-
     state
         .menu_repo
         .assign_role_menus(role_id, &req.menu_ids)
