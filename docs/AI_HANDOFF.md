@@ -33,7 +33,7 @@
 | 7 | 测试：后端集成 + 前端单测 + 契约测试 | ✅ `b4de0d0a` / `a65ab453` |
 | 8 | 文档：CHANGELOG / README / 版本号 | ✅ `42338986` |
 | 9 | Chrome 端到端验证 | ✅ 12/12 通过 |
-| 10 | 合并/tag/Release | ⬜ 待用户确认 |
+| 10 | 合并/tag/Release | ✅ 已发布 v0.4.0 |
 
 ## 起始 git 状态
 
@@ -135,6 +135,33 @@
 | `pnpm typecheck` / `pnpm test` / `pnpm build` | ✅ 36 passed |
 
 > 注：`pnpm-lock.yaml` 不记录项目版本号，故 `package.json` 改版本无需重新生成 lockfile。
+
+## ✅ v0.4.0 已发布（2026-10-01）
+
+- PR：https://github.com/ZhongGheart/axum-api/pull/3 （CI 三个 job 全绿后合并）
+- 合并方式：merge commit `b4711d67`（保留 5 个提交的历史，未 squash）
+- tag：`v0.4.0`（annotated，指向 merge commit）
+- Release：https://github.com/ZhongGheart/axum-api/releases/tag/v0.4.0
+- 已删除已合并分支 `v0.4.0`（本地 + 远程），master CI 复核全绿
+
+### 发版流程里踩到的两个 `gh` 版本差异（下次直接照抄）
+
+1. `gh pr merge` 用 **`-t/--subject`** 给 merge commit 标题，**没有 `--title`**；
+   body 用 `-b/--body`。
+2. `gh release create` 用 **`--notes-file`**，**没有 `--body-file`**；
+   配合 `--verify-tag` 确保 tag 已在远端。
+3. 删远程分支时 `git push origin --delete v0.4.0` 会报
+   `dst refspec matches more than one`（分支与 tag 同名），
+   必须写全 refspec：`git push origin :refs/heads/v0.4.0`。
+
+## 当前状态（交接给下一轮）
+
+- 分支：master，工作区干净，HEAD = `b4711d67`（= tag v0.4.0）
+- 本地仍可能残留：E2E 后端 `:8080`、Vite `:5173`、`scripts/test_env.sh`
+  的 Postgres/Redis（55432 / 56379）。收尾时用
+  `scripts/test_env.sh stop` 与 `pkill -f "target/debug/axum-api"` 清理。
+- 下一版候选方向：把 `require_role("admin")` 粗粒度闸门与权限码体系合并
+  （当前非 admin 角色仍被整体挡住，权限码只细化 admin 路由）。
 
 ## 已知残留限制（本版不解决，需诚实记录）
 
