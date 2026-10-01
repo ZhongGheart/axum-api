@@ -58,21 +58,24 @@
     >
       <n-alert type="info" :bordered="false" class="grant-hint">
         保存为全量覆盖：未勾选的菜单与权限码会被撤销。「按钮」节点即接口权限码，
-        授予后才能通过后端权限码校验。当前已选 {{ grantedCount }} 项。
+        授予后才能通过后端权限码校验。取消某个按钮会使其上级菜单变为半选、
+        不再随保存提交——若要保留菜单入口，请重新勾选上级菜单。当前已选 {{ grantedCount }} 项。
       </n-alert>
       <n-spin :show="grantLoading">
-        <n-tree
-          v-if="grantTreeData.length"
-          :data="grantTreeData"
-          :default-expand-all="true"
-          :render-label="renderGrantLabel"
-          :checked-keys="grantCheckedKeys"
-          block-line
-          checkable
-          cascade
-          @update:checked-keys="onCheckedKeysChange"
-        />
-        <n-empty v-else description="暂无菜单数据" />
+        <div class="grant-tree-scroll">
+          <n-tree
+            v-if="grantTreeData.length"
+            :data="grantTreeData"
+            :default-expand-all="true"
+            :render-label="renderGrantLabel"
+            :checked-keys="grantCheckedKeys"
+            block-line
+            checkable
+            cascade
+            @update:checked-keys="onCheckedKeysChange"
+          />
+          <n-empty v-else description="暂无菜单数据" />
+        </div>
       </n-spin>
       <template #footer>
         <n-space justify="end">
@@ -335,5 +338,11 @@ onMounted(() => {
 
 .grant-hint {
   margin-bottom: 12px;
+}
+
+/* 全量菜单树有 40+ 节点，不限高会把弹窗顶出视口、保存按钮够不到 */
+.grant-tree-scroll {
+  max-height: 46vh;
+  overflow-y: auto;
 }
 </style>

@@ -27,10 +27,10 @@ impl MenuRepository {
         .map_err(|e| AppError::InternalServerError(format!("查询菜单失败: {e}")))
     }
 
-    /// 构建菜单树
+    /// 构建菜单树（全量）
     pub async fn find_tree(&self) -> Result<Vec<MenuNode>, AppError> {
         let all = self.find_all().await?;
-        Ok(build_tree(all, None))
+        Ok(build_tree(&all))
     }
 
     /// 根据角色 ID 查询菜单 ID 列表
@@ -45,6 +45,10 @@ impl MenuRepository {
     }
 
     /// 根据角色 ID 查询菜单树（仅返回有权限的节点）
+    ///
+    /// 注意：授权集合通常是**不完整**的——用户可能只勾了某个菜单页而没勾它的
+    /// 上级目录。`build_tree` 会把「父节点不在集合内」的节点当作根返回，
+    /// 而不是悄悄丢弃（见 `build_tree` 的说明）。
     pub async fn find_tree_by_role(&self, role_id: Uuid) -> Result<Vec<MenuNode>, AppError> {
         let menu_ids = self.find_menu_ids_by_role(role_id).await?;
         let all = self.find_all().await?;
@@ -52,7 +56,7 @@ impl MenuRepository {
             .into_iter()
             .filter(|m| menu_ids.contains(&m.id))
             .collect();
-        Ok(build_tree(filtered, None))
+        Ok(build_tree(&filtered))
     }
 
     /// 查询多个角色可见的**导航菜单树**
@@ -83,7 +87,7 @@ impl MenuRepository {
         .await
         .map_err(|e| AppError::InternalServerError(format!("查询用户菜单失败: {e}")))?;
 
-        Ok(build_tree(menus, None))
+        Ok(build_tree(&menus))
     }
 
     /// 新增菜单
@@ -280,13 +284,40 @@ impl MenuRepository {
     }
 }
 
-/// 递归构建菜单树
-fn build_tree(all: Vec<Menu>, parent: Option<Uuid>) -> Vec<MenuNode> {
+/// 递归构建菜单树（森林）
+///
+/// **入参常常是不完整的子集**（按角色过滤后的授权集合、可见且非按钮的导航集合），
+/// 因此判定「根节点」不能只看 `parent_id IS NULL`，而要看**父节点是否在集合内**：
+/// 父节点不在集合里的节点一律当作根返回。
+///
+/// 早先这里只过滤 `parent_id == None`，后果是「勾了子菜单但没勾上级目录」
+/// 的角色在 `GET /api/admin/menus?role_id=` 下返回**空树**——
+/// 前端授权弹窗会显示「该角色没有任何权限」，管理员一保存就把授权全清空。
+/// admin 因为被种子授满全部菜单（含所有祖先）而恰好看不出问题。
+fn build_tree(all: &[Menu]) -> Vec<MenuNode> {
+    let ids: std::collections::HashSet<Uuid> = all.iter().map(|m| m.id).collect();
+    let is_root = |m: &Menu| match m.parent_id {
+        Some(pid) => !ids.contains(&pid),
+        None => true,
+    };
+
     all.iter()
-        .filter(|m| m.parent_id == parent)
+        .filter(|m| is_root(m))
         .map(|m| {
             let mut node = MenuNode::from(m.clone());
-            node.children = build_tree(all.clone(), Some(m.id));
+            node.children = build_children(all, m.id);
+            node
+        })
+        .collect()
+}
+
+/// 递归收集 `parent` 的直接子节点
+fn build_children(all: &[Menu], parent: Uuid) -> Vec<MenuNode> {
+    all.iter()
+        .filter(|m| m.parent_id == Some(parent))
+        .map(|m| {
+            let mut node = MenuNode::from(m.clone());
+            node.children = build_children(all, m.id);
             node
         })
         .collect()
@@ -304,4 +335,84 @@ fn map_menu_fk_error(e: sqlx::Error) -> AppError {
         }
     }
     AppError::InternalServerError(format!("写入角色授权失败: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_tree;
+    use crate::model::Menu;
+    use uuid::Uuid;
+
+    fn menu(id: Uuid, parent: Option<Uuid>) -> Menu {
+        let now = chrono::Utc::now();
+        Menu {
+            id,
+            parent_id: parent,
+            name: id.to_string(),
+            path: None,
+            component: None,
+            icon: None,
+            sort_order: 0,
+            r#type: "menu".into(),
+            permission: None,
+            is_visible: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn flatten(nodes: &[crate::model::MenuNode], out: &mut Vec<Uuid>) {
+        for n in nodes {
+            out.push(n.id);
+            flatten(&n.children, out);
+        }
+    }
+
+    #[test]
+    fn build_tree_roots_nodes_whose_parent_is_absent() {
+        // 授权集合里只有「角色管理」和它的按钮，没有上级目录「系统管理」
+        let dir = Uuid::new_v4();
+        let page = Uuid::new_v4();
+        let btn = Uuid::new_v4();
+        let subset = vec![menu(page, Some(dir)), menu(btn, Some(page))];
+
+        let tree = build_tree(&subset);
+
+        // 页面必须以根出现，而不是被悄悄丢掉
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].id, page);
+        assert_eq!(tree[0].children.len(), 1);
+        assert_eq!(tree[0].children[0].id, btn);
+    }
+
+    #[test]
+    fn build_tree_returns_every_node_exactly_once() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let full = vec![menu(a, None), menu(b, Some(a)), menu(c, Some(b))];
+
+        let tree = build_tree(&full);
+        let mut ids = Vec::new();
+        flatten(&tree, &mut ids);
+
+        assert_eq!(ids.len(), 3, "每个节点应恰好出现一次: {ids:?}");
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn build_tree_of_empty_set_is_empty() {
+        assert!(build_tree(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_tree_of_orphan_children_only_is_not_empty() {
+        // 只授权了按钮、连菜单页都没授权：早先的实现这里会返回空树
+        let page = Uuid::new_v4();
+        let btn = Uuid::new_v4();
+        let tree = build_tree(&[menu(btn, Some(page))]);
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].id, btn);
+    }
 }

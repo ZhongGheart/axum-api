@@ -1176,6 +1176,149 @@ async fn deleting_an_unknown_menu_is_not_found() {
     assert_eq!(status, StatusCode::NOT_FOUND, "应返回 404: {body}");
 }
 
+/// 回归：`GET /api/admin/menus?role_id=` 曾对「只勾了子菜单、没勾上级目录」的角色
+/// 返回**空树**。
+///
+/// 早先的 `build_tree` 只把 `parent_id IS NULL` 当根，父节点不在授权集合里的节点
+/// 被悄悄丢弃。于是授权弹窗显示「该角色没有任何权限」，管理员一保存就把授权全清空
+/// ——静默的数据丢失。admin 因被种子授满全部菜单（含所有祖先）而恰好看不出问题。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn role_menu_query_keeps_grants_whose_ancestors_are_not_granted() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    // 造三层临时菜单：目录 → 页面 → 按钮
+    let make_menu = |parent: Option<uuid::Uuid>, name: String, kind: &str| {
+        let mut body = json!({
+            "name": name,
+            "type": kind,
+            "sort_order": 97
+        });
+        if let Some(p) = parent {
+            body["parent_id"] = json!(p);
+        }
+        if kind == "button" {
+            body["permission"] = json!(format!("tmp:test:{}", &unique("p")[5..]));
+        } else {
+            body["path"] = json!(format!("/{}", unique("t")));
+        }
+        body
+    };
+
+    let dir_name = unique("tmp_dir");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(make_menu(None, dir_name.clone(), "directory")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时目录失败: {body}");
+    let dir_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    let page_name = unique("tmp_page");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(make_menu(Some(dir_id), page_name.clone(), "menu")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时页面失败: {body}");
+    let page_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    let btn_name = unique("tmp_btn");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(make_menu(Some(page_id), btn_name.clone(), "button")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时按钮失败: {body}");
+    let btn_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    let role_id = create_role_via_api(&app, &token, &unique("tmp_role")).await;
+
+    // 场景 A：只授权按钮，页面与目录都没授权
+    let (status, body) = assign_menus(&app, &token, role_id, &[btn_id]).await;
+    assert_eq!(status, StatusCode::OK, "授权按钮失败: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/menus?role_id={role_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names = collect_menu_names(&body["data"]);
+    assert_eq!(
+        names.len(),
+        1,
+        "只授权一个菜单时应只返回它，实际: {names:?}"
+    );
+    assert_eq!(
+        names.first().map(String::as_str),
+        Some(btn_name.as_str()),
+        "只授权按钮时 ?role_id= 必须返回该按钮（早先返回空树）: {names:?}"
+    );
+
+    // 场景 B：授权页面 + 按钮，页面应作为根返回、按钮挂在它下面
+    let (status, body) = assign_menus(&app, &token, role_id, &[page_id, btn_id]).await;
+    assert_eq!(status, StatusCode::OK, "授权页面+按钮失败: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/menus?role_id={role_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let roots = body["data"].as_array().expect("data 应为数组");
+    assert_eq!(
+        roots.len(),
+        1,
+        "页面未授权其父目录，应作为根返回: {roots:?}"
+    );
+    assert_eq!(roots[0]["name"].as_str(), Some(page_name.as_str()));
+    let children = roots[0]["children"].as_array().expect("children 应为数组");
+    assert_eq!(children.len(), 1, "按钮应挂在页面下: {children:?}");
+    assert_eq!(children[0]["name"].as_str(), Some(btn_name.as_str()));
+
+    // 清理：角色无用户占用，可直接删；删目录会级联清掉页面与按钮
+    let (status, body) = delete_role(&app, &token, role_id).await;
+    assert_eq!(status, StatusCode::OK, "清理临时角色失败: {body}");
+    let (status, _) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{dir_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理临时目录失败");
+}
+
 /// 契约测试：每个 `/api/admin/*` handler 都必须声明类型化权限码守卫。
 ///
 /// 防止将来新增管理接口时漏接守卫，从而绕过授权体系。守卫是签名里的提取器参数
