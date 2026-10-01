@@ -12,6 +12,24 @@ pub struct MenuRepository {
     pool: PgPool,
 }
 
+/// `Menu` 的列清单
+///
+/// `sqlx::FromRow` 要求结果集**包含结构体的每一个字段**，少一列就在运行时报错。
+/// 本仓库有 4 处把 `menus` 行映射成 `Menu`，手写 4 份列名迟早会漏——
+/// 迁移 009 加列时就差点只改一半。集中成常量，加列只改这一处。
+const MENU_COLUMNS: &str = "id, parent_id, name, path, component, icon, sort_order, type, \
+     permission, is_visible, created_at, updated_at, prev_permission, \
+     prev_permission_cleared_by";
+
+/// [`MENU_COLUMNS`] 的带表别名版本（供 `menus m` 这类 JOIN 查询使用）
+fn prefixed_menu_columns() -> String {
+    MENU_COLUMNS
+        .split(", ")
+        .map(|c| format!("m.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl MenuRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -19,9 +37,9 @@ impl MenuRepository {
 
     /// 查询所有菜单（平坦列表）
     pub async fn find_all(&self) -> Result<Vec<Menu>, AppError> {
-        sqlx::query_as::<_, Menu>(
-            "SELECT id, parent_id, name, path, component, icon, sort_order, type, permission, is_visible, created_at, updated_at FROM menus ORDER BY sort_order ASC",
-        )
+        sqlx::query_as::<_, Menu>(&format!(
+            "SELECT {MENU_COLUMNS} FROM menus ORDER BY sort_order ASC"
+        ))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("查询菜单失败: {e}")))
@@ -70,18 +88,18 @@ impl MenuRepository {
             return Ok(Vec::new());
         }
 
-        let menus = sqlx::query_as::<_, Menu>(
+        let menus = sqlx::query_as::<_, Menu>(&format!(
             r#"
-            SELECT DISTINCT m.id, m.parent_id, m.name, m.path, m.component, m.icon,
-                   m.sort_order, m.type, m.permission, m.is_visible, m.created_at, m.updated_at
-            FROM menus m
-            JOIN role_menus rm ON rm.menu_id = m.id
-            WHERE rm.role_id = ANY($1)
-              AND m.is_visible = TRUE
-              AND m.type <> 'button'
-            ORDER BY m.sort_order ASC
-            "#,
-        )
+                SELECT DISTINCT {}
+                FROM menus m
+                JOIN role_menus rm ON rm.menu_id = m.id
+                WHERE rm.role_id = ANY($1)
+                  AND m.is_visible = TRUE
+                  AND m.type <> 'button'
+                ORDER BY m.sort_order ASC
+                "#,
+            prefixed_menu_columns()
+        ))
         .bind(role_ids)
         .fetch_all(&self.pool)
         .await
@@ -93,11 +111,13 @@ impl MenuRepository {
     /// 新增菜单
     pub async fn create(&self, menu: &Menu) -> Result<Menu, AppError> {
         sqlx::query_as::<_, Menu>(
-            r#"
-            INSERT INTO menus (id, parent_id, name, path, component, icon, sort_order, type, permission, is_visible)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id, parent_id, name, path, component, icon, sort_order, type, permission, is_visible, created_at, updated_at
-            "#,
+            &format!(
+                r#"
+                INSERT INTO menus (id, parent_id, name, path, component, icon, sort_order, type, permission, is_visible)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                RETURNING {MENU_COLUMNS}
+                "#
+            ),
         )
         .bind(menu.id)
         .bind(menu.parent_id)
@@ -196,10 +216,14 @@ impl MenuRepository {
     }
 
     /// 更新菜单
+    ///
+    /// `actor_id` 只用于权限码留痕：把某个码从按钮上清空时，
+    /// 记下"清掉的是什么、谁清的"，供 `restore_permission` 让本人撤销误操作。
     pub async fn update(
         &self,
         id: Uuid,
         fields: &crate::model::UpdateMenuRequest,
+        actor_id: Uuid,
     ) -> Result<Menu, AppError> {
         let menu = self.find_by_id(id).await?;
         let parent_id = fields.parent_id.or(menu.parent_id);
@@ -209,22 +233,105 @@ impl MenuRepository {
         let icon = fields.icon.as_deref().or(menu.icon.as_deref());
         let sort_order = fields.sort_order.unwrap_or(menu.sort_order);
         let r#type = fields.r#type.as_deref().unwrap_or(&menu.r#type);
-        let permission = fields.permission.as_deref().or(menu.permission.as_deref());
+        // 空串与 NULL 在授权查询里等价（都靠 `permission <> ''` 过滤掉），
+        // 但统一落成 NULL，"这个按钮当前有没有码"才是一个确定的事实，
+        // 不会在恢复逻辑里出现"空串算不算已清空"的分支。
+        let permission = fields
+            .permission
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                // `fields.permission` 显式给了空串 ⇒ 本次就是清空，不能回退旧值
+                if fields.permission.is_some() {
+                    None
+                } else {
+                    menu.permission.as_deref().filter(|p| !p.is_empty())
+                }
+            });
         let is_visible = fields.is_visible.unwrap_or(menu.is_visible);
 
-        sqlx::query_as::<_, Menu>(
+        // 恢复槽位的记账规则（只有权限码真的变了才动）：
+        //
+        // - 本次把某个码清掉了 → 记进 `prev_permission`，供恢复
+        // - 本次把码设成了新值 → 槽位作废（按钮现在有码了，没有"丢失"可恢复）
+        // - 本次没碰 `permission` → 原样保留，别让一次改名把恢复凭据冲掉
+        let prev_permission = if permission.is_some() {
+            None
+        } else if menu.permission.is_some() {
+            menu.permission.clone()
+        } else {
+            menu.prev_permission.clone()
+        };
+        let prev_permission_cleared_by = if permission.is_some() {
+            None
+        } else if menu.permission.is_some() {
+            Some(actor_id)
+        } else {
+            menu.prev_permission_cleared_by
+        };
+
+        sqlx::query_as::<_, Menu>(&format!(
             r#"
-            UPDATE menus SET parent_id=$2, name=$3, path=$4, component=$5, icon=$6,
-                sort_order=$7, type=$8, permission=$9, is_visible=$10
-            WHERE id=$1
-            RETURNING id, parent_id, name, path, component, icon, sort_order, type, permission, is_visible, created_at, updated_at
-            "#,
-        )
-        .bind(id).bind(parent_id).bind(name).bind(path).bind(component)
-        .bind(icon).bind(sort_order).bind(r#type).bind(permission).bind(is_visible)
+                UPDATE menus SET parent_id=$2, name=$3, path=$4, component=$5, icon=$6,
+                    sort_order=$7, type=$8, permission=$9, is_visible=$10,
+                    prev_permission=$11, prev_permission_cleared_by=$12
+                WHERE id=$1
+                RETURNING {MENU_COLUMNS}
+                "#
+        ))
+        .bind(id)
+        .bind(parent_id)
+        .bind(name)
+        .bind(path)
+        .bind(component)
+        .bind(icon)
+        .bind(sort_order)
+        .bind(r#type)
+        .bind(permission)
+        .bind(is_visible)
+        .bind(prev_permission)
+        .bind(prev_permission_cleared_by)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("更新菜单失败: {e}")))
+    }
+
+    /// 把 `prev_permission` 写回 `permission`
+    ///
+    /// 调用方（controller）负责校验"是本人清空的"，仓储只管执行。
+    /// 写回后清空恢复槽位：凭据只能用一次，否则"清空→恢复→再清空"
+    /// 会让槽位指向一个已经不在按钮上的码。
+    pub async fn restore_permission(&self, id: Uuid) -> Result<Menu, AppError> {
+        sqlx::query_as::<_, Menu>(&format!(
+            r#"
+            UPDATE menus
+            SET permission = prev_permission,
+                prev_permission = NULL,
+                prev_permission_cleared_by = NULL
+            WHERE id = $1 AND prev_permission IS NOT NULL
+            RETURNING {MENU_COLUMNS}
+            "#
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("恢复菜单权限码失败: {e}")))?
+        .ok_or_else(|| AppError::BadRequest("该菜单没有可恢复的权限码".into()))
+    }
+
+    /// 该菜单是否已被授予至少一个角色
+    ///
+    /// 用于判定"清空权限码"到底有没有改变任何人的权限：
+    /// 已授予 → 清空就是从那些角色手里收回码，属于授权操作，要过守卫；
+    /// 未授予 → 不改变任何人的权限，放行。
+    pub async fn is_granted_to_any_role(&self, id: Uuid) -> Result<bool, AppError> {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM role_menus WHERE menu_id = $1)")
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| AppError::InternalServerError(format!("查询菜单授权状态失败: {e}")))?;
+        Ok(exists)
     }
 
     /// 删除菜单
@@ -251,14 +358,12 @@ impl MenuRepository {
 
     /// 根据 ID 查询
     pub async fn find_by_id(&self, id: Uuid) -> Result<Menu, AppError> {
-        sqlx::query_as::<_, Menu>(
-            "SELECT id, parent_id, name, path, component, icon, sort_order, type, permission, is_visible, created_at, updated_at FROM menus WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| AppError::InternalServerError(format!("查询菜单失败: {e}")))?
-        .ok_or_else(|| AppError::NotFound("菜单不存在".into()))
+        sqlx::query_as::<_, Menu>(&format!("SELECT {MENU_COLUMNS} FROM menus WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("查询菜单失败: {e}")))?
+            .ok_or_else(|| AppError::NotFound("菜单不存在".into()))
     }
 
     /// 分配角色菜单权限（全量替换）
@@ -394,6 +499,8 @@ mod tests {
             is_visible: true,
             created_at: now,
             updated_at: now,
+            prev_permission: None,
+            prev_permission_cleared_by: None,
         }
     }
 

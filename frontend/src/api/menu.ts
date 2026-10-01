@@ -13,6 +13,14 @@ export interface MenuNode {
   type: string
   permission: string | null
   is_visible: boolean
+  /**
+   * 可恢复的权限码（仅后端返回）
+   *
+   * 权限码被清空后全系统就没有任何角色再持有它，而"改写权限码必须持有
+   * 目标码"的守卫会把写回也一并拦死。这个字段告诉界面"这个按钮的码
+   * 可以恢复"，恢复入口才不至于无从发现。为 null 表示没有可恢复的清空记录。
+   */
+  restorable_permission?: string | null
   children: MenuNode[]
 }
 
@@ -52,6 +60,15 @@ export const menuApi = {
   /** DELETE /api/admin/menus/:id */
   delete(id: string) {
     return http.delete<null>(`/admin/menus/${id}`)
+  },
+
+  /**
+   * POST /api/admin/menus/:id/restore-permission — 恢复被清空的权限码
+   *
+   * 只有清空者本人能调（服务端按 user id 判定），且不要求当前持有该码。
+   */
+  restorePermission(id: string) {
+    return http.post<MenuNode>(`/admin/menus/${id}/restore-permission`)
   },
 
   /**

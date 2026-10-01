@@ -46,6 +46,7 @@ use utoipa::OpenApi as _;
         crate::controller::menu::list_menus,
         crate::controller::menu::create_menu,
         crate::controller::menu::update_menu,
+        crate::controller::menu::restore_menu_permission,
         crate::controller::menu::delete_menu,
         crate::controller::menu::assign_role_menus,
         crate::controller::dict::list_types,

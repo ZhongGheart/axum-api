@@ -194,6 +194,10 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
             axum::routing::put(menu::update_menu).delete(menu::delete_menu),
         )
         .route(
+            "/api/admin/menus/{id}/restore-permission",
+            axum::routing::post(menu::restore_menu_permission),
+        )
+        .route(
             "/api/admin/roles/{role_id}/menus",
             axum::routing::put(menu::assign_role_menus),
         )

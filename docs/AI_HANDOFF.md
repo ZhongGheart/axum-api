@@ -1029,3 +1029,147 @@ v0.5.0 有追加语义的 `POST /api/admin/users/{user_id}/roles`，
  两个权限码后端已支持、种子已下发，但前端没有任何入口能用到它们
 4. **运维债**：审计日志保留策略；接口耗时跨副本聚合
  （现在是进程内统计，重启丢失，多副本下不准）
+
+---
+
+# v0.7.0 — 权限码清空后的恢复路径（计划第 2 项）
+
+## 当前目标
+
+按后续版本计划**顺序**执行。第 1 项（多角色用户）已在 v0.6.0 发布完成。
+本版做第 2 项：**`update_menu` 清空某按钮 permission 后，该码怎么找回来。**
+
+## 缺陷（已确认）
+
+`update_menu` 的守卫是**单向**的：
+
+```rust
+if let Some(new_permission) = req.permission.as_deref().filter(|p| !p.is_empty()) {
+    perm.guard().ensure_covers(&required, "把菜单的权限码改为该值")?;
+}
+```
+
+`.filter(|p| !p.is_empty())` 让**清空**绕过守卫。于是：
+
+1. 清空某按钮的 `permission` → 该码在全系统消失，**没有任何角色再持有它**
+2. 想写回去 → 守卫要求持有该码 → **没人持有** → 403
+
+**死锁**：唯一出路是 `create_menu` 造一个新按钮（该端点无守卫），
+但那会留下一个位置/父节点/名称都不对的孤儿菜单，原按钮的 `role_menus`
+授权还在、却不再对应任何码，管理员看不出原来那个码是什么。
+
+附带确认：`create_menu` 的 `_perm: PermMenuCreate` **完全没用到**，
+即"定义一个权限码"这件事没有任何授权下界。
+
+## 方案
+
+### 1. 清空也要过守卫，但只在"真的撤销了别人的权限"时
+
+- 该按钮**已被授予至少一个角色** → 清空就是从那些角色手里收回码
+  → 要求调用者**持有该码**（与"设置新码必须持有"对称）
+- 该按钮**未授予任何角色** → 清空不改变任何人的权限
+  → 放行（保持既有测试 `rewriting_a_granted_menu_permission_to_an_unheld_code_is_denied`
+  的第一步仍然成立，该测试**不得改动**）
+
+这样补上了真实缺口：此前持 `system:menu:update` 的角色可以
+把**别的角色**已持有按钮的码清掉，绕过 `system:menu:grant`。
+
+### 2. 清空时留痕 + 提供"撤销我自己的误操作"
+
+迁移 `009` 给 `menus` 加两列：
+
+- `prev_permission` — 清空前的码
+- `prev_permission_cleared_by` — 谁清的
+
+新增 `POST /api/admin/menus/:id/restore-permission`：
+
+- **只有清空者本人可调**（按 user id 比对）
+- 恢复 `prev_permission`，**不要求当前持有该码**
+
+### 为什么恢复不构成提权（这是本方案成立的关键）
+
+清空已授予角色的按钮要求"持有该码"，所以能清空 ⟹ 当时持有。
+恢复只是把状态还原到清空之前，**净零**。
+若菜单未授予任何角色则清空本就放行，恢复也只是给"无人"一个码，同样净零。
+
+而"把菜单授予别的角色"这条路仍要过 `system:menu:grant` +
+`assign_role_menus` 既有判定，因此恢复不构成新的越权原语。
+
+### 3. 前端
+
+菜单管理页在该按钮存在 `prev_permission` 时显示"恢复权限码"操作。
+
+## 本版不做（已记录，留给下一项）
+
+`create_menu` 无授权下界：持 `system:menu:create` 的角色可以
+声明一个后端认识的码（如 `system:user:delete`）再分发给别的角色。
+候选规则：**只允许声明"当前没有任何菜单在用"的码**，
+既保住"权限码即数据、admin 可自造码分发"的核心工作流，
+又堵住"声明既有语义码"这条提权路径。
+
+## 起始 git 状态
+
+- 分支 `v0.7.0`（从 master 切出）
+- HEAD = `d91dbbf0 docs(handoff): 记录 v0.6.0 发布结果与后续版本计划`
+- 上一版：v0.6.0 已发布（tag `v0.6.0` → merge commit `4d036487`）
+
+## PR-1 完成记录（实现 + 验证全绿，**尚未推送**）
+
+按用户指令：**本地跑门禁 + 提交，不推送**，等后续版本计划全部做完再统一推送。
+
+### 落地内容
+
+- 迁移 `009`：`menus` 加 `prev_permission` / `prev_permission_cleared_by`
+- `update_menu`：清空**已授权**按钮的码也要持有该码；未授权的照旧放行
+- `restore_menu_permission`：新端点 `POST /api/admin/menus/:id/restore-permission`，仅清空者本人
+- repo：`restore_permission` / `is_granted_to_any_role`；`MENU_COLUMNS` 常量收口 4 处列清单
+- `MenuNode`：新增 `restorable_permission`；**刻意不暴露** `cleared_by`
+- 前端：菜单树行显示"码已清空，可恢复 X"标签 + 恢复按钮
+
+### 门禁结果（全绿）
+
+- `cargo test --lib`：49
+- 集成测试：51 → **56**（+5）
+- 前端单测：84
+- `cargo fmt --check` / `clippy -D warnings`：clean
+- 前端 typecheck / lint / build：clean / 0 error
+
+新增 5 条：`clearing_a_permission_code_can_be_restored_by_the_clearing_user`、
+`clearing_a_code_others_rely_on_requires_holding_it`、
+`clearing_a_code_no_role_relies_on_is_allowed`、
+`only_the_clearing_user_can_restore_a_permission_code`、
+`the_menu_tree_reports_a_restorable_permission_code`
+
+空库重建后跑全量：56 全绿，`max_migration=9`，
+种子核验 `menu_total=42`（14 目录 + 28 按钮）/ `perm_codes=28` /
+`stale_prev_slot=0` / `admin_role=1` / `distinct_admin_users=1` / `tmp_leftover=0`。
+
+### 缺陷注入验证（两条都真实失败）
+
+1. 移除 `update_menu` 的清空守卫 →
+   `clearing_a_code_others_rely_on_requires_holding_it` **FAILED**，
+   实得 200（别人依赖的码被静默清掉），期望 403
+2. 移除 `restore_menu_permission` 的归属校验 →
+   `only_the_clearing_user_can_restore_a_permission_code` **FAILED**，
+   实得 200（非清空者成功接管），期望 400
+
+两处均已还原（`src/controller/menu.rs:181` / `:235`）。
+
+### 写测试时踩到的两个坑（都是真·授权下界，不是测试写错）
+
+1. **admin 不持有自建的码**。种子的"只授权新建行"策略刻意不把新码塞给
+   admin（否则管理员在菜单页撤销的授权会被下次启动悄悄恢复）。
+   所以"admin 造一个码再清空它"必然 403——admin 恰恰是不持有它的人。
+2. **建号顺序被授权下界卡死**。`ensure_can_grant_roles` 要求
+   "建号时赋予的角色，其码集 ⊆ 你的码集"。先授权再建号会失败，
+   因为 admin 不持有那个新码。必须**先建空角色与用户、再授权按钮**。
+
+夹具 `granted_temp_button` 因此自带两条自检断言（持有者必须真的经
+"角色→菜单"拿到该码、且必须持有 `system:menu:update`），
+否则夹具静默失效、测试会假绿。
+
+## 待办
+
+1. 计划第 3 项：补前端入口（`system:monitor:export`、`system:test:access`）
+2. 计划第 4 项：运维债（审计日志保留策略、接口耗时跨副本聚合）
+3. 全部完成后统一推送
