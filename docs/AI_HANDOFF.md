@@ -31,8 +31,9 @@
 | 5 | `GET /api/auth/permissions` | ✅ `b4de0d0a` |
 | 6 | 前端：权限码 store / 指令 / `PermissionButton` / 调用点 | ✅ `a65ab453` |
 | 7 | 测试：后端集成 + 前端单测 + 契约测试 | ✅ `b4de0d0a` / `a65ab453` |
-| 8 | 文档：CHANGELOG / README / 版本号 | ⬜ |
-| 9 | Chrome 端到端验证 + 合并/tag/Release | 🔄 E2E 进行中 |
+| 8 | 文档：CHANGELOG / README / 版本号 | ✅ `42338986` |
+| 9 | Chrome 端到端验证 | ✅ 12/12 通过 |
+| 10 | 合并/tag/Release | ⬜ 待用户确认 |
 
 ## 起始 git 状态
 
@@ -91,12 +92,49 @@
 
 ## 当前 E2E 状态
 
-- 后端 `:8080`（库 `axum_api_e2e`）+ Vite `:5173` 仍在运行（上一会话遗留的 TTY session）。
-- curl 层已验证：登录 OK、admin 拿 28 个码、撤销 `system:user:delete` 后变 27、
-  `GET /api/admin/roles` 不受影响。
-- **阻塞点**：`/tmp/e2e-perm.mjs` 的 `waitFor` 在 `Page.navigate` 之后疑似处于失效的执行上下文。
-  探针脚本 `/tmp/probe.mjs`（固定 sleep 3.5s）能稳定读到按钮 `["登 录"]`，
-  说明是脚本等待逻辑问题，不是页面渲染问题。
+- ✅ **12/12 通过**（真实 Chrome headless + CDP 直连，Node 22 内置 WebSocket，零依赖）。
+  截图 `/tmp/e2e-{admin-full,admin-revoked,plain-user,plain-user-404}.png` 已人工复核。
+
+### 上一个会话遗留的"阻塞点"其实是两个 bug，都已定位
+
+1. **模板字符串里的 `\s` 不是正则转义**。上一会话把匹配器改成
+    `textContent.replace(/\s/g,'')`，但这段代码在 JS **模板字符串**里，`\s` 是无效转义、
+    会被折叠成字母 `s`，页面实际执行的是 `replace(/s/g,'')` —— 删掉的是字母而不是空格，
+    `"登 录"` 因此永远匹配不上 `"登录"`。探针脚本能跑通只是因为它写成了 `\\s`。
+2. `JSON.stringify` 把 SQL 里的真实换行转义成字面量 `\n`，psql 不会还原 → 需先压掉换行。
+
+另外把 `waitFor` 改成**超时即抛错**（原来只记一条失败就继续跑，导致后续断言全建立在
+"页面根本没渲染"之上，刷出一堆误导性失败项），并给 Vite 冷启动留足 45s。
+
+## 升级路径验证（v0.3 → v0.4，真实二进制）
+
+集成测试只覆盖空库启动，**没覆盖存量库升级**——这是真实用户最可能走的路径，
+因此单独用 v0.3.0 的真实二进制做了验证：
+
+1. `git worktree` 检出 v0.3.0 并编译 → 启动，产出**真实 v0.3 库**
+   （迁移 001–006、14 条菜单、0 条 button 行、0 个 permission 值）
+2. 用 v0.4.0 二进制启动同一个库
+
+结论：
+
+- 迁移 `007` 正常应用；新增 28 条 button 行，**原有 14 条菜单逐字节零改动**（ID 也保持）
+- admin 自动获得全部 28 个权限码，侧栏 14 个菜单一个不少
+- 全部 admin 接口 200，**无 403 回归**；`/api/admin/menus` 可见 28 个按钮节点
+- 撤销的权限码重启后不会被重新授予（已单独实测）
+
+## 全量回归结果（对照 CI 命令）
+
+| 检查 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | ✅ |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | ✅ |
+| `cargo test --locked --all-targets --all-features` | ✅ 32 passed |
+| 集成测试（fresh DB，`--ignored --test-threads=1`） | ✅ 16 passed |
+| `pnpm install --frozen-lockfile` | ✅ 版本号变更不影响 lockfile |
+| `pnpm lint` | ✅ 0 errors（`env.d.ts` 1 个历史 warning） |
+| `pnpm typecheck` / `pnpm test` / `pnpm build` | ✅ 36 passed |
+
+> 注：`pnpm-lock.yaml` 不记录项目版本号，故 `package.json` 改版本无需重新生成 lockfile。
 
 ## 已知残留限制（本版不解决，需诚实记录）
 
