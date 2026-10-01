@@ -931,3 +931,63 @@ admin_granted_perm_codes=28
 3. 删分支（用全 refspec `:refs/heads/v0.6.0`）
 4. 可选但推荐：升级路径实测（v0.5.0 → v0.6.0）。v0.6.0 **无新迁移**，
  成本低；v0.5.0 的发布流程里做了，保持一致
+
+---
+
+## 升级路径验证（v0.5.0 → v0.6.0，真实二进制 + 真实存量库）
+
+方法沿用 v0.4→v0.5：`git worktree add /tmp/axum-v050 v0.5.0` → 编译 release →
+单独开库 `axum_api_upgrade` → v0.5.0 造数据 → 停掉 → **v0.6.0 二进制启动同一个库**。
+全程用 PTY 会话起服务（`nohup ... &` 会被 exec shell 退出回收）。
+
+### v0.5.0 侧：先复现缺陷（本版要修的正是它）
+
+v0.5.0 有追加语义的 `POST /api/admin/users/{user_id}/roles`，
+所以**真实 v0.5.0 库里确实存在多角色用户**，不是理论问题。
+用该端点把 `multi_v050` 造成 `user` + `auditor` 两个角色，再用表单保存：
+
+    PUT /api/admin/users/{id}  {"role":"user"}    ← 模拟前端只回填 roles[0]
+      -> HTTP 200  {"message":"success"}
+    SELECT r.name FROM user_roles ...            -> 只剩 user
+
+`auditor` 被静默删除，**接口返回成功**。这是升级前真实存在的状态。
+
+### 数据快照对照（升级前后逐项比对）
+
+| 项 | v0.5.0 | v0.6.0 启动后 |
+|---|---|---|
+| 迁移版本 | 008 | 008（**v0.6.0 无新迁移**） |
+| 菜单 / 按钮 / 权限码 | 42 / 28 / 28 | 42 / 28 / 28，**逐项未变** |
+| 角色 / 用户 | 3 / 3 | 3 / 3，**未变** |
+| 存量多角色用户 `multi_ok` | `["user","auditor"]` | `["user","auditor"]`，**完整保留** |
+
+### v0.6.0 侧行为验证（同一存量库）
+
+| 场景 | 结果 |
+|---|---|
+| 新写法 `roles:["user","auditor"]` 保存 | 200，两个角色**都在** |
+| 给受损的 `multi_v050` 加回 `auditor` | 200 → `["user","auditor"]`（v0.5.0 做不到） |
+| 三角色 `["user","auditor","viewer"]` | 200 → 三个都在 |
+| 旧客户端只发 `role:"user"` | 200 → `["user"]`，**整体替换，与 v0.5.0 完全一致** |
+| 空 `roles:[]` | 400「至少需要指定一个角色：没有角色的用户登录后没有任何权限」 |
+| `role` 与 `roles` 都给 | `roles` 优先 → 三个角色 |
+| 重复角色 `["user","user","auditor","user"]` | 折叠为 `["user","auditor"]`，库内 2 行（无重复行） |
+| 未知角色 `["user","nonexistent_zzz"]` | 400 点名该角色；角色行数 before=2 after=2，**原子拒绝** |
+| admin 全部管理接口（users/roles/menus/audit-logs/monitor） | 全 200，**无 403 回归** |
+| 多角色并集越界 `roles:["user","admin"]` | 403，文案点名缺 `system:dict:create`；`evil2` 建号数 **0** |
+| 唯一 admin（持 `admin`+`user`）改成只留 `user` | 400「不能移除最后一名管理员的 admin 角色」 |
+| 删除唯一 admin | 400「不能删除当前登录账号」 |
+
+授权下界对**多角色并集**依然成立：持 `system:user:create`+`system:user:list`
+的角色能建 `user`（无权限码的角色），但建 `user`+`admin` 被拒，
+且 403 文案点名缺哪个码。
+
+### 复用要点
+
+- 升级验证的库要**单独开一个**（本轮 `axum_api_upgrade`），验证完 `dropdb`，
+  否则会污染 `axum_api_test`，症状记到别人头上
+- 同一端口串行跑两个版本：v0.5.0 与 v0.6.0 都用 8083，停干净再起下一个
+  （`curl` 返回 000 才算真停）
+- `assign_role_menus` 的 `menu_ids` 必须是**带引号的 UUID 数组**；
+  用 shell 拼字符串时漏了逗号会报 `invalid type: integer`，容易被误读成授权失败
+- zsh 里**不要用 `UID` 作变量名**（是只读的当前用户 id），本轮踩过
