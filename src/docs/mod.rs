@@ -18,7 +18,7 @@ use utoipa::OpenApi as _;
 #[openapi(
     info(
         title = "Axum Admin API",
-        version = "0.3.0",
+        version = "0.4.0",
         description = "基于 Axum + SQLx + JWT 的管理后台 API。规范由代码生成，与实现保持同步。",
     ),
     paths(
