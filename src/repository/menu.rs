@@ -110,6 +110,51 @@ impl MenuRepository {
         .map_err(|e| AppError::InternalServerError(format!("创建菜单失败: {e}")))
     }
 
+    /// 查询给定角色集合拥有的权限码
+    ///
+    /// 权限码是 `type = 'button'` 菜单行的 `permission` 列，经 `role_menus` 授权。
+    /// 单条索引 JOIN 完成，无 N+1：
+    ///
+    /// ```sql
+    /// SELECT DISTINCT m.permission
+    /// FROM menus m
+    /// JOIN role_menus rm ON rm.menu_id = m.id
+    /// JOIN roles r      ON r.id = rm.role_id
+    /// WHERE r.name = ANY($1) AND m.type = 'button'
+    ///   AND m.permission IS NOT NULL AND m.permission <> ''
+    /// ```
+    ///
+    /// 刻意不做缓存：撤销角色菜单授权后必须立即生效，
+    /// 避免 TTL 窗口内出现已撤权仍可调用的情况。
+    pub async fn find_permission_codes(
+        &self,
+        role_names: &[String],
+    ) -> Result<Vec<String>, AppError> {
+        if role_names.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let codes = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT m.permission
+            FROM menus m
+            JOIN role_menus rm ON rm.menu_id = m.id
+            JOIN roles r      ON r.id = rm.role_id
+            WHERE r.name = ANY($1)
+              AND m.type = 'button'
+              AND m.permission IS NOT NULL
+              AND m.permission <> ''
+            ORDER BY m.permission ASC
+            "#,
+        )
+        .bind(role_names)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询用户权限码失败: {e}")))?;
+
+        Ok(codes)
+    }
+
     /// 更新菜单
     pub async fn update(
         &self,

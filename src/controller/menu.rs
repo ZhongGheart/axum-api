@@ -7,7 +7,8 @@ use axum::{
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::middleware::auth::AuthenticatedUser;
+use crate::middleware::auth::{AuthenticatedUser, PermissionGuard};
+use crate::model::permission;
 use crate::model::{
     ApiResponse, AssignMenuRequest, CreateMenuRequest, Menu, MenuNode, UpdateMenuRequest,
 };
@@ -25,8 +26,11 @@ use crate::utils::validation;
 )]
 pub async fn list_menus(
     State(state): State<AppState>,
+    perm: PermissionGuard,
     Query(params): Query<MenuQuery>,
 ) -> Result<Json<ApiResponse<Vec<MenuNode>>>, AppError> {
+    perm.require(permission::MENU_LIST)?;
+
     let repo = &state.menu_repo;
     let tree = if let Some(role_id) = params.role_id {
         validation::validate_uuid(&role_id.to_string())?;
@@ -78,6 +82,28 @@ pub async fn my_menus(
     Ok(Json(ApiResponse::success(tree)))
 }
 
+/// GET /api/auth/permissions — 当前登录用户的权限码
+///
+/// 前端 `v-permission` / `PermissionButton` 据此判定按钮级权限，
+/// 与后端 `PermissionGuard` 用的是同一份数据源（`menus.permission`）。
+#[utoipa::path(
+    get,
+    path = "/api/auth/permissions",
+    tag = "认证",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "当前用户的权限码列表", body = ApiResponse<Vec<String>>))
+)]
+pub async fn my_permissions(
+    State(state): State<AppState>,
+    auth_user: AuthenticatedUser,
+) -> Result<Json<ApiResponse<Vec<String>>>, AppError> {
+    let codes = state
+        .menu_repo
+        .find_permission_codes(&auth_user.roles)
+        .await?;
+    Ok(Json(ApiResponse::success(codes)))
+}
+
 /// POST /api/admin/menus — 新增菜单
 #[utoipa::path(
     post,
@@ -89,8 +115,11 @@ pub async fn my_menus(
 )]
 pub async fn create_menu(
     State(state): State<AppState>,
+    perm: PermissionGuard,
     Json(req): Json<CreateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
+    perm.require(permission::MENU_CREATE)?;
+
     let menu = Menu {
         id: Uuid::new_v4(),
         parent_id: req.parent_id,
@@ -121,9 +150,12 @@ pub async fn create_menu(
 )]
 pub async fn update_menu(
     State(state): State<AppState>,
+    perm: PermissionGuard,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
+    perm.require(permission::MENU_UPDATE)?;
+
     let saved = state.menu_repo.update(id, &req).await?;
     Ok(Json(ApiResponse::success(MenuNode::from(saved))))
 }
@@ -139,8 +171,11 @@ pub async fn update_menu(
 )]
 pub async fn delete_menu(
     State(state): State<AppState>,
+    perm: PermissionGuard,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    perm.require(permission::MENU_DELETE)?;
+
     state.menu_repo.delete(id).await?;
     Ok(Json(ApiResponse::success("删除成功")))
 }
@@ -157,9 +192,12 @@ pub async fn delete_menu(
 )]
 pub async fn assign_role_menus(
     State(state): State<AppState>,
+    perm: PermissionGuard,
     Path(role_id): Path<Uuid>,
     Json(req): Json<AssignMenuRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    perm.require(permission::MENU_GRANT)?;
+
     state
         .menu_repo
         .assign_role_menus(role_id, &req.menu_ids)
