@@ -991,3 +991,41 @@ v0.5.0 有追加语义的 `POST /api/admin/users/{user_id}/roles`，
 - `assign_role_menus` 的 `menu_ids` 必须是**带引号的 UUID 数组**；
   用 shell 拼字符串时漏了逗号会报 `invalid type: integer`，容易被误读成授权失败
 - zsh 里**不要用 `UID` 作变量名**（是只读的当前用户 id），本轮踩过
+
+---
+
+## ✅ v0.6.0 已发布（2026-10-02）
+
+- PR：https://github.com/ZhongGheart/axum-api/pull/5
+  （CI 三 job：rust / frontend / docker 全绿后合并）
+- 合并方式：merge commit `4d036487`（两个 parent，历史全保留，未 squash）
+- tag：`v0.6.0`（annotated，指向 merge commit `4d036487`，已用
+  `git rev-parse refs/tags/v0.6.0^{commit}` 校验）
+- Release：https://github.com/ZhongGheart/axum-api/releases/tag/v0.6.0
+- 已删除已合并分支 `v0.6.0`（本地 `git branch -D` + 远程
+  `git push origin --delete refs/heads/v0.6.0`）
+- master CI 复核：run 36939961715
+
+### 本轮验证过 tag/branch 同名的坑没再踩
+
+沿用 v0.5.0 的解法：**打 tag 之前先 `git checkout master` 并删掉本地
+`v0.6.0` 分支**，这样 `v0.6.0` 这个短名只解析到 tag。
+本轮 `git rev-parse refs/tags/v0.6.0^{commit}` 一次就对上了 merge commit，
+没有出现 ambiguous 警告。
+
+### 环境清理
+
+- 升级验证库 `axum_api_upgrade` 已 `dropdb`
+- worktree `/tmp/axum-v050` 已 `git worktree remove --force`
+- `axum_api_test` 保留在本轮整库重建后的干净状态（空库跑完 51 条后的状态）
+
+## 后续版本计划（按序，v0.6.0 已完成第 1 项）
+
+1. ~~多角色用户（PR-1）~~ ✅ **v0.6.0 已发布**
+2. **权限码清空后的恢复路径**：`update_menu` 清空某按钮的 `permission`
+ 后，该码只能靠新建按钮恢复——授权下界不允许把别的菜单改指成未持有的码。
+ 需要给出"权限码丢了怎么找回来"的可操作路径
+3. **补前端入口**：`system:monitor:export`、`system:test:access`
+ 两个权限码后端已支持、种子已下发，但前端没有任何入口能用到它们
+4. **运维债**：审计日志保留策略；接口耗时跨副本聚合
+ （现在是进程内统计，重启丢失，多副本下不准）
