@@ -43,10 +43,12 @@ export const PERM = {
   MONITOR_API: 'system:monitor:api',
   MONITOR_ALERT: 'system:monitor:alert',
   MONITOR_RESET: 'system:monitor:reset',
+  MONITOR_EXPORT: 'system:monitor:export',
 
   // 其他
   EXPORT_USER: 'system:export:user',
   VALIDATE_TEST: 'system:validate:test',
+  TEST_ACCESS: 'system:test:access',
 } as const
 
 /** 全部权限码 */

@@ -1168,8 +1168,63 @@ if let Some(new_permission) = req.permission.as_deref().filter(|p| !p.is_empty()
 "角色→菜单"拿到该码、且必须持有 `system:menu:update`），
 否则夹具静默失效、测试会假绿。
 
+## PR-2 完成记录（计划第 3 项：补前端入口 + 真实浏览器回归，**尚未推送**）
+
+v0.5.0 的 handoff 里留了一句债：「没做浏览器回归，下一版动前端时补上」。
+本轮动了前端，因此补上——用**真实 Google Chrome 154** 跑完整登录→点击→下载链路。
+
+### 落地内容
+
+- `constants/permission.ts`：补 `PERM.MONITOR_EXPORT`、`PERM.TEST_ACCESS`
+- `api/monitor.ts`：补 `exportSystem()`（blob 响应）
+- 监控页 `monitor/system/index.vue`：页头加「导出 Excel」按钮 + `handleExport`
+- 后端能力页 `demo/backend.vue`：加第 4 张卡「能力探测」+ `probeAccess`
+- `__tests__/permissionCodes.spec.ts`：`BACKEND_ONLY_CODES` 清空为 `{}`
+
+`BACKEND_ONLY_CODES` 清空是这个测试的**意图兑现**：它一直是用来显式登记
+「后端有码但前端没入口」的豁免清单，清空意味着后端 28 个权限码
+**全部**在前端有对应入口，契约测试从此双向全覆盖。
+
+### 浏览器回归怎么做（环境无 Playwright）
+
+机器上没有 Playwright/puppeteer，也不想为此拉依赖。
+Node 22 自带全局 `WebSocket`，于是直接用 **CDP** 驱动**真实的 Google Chrome**
+（`--headless=new --remote-debugging-port=9222`），脚本在
+`/tmp/axum-e2e/`（一次性，不入库）。三个要点：
+
+1. **每次跑新建 browser context**：否则上次的 token 还在，
+   `/login` 会直接跳首页，脚本卡在"找不到登录框"
+2. **Chrome 必须起在 PTY 里**：普通后台 `&` 会随 shell 退出被回收，
+   表现为跑到一半 `ECONNREFUSED 9222`
+3. **`localStorage` 是 base64(encodeURIComponent(JSON))**：
+   `JSON.parse(localStorage.getItem('axum_token'))` 会报
+   `Unexpected token 'J'`，必须先 `decodeURIComponent(atob(...))`
+   再 `.value`
+
+### 回归结果：13/13 通过
+
+真实登录 admin → 监控页点「导出 Excel」→ 文件落盘且是合法 xlsx
+（`magic=PK`、`xl/worksheets/sheet1.xml` 存在、6467 字节）
+→ 后端能力页点「探测访问能力」→ 「管理员访问成功！用户: …, 角色: ["admin","user"]」
+→ 全程无 4xx/5xx、无控制台错误。
+
+截图在 `/tmp/axum-e2e/shots/`，已人工核对版式：
+导出按钮在页头与「刷新」并排不重叠，第 4 张卡文案不溢出。
+
+### 回归顺手挖出并修掉的一个真缺陷
+
+截图里第 2 张卡（通用分页查询）显示「无数据」，而同一时刻
+`GET /api/admin/users?page=1` 返回 `total=1, items=1`。
+
+根因：`demo/backend.vue` 的 `fetchTest` **只挂在分页的 `@update:page` 上**，
+从没在 `onMounted` 触发。进页面表格恒为空，
+要点一次页码才出数据。已加 `onMounted(fetchTest)`（一行）。
+
+这个 bug 与本次改动无关（是既有的），但它只有真人看截图才会发现——
+自动化断言若只查"接口返回 200"就会漏过去。
+回归脚本里已补成硬断言：表格行数必须等于 `items.length`。
+
 ## 待办
 
-1. 计划第 3 项：补前端入口（`system:monitor:export`、`system:test:access`）
-2. 计划第 4 项：运维债（审计日志保留策略、接口耗时跨副本聚合）
-3. 全部完成后统一推送
+1. 计划第 4 项：运维债（审计日志保留策略、接口耗时跨副本聚合）
+2. 全部完成后统一推送 `v0.7.0`（当前 `ad09d294` + 第 3 项两个 commit 均未推送）

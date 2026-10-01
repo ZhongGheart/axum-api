@@ -14,13 +14,15 @@ import { ALL_PERMISSION_CODES, PERM } from '@/constants/permission'
 /**
  * 仅后端使用的权限码（前端没有对应按钮）
  *
- * 显式列出而非放宽断言：后端新增权限码时，这个测试会失败，
+ * 显式列出而非放宽断言：后端新增权限码时，
+ * 「覆盖后端定义的全部权限码」那条会失败，
  * 迫使我们明确判断「前端是否需要对应按钮」，而不是默默漂移。
+ *
+ * v0.7.0 起为空：原先豁免的两个码都补上了前端入口
+ * （`system:monitor:export` → 系统监控页导出按钮，
+ * `system:test:access` → 后端能力示例页的能力探测）。
  */
-const BACKEND_ONLY_CODES: Record<string, string> = {
-  'system:test:access': '/api/admin/test 能力探测端点，前端无入口',
-  'system:monitor:export': '/api/admin/monitor/system/export 当前无前端入口',
-}
+const BACKEND_ONLY_CODES: Record<string, string> = {}
 
 /** 解析后端权限码定义表里的所有权限码 */
 function backendPermissionCodes(): string[] {
