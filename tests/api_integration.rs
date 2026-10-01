@@ -274,7 +274,11 @@ async fn non_admin_is_blocked_from_admin_api() {
     .await;
     assert_ne!(dict_status, StatusCode::FORBIDDEN, "字典读取不应要求 admin");
 
-    // 但不能访问管理接口
+    // 但不能访问管理接口。
+    //
+    // v0.5.0 PR-3 之前这里被 `require_role("admin")` 拦住；那道闸门已删除，
+    // 现在拦住它的是**权限码**——注册得到的账号没有任何授权，守卫在提取阶段 403。
+    // 判定依据从"角色名"换成了"权限码"，对外表现不变。
     let (admin_status, _) =
         send(&app, request("GET", "/api/admin/users", Some(&token), None)).await;
     assert_eq!(admin_status, StatusCode::FORBIDDEN);
@@ -800,6 +804,985 @@ async fn permission_grant_endpoint_requires_grant_code() {
     .expect("恢复权限码授权失败");
 }
 
+// ──────────────────────────────────────────────
+// 角色与授权写入：写路径必须"要么完整成功、要么整体失败"
+// ──────────────────────────────────────────────
+
+async fn role_id_by_name(name: &str) -> uuid::Uuid {
+    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM roles WHERE name = $1")
+        .bind(name)
+        .fetch_one(&pool().await)
+        .await
+        .unwrap_or_else(|e| panic!("查询角色 {name} 失败: {e}"))
+}
+
+/// 某权限码对应的菜单 ID（权限码即按钮型菜单行的 `menus.permission`）
+async fn menu_id_of(code: &str) -> uuid::Uuid {
+    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM menus WHERE permission = $1")
+        .bind(code)
+        .fetch_one(&pool().await)
+        .await
+        .unwrap_or_else(|e| panic!("查询权限码 {code} 对应菜单失败: {e}"))
+}
+
+async fn granted_menu_ids(role_id: uuid::Uuid) -> Vec<uuid::Uuid> {
+    sqlx::query_scalar::<_, uuid::Uuid>("SELECT menu_id FROM role_menus WHERE role_id = $1")
+        .bind(role_id)
+        .fetch_all(&pool().await)
+        .await
+        .expect("查询角色授权失败")
+}
+
+async fn role_still_exists(id: uuid::Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM roles WHERE id = $1)")
+        .bind(id)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询角色失败")
+}
+
+async fn menu_still_exists(id: uuid::Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM menus WHERE id = $1)")
+        .bind(id)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询菜单失败")
+}
+
+async fn grant_count_for_menu(menu_id: uuid::Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM role_menus WHERE menu_id = $1")
+        .bind(menu_id)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询授权失败")
+}
+
+/// 通过接口新建角色，返回其 ID
+async fn create_role_via_api(app: &Router, token: &str, name: &str) -> uuid::Uuid {
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/roles",
+            Some(token),
+            Some(json!({ "name": name, "description": "v0.5.0 测试角色" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "新建角色失败: {body}");
+    body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("新建角色响应里没有可解析的 id: {body}"))
+}
+
+async fn assign_menus(
+    app: &Router,
+    token: &str,
+    role_id: uuid::Uuid,
+    menu_ids: &[uuid::Uuid],
+) -> (StatusCode, Value) {
+    send(
+        app,
+        request(
+            "PUT",
+            &format!("/api/admin/roles/{role_id}/menus"),
+            Some(token),
+            Some(json!({ "menu_ids": menu_ids })),
+        ),
+    )
+    .await
+}
+
+async fn delete_role(app: &Router, token: &str, role_id: uuid::Uuid) -> (StatusCode, Value) {
+    send(
+        app,
+        request(
+            "DELETE",
+            &format!("/api/admin/roles/{role_id}"),
+            Some(token),
+            None,
+        ),
+    )
+    .await
+}
+
+/// 通过接口撤销权限，**必须真的生效**。
+///
+/// 曾经的缺陷：`assign_role_menus` 对 DELETE 与 INSERT 都用 `.ok()` 吞掉错误却仍提交，
+/// 于是"取消勾选 → 保存"可能静默失效——UI 上看着撤销成功，权限其实还在。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn revoking_permission_through_the_api_actually_takes_effect() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_id = create_role_via_api(&app, &token, &unique("role_revoke")).await;
+
+    let user_list = menu_id_of(axum_api::model::permission::USER_LIST).await;
+    let role_list = menu_id_of(axum_api::model::permission::ROLE_LIST).await;
+
+    let (status, body) = assign_menus(&app, &token, role_id, &[user_list, role_list]).await;
+    assert_eq!(status, StatusCode::OK, "首次授权应成功: {body}");
+    let granted = granted_menu_ids(role_id).await;
+    assert!(granted.contains(&user_list) && granted.contains(&role_list));
+
+    // 全量替换语义：只提交 user:list，role:list 必须被撤销
+    let (status, body) = assign_menus(&app, &token, role_id, &[user_list]).await;
+    assert_eq!(status, StatusCode::OK, "重新授权应成功: {body}");
+
+    let granted = granted_menu_ids(role_id).await;
+    assert!(
+        granted.contains(&user_list),
+        "仍在提交集合中的权限码应保留: {granted:?}"
+    );
+    assert!(
+        !granted.contains(&role_list),
+        "未提交的权限码必须被撤销（曾因吞错而静默失效）: {granted:?}"
+    );
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 传入不存在的菜单 ID 必须**整体失败**，不能静默部分授权后还返回成功。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn assigning_an_unknown_menu_id_is_rejected_atomically() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_id = create_role_via_api(&app, &token, &unique("role_badid")).await;
+
+    let good = menu_id_of(axum_api::model::permission::USER_LIST).await;
+    let bogus = uuid::Uuid::new_v4();
+
+    let (status, body) = assign_menus(&app, &token, role_id, &[good, bogus]).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "含非法菜单 ID 时应明确报错，而不是返回成功: {body}"
+    );
+    assert!(
+        granted_menu_ids(role_id).await.is_empty(),
+        "事务必须整体回滚：非法 ID 不应导致合法的那个被写入"
+    );
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 授权给不存在的角色应是 404，而不是"成功"
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn assigning_menus_to_an_unknown_role_is_not_found() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let good = menu_id_of(axum_api::model::permission::USER_LIST).await;
+
+    let (status, body) = assign_menus(&app, &token, uuid::Uuid::new_v4(), &[good]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "应返回 404: {body}");
+}
+
+/// 内置角色不可删除：角色种子只在 `roles` 表为空时写入，删掉不会被重建。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn builtin_roles_cannot_be_deleted() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    for name in ["admin", "user"] {
+        let id = role_id_by_name(name).await;
+        let (status, body) = delete_role(&app, &token, id).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "内置角色 {name} 不应可删除: {body}"
+        );
+        assert!(role_still_exists(id).await, "内置角色 {name} 必须仍然存在");
+    }
+}
+
+/// 仍有用户持有该角色时必须拒绝删除。
+///
+/// `user_roles.role_id` 是 `ON DELETE CASCADE`：直接删角色会**静默**剥掉这些用户的角色，
+/// 用户变成"没有任何角色"却毫不知情。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_a_role_still_held_by_users_is_refused() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_name = unique("role_inuse");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+
+    // 经用户表单分配该自定义角色（v0.5.0 PR-2 起自定义角色可分配）
+    let username = unique("user_inuse");
+    let (status, created) = create_user_via_api(&app, &token, &username, &role_name).await;
+    assert_eq!(status, StatusCode::OK, "创建测试用户失败: {created}");
+    let user_id = uuid::Uuid::parse_str(created["data"]["id"].as_str().unwrap()).unwrap();
+
+    // 该用户确实持有这个自定义角色（否则"被占用"的前提不成立）
+    let held: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM user_roles WHERE user_id = $1 AND role_id = $2")
+            .bind(user_id)
+            .bind(role_id)
+            .fetch_one(&pool().await)
+            .await
+            .expect("查询角色占用失败");
+    assert_eq!(held.0, 1, "测试前提：用户应持有该自定义角色");
+
+    let (status, body) = delete_role(&app, &token, role_id).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "仍被用户占用的角色不应可删除: {body}"
+    );
+    assert!(
+        body["message"].as_str().unwrap_or("").contains('1'),
+        "错误应说明还有多少用户在用: {body}"
+    );
+    assert!(
+        role_still_exists(role_id).await,
+        "角色必须还在，且用户的角色关系未被级联剥掉"
+    );
+
+    sqlx::query("DELETE FROM roles WHERE id = $1")
+        .bind(role_id)
+        .execute(&pool().await)
+        .await
+        .expect("清理测试角色失败");
+}
+
+/// 无人使用的自定义角色可以正常删除
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_an_unused_custom_role_succeeds() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_id = create_role_via_api(&app, &token, &unique("role_free")).await;
+
+    let (status, body) = delete_role(&app, &token, role_id).await;
+    assert_eq!(status, StatusCode::OK, "删除空闲角色应成功: {body}");
+    assert!(!role_still_exists(role_id).await, "角色应已从表中删除");
+}
+
+/// 删除不存在的角色返回 404，而不是"删除成功"
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_an_unknown_role_is_not_found() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (status, body) = delete_role(&app, &token, uuid::Uuid::new_v4()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "应返回 404: {body}");
+}
+
+/// 删除菜单会连同其下嵌套的权限码按钮一起消失（依赖外键级联）
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_a_menu_removes_its_nested_permission_buttons() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(json!({
+                "name": unique("tmp_dir"),
+                "type": "directory",
+                "path": format!("/{}", unique("tmp")),
+                "sort_order": 99
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建测试菜单失败: {body}");
+    let parent_id = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(json!({
+                "parent_id": parent_id,
+                "name": "临时按钮",
+                "type": "button",
+                "permission": format!("tmp:test:{}", &unique("p")[5..]),
+                "sort_order": 1
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建测试按钮失败: {body}");
+    let child_id = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    // 授权给 admin，确保 role_menus 也需要一并清理
+    sqlx::query(
+        "INSERT INTO role_menus (role_id, menu_id) \
+         SELECT r.id, $1 FROM roles r WHERE r.name = 'admin' ON CONFLICT DO NOTHING",
+    )
+    .bind(child_id)
+    .execute(&pool().await)
+    .await
+    .expect("构造授权失败");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{parent_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除菜单失败: {body}");
+
+    assert!(!menu_still_exists(parent_id).await, "父菜单应被删除");
+    assert!(
+        !menu_still_exists(child_id).await,
+        "嵌套的权限码按钮应随级联一并消失"
+    );
+    assert_eq!(
+        grant_count_for_menu(child_id).await,
+        0,
+        "角色授权应随级联一并清理"
+    );
+}
+
+/// 删除不存在的菜单返回 404，而不是"删除成功"
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_an_unknown_menu_is_not_found() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{}", uuid::Uuid::new_v4()),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "应返回 404: {body}");
+}
+
+/// 回归：`GET /api/admin/menus?role_id=` 曾对「只勾了子菜单、没勾上级目录」的角色
+/// 返回**空树**。
+///
+/// 早先的 `build_tree` 只把 `parent_id IS NULL` 当根，父节点不在授权集合里的节点
+/// 被悄悄丢弃。于是授权弹窗显示「该角色没有任何权限」，管理员一保存就把授权全清空
+/// ——静默的数据丢失。admin 因被种子授满全部菜单（含所有祖先）而恰好看不出问题。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn role_menu_query_keeps_grants_whose_ancestors_are_not_granted() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    // 造三层临时菜单：目录 → 页面 → 按钮
+    let make_menu = |parent: Option<uuid::Uuid>, name: String, kind: &str| {
+        let mut body = json!({
+            "name": name,
+            "type": kind,
+            "sort_order": 97
+        });
+        if let Some(p) = parent {
+            body["parent_id"] = json!(p);
+        }
+        if kind == "button" {
+            body["permission"] = json!(format!("tmp:test:{}", &unique("p")[5..]));
+        } else {
+            body["path"] = json!(format!("/{}", unique("t")));
+        }
+        body
+    };
+
+    let dir_name = unique("tmp_dir");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(make_menu(None, dir_name.clone(), "directory")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时目录失败: {body}");
+    let dir_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    let page_name = unique("tmp_page");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(make_menu(Some(dir_id), page_name.clone(), "menu")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时页面失败: {body}");
+    let page_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    let btn_name = unique("tmp_btn");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(make_menu(Some(page_id), btn_name.clone(), "button")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时按钮失败: {body}");
+    let btn_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    let role_id = create_role_via_api(&app, &token, &unique("tmp_role")).await;
+
+    // 场景 A：只授权按钮，页面与目录都没授权
+    let (status, body) = assign_menus(&app, &token, role_id, &[btn_id]).await;
+    assert_eq!(status, StatusCode::OK, "授权按钮失败: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/menus?role_id={role_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let names = collect_menu_names(&body["data"]);
+    assert_eq!(
+        names.len(),
+        1,
+        "只授权一个菜单时应只返回它，实际: {names:?}"
+    );
+    assert_eq!(
+        names.first().map(String::as_str),
+        Some(btn_name.as_str()),
+        "只授权按钮时 ?role_id= 必须返回该按钮（早先返回空树）: {names:?}"
+    );
+
+    // 场景 B：授权页面 + 按钮，页面应作为根返回、按钮挂在它下面
+    let (status, body) = assign_menus(&app, &token, role_id, &[page_id, btn_id]).await;
+    assert_eq!(status, StatusCode::OK, "授权页面+按钮失败: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/menus?role_id={role_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let roots = body["data"].as_array().expect("data 应为数组");
+    assert_eq!(
+        roots.len(),
+        1,
+        "页面未授权其父目录，应作为根返回: {roots:?}"
+    );
+    assert_eq!(roots[0]["name"].as_str(), Some(page_name.as_str()));
+    let children = roots[0]["children"].as_array().expect("children 应为数组");
+    assert_eq!(children.len(), 1, "按钮应挂在页面下: {children:?}");
+    assert_eq!(children[0]["name"].as_str(), Some(btn_name.as_str()));
+
+    // 清理：角色无用户占用，可直接删；删目录会级联清掉页面与按钮
+    let (status, body) = delete_role(&app, &token, role_id).await;
+    assert_eq!(status, StatusCode::OK, "清理临时角色失败: {body}");
+    let (status, _) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{dir_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理临时目录失败");
+}
+
+// ──────────────────────────────────────────────
+// 角色即数据：自定义角色可分配（v0.5.0 PR-2 拆掉 ASSIGNABLE_ROLES）
+// ──────────────────────────────────────────────
+
+/// 建用户请求（角色可任意指定，由被测用例决定）
+fn user_payload(username: &str, role: &str) -> Value {
+    json!({
+        "username": username,
+        "email": format!("{username}@example.com"),
+        "password": "user1234",
+        "role": role,
+    })
+}
+
+async fn create_user_via_api(
+    app: &Router,
+    token: &str,
+    username: &str,
+    role: &str,
+) -> (StatusCode, Value) {
+    send(
+        app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(token),
+            Some(user_payload(username, role)),
+        ),
+    )
+    .await
+}
+
+async fn user_exists(username: &str) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)")
+        .bind(username)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询用户失败")
+}
+
+async fn email_in_db(username: &str) -> String {
+    sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE username = $1")
+        .bind(username)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询用户失败")
+}
+
+async fn update_role_via_api(
+    app: &Router,
+    token: &str,
+    role_id: uuid::Uuid,
+    name: &str,
+) -> (StatusCode, Value) {
+    send(
+        app,
+        request(
+            "PUT",
+            &format!("/api/admin/roles/{role_id}"),
+            Some(token),
+            Some(json!({ "name": name, "description": "PR-2 测试" })),
+        ),
+    )
+    .await
+}
+
+async fn role_name_in_db(role_id: uuid::Uuid) -> String {
+    sqlx::query_scalar::<_, String>("SELECT name FROM roles WHERE id = $1")
+        .bind(role_id)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询角色名失败")
+}
+
+/// PR-2 的核心：角色是数据，新建一个角色立刻就能通过用户表单分配。
+/// 拆白名单之前这里是 400，自定义角色永远建不出可用的人。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn custom_role_can_be_assigned_to_a_new_user() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_name = unique("auditor");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+
+    let username = unique("user_auditor");
+    let (status, body) = create_user_via_api(&app, &token, &username, &role_name).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "自定义角色应可分配给新建用户: {body}"
+    );
+    // 注意：`UserInfo.role` 是只有 admin/user 两值的展示用枚举，
+    // 自定义角色在这里一律塌缩成 "user"。真正的角色集合在 `roles`。
+    assert_eq!(
+        body["data"]["roles"][0].as_str(),
+        Some(role_name.as_str()),
+        "响应里的角色集合应是自定义角色: {body}"
+    );
+
+    // 角色关系确实落库（不只是响应里好看）
+    let user_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{user_id}/roles"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let roles: Vec<&str> = body["data"]
+        .as_array()
+        .expect("data 应为数组")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(roles, vec![role_name.as_str()], "{body}");
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 改一个已有用户的角色同样要接受自定义角色（用户表单的 update 路径）。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn custom_role_can_be_assigned_when_updating_a_user() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_name = unique("operator");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+
+    let username = unique("user_promote");
+    let (status, body) = create_user_via_api(&app, &token, &username, "user").await;
+    assert_eq!(status, StatusCode::OK, "创建测试用户失败: {body}");
+    let user_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{user_id}"),
+            Some(&token),
+            Some(user_payload(&username, &role_name)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "更新用户时应接受自定义角色: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{user_id}/roles"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let roles: Vec<&str> = body["data"]
+        .as_array()
+        .expect("data 应为数组")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(roles, vec![role_name.as_str()], "{body}");
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 不存在的角色必须被拒绝，**且不能留下半成品用户**。
+///
+/// `create_user` 先建用户行、再调 `replace_user_roles` 校验角色，两者不在同一事务。
+/// 拆掉白名单后这条路径才真正可达：校验若放在写入之后，就会返回一个 400
+/// 同时在库里留下一个"没有任何角色"的用户。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn unknown_role_is_rejected_without_leaving_a_half_created_user() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let username = unique("user_ghost");
+
+    let (status, body) = create_user_via_api(&app, &token, &username, "ghost_role").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "不存在的角色应返回 400: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ghost_role"),
+        "错误信息应带上实际角色名: {body}"
+    );
+    assert!(
+        !user_exists(&username).await,
+        "请求已失败，用户行不得落库（否则库里多出一个没有任何角色的用户）"
+    );
+}
+
+/// 更新路径同理：角色非法时基础字段也不能被改掉。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn updating_with_unknown_role_changes_nothing() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let username = unique("user_ghost2");
+    let (status, body) = create_user_via_api(&app, &token, &username, "user").await;
+    assert_eq!(status, StatusCode::OK, "创建测试用户失败: {body}");
+    let user_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+    let original_email = email_in_db(&username).await;
+
+    // 故意把邮箱换掉：若角色校验发生在写入之后，这个邮箱就会真的被改掉
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{user_id}"),
+            Some(&token),
+            Some(json!({
+                "username": username,
+                "email": format!("changed-{username}@example.com"),
+                "password": "user1234",
+                "role": "ghost_role",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    assert_eq!(
+        email_in_db(&username).await,
+        original_email,
+        "角色校验失败时不得留下已改过邮箱的半成品: {body}"
+    );
+}
+
+/// 角色名在写入时就归一化，撞名返回 409 而不是 500。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn role_names_are_normalized_on_write_and_conflicts_return_409() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let suffix = unique("n").to_uppercase();
+    let noisy = format!("  MiXeD_{suffix}  ");
+    let canonical = format!("mixed_{}", suffix.to_lowercase());
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/roles",
+            Some(&token),
+            Some(json!({ "name": noisy, "description": "PR-2" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建角色失败: {body}");
+    assert_eq!(
+        body["data"]["name"].as_str(),
+        Some(canonical.as_str()),
+        "角色名应在写入时归一化（trim + 小写）: {body}"
+    );
+    let role_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    // 归一化后同名 → 409（不是 500）。这里必须真的撞上同一个名字：
+    // 建的是 "mixed_<suffix>"，所以第二个名字也得带 MIXED_ 前缀。
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/roles",
+            Some(&token),
+            Some(json!({ "name": format!("MIXED_{}", suffix.to_lowercase()), "description": "PR-2" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "归一化后同名应返回 409: {body}"
+    );
+
+    // 非法名字是 400，不是 500
+    for bad in ["   ", "tab\there", &"a".repeat(51)] {
+        let (status, body) = send(
+            &app,
+            request(
+                "POST",
+                "/api/admin/roles",
+                Some(&token),
+                Some(json!({ "name": bad, "description": "PR-2" })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "非法角色名 {bad:?} 应返回 400: {body}"
+        );
+    }
+
+    // 中间有空格的角色名是合法的（存量库里有这种角色），不能误伤
+    let spaced = unique("senior auditor");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/roles",
+            Some(&token),
+            Some(json!({ "name": spaced, "description": "PR-2" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "中间有空格的角色名应被接受: {body}");
+    assert_eq!(body["data"]["name"].as_str(), Some(spaced.as_str()));
+    let spaced_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+    let _ = delete_role(&app, &token, spaced_id).await;
+
+    // 归一化后的名字可直接用于分配用户
+    let username = unique("user_mixed");
+    let (status, body) = create_user_via_api(&app, &token, &username, &noisy).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "表单传带空格大写的角色名也应命中归一化后的角色: {body}"
+    );
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 内置角色不可改名，也不能把自定义角色改名成内置角色名。
+///
+/// 与「内置角色不可删除」同源：`ADMIN_ROLE = "admin"` 是最后一名管理员保护
+/// （`count_users_with_role`）和权限码种子（`WHERE r.name='admin'`）的查找依据，
+/// 一旦改名这些依据全部落空，系统会变成"没人是管理员"。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn builtin_roles_cannot_be_renamed_or_impersonated() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    // 内置角色改名（含改成自身的小写形式）
+    for name in ["admin", "user"] {
+        let id = role_id_by_name(name).await;
+        for new_name in ["superadmin", &name.to_uppercase()] {
+            let (status, body) = update_role_via_api(&app, &token, id, new_name).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "内置角色 {name} 不应可改名为 {new_name}: {body}"
+            );
+        }
+        assert_eq!(
+            role_name_in_db(id).await,
+            name,
+            "内置角色 {name} 的名字不得被改动"
+        );
+    }
+
+    // 自定义角色改名成内置角色名也要拒绝
+    let role_id = create_role_via_api(&app, &token, &unique("impostor")).await;
+    for builtin in ["admin", "user"] {
+        let (status, body) = update_role_via_api(&app, &token, role_id, builtin).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "不应能改名成内置角色名 {builtin}: {body}"
+        );
+    }
+
+    // 不存在的角色 → 404
+    let (status, body) =
+        update_role_via_api(&app, &token, uuid::Uuid::new_v4(), &unique("ghost_role")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 更新角色返回**真实行**，不是编造的 created_at / user_count。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn updating_a_role_returns_the_real_row() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_name = unique("counted");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+
+    let username = unique("user_counted");
+    let (status, body) = create_user_via_api(&app, &token, &username, &role_name).await;
+    assert_eq!(status, StatusCode::OK, "创建测试用户失败: {body}");
+
+    let (status, updated) = update_role_via_api(&app, &token, role_id, &role_name).await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(
+        updated["data"]["user_count"].as_i64(),
+        Some(1),
+        "该角色有 1 个用户，回读不该编造 user_count=0: {updated}"
+    );
+
+    // created_at 必须是数据库里的原值，而不是"刚刚"
+    let (status, list) = send(&app, request("GET", "/api/admin/roles", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let from_list = list["data"]
+        .as_array()
+        .expect("data 应为数组")
+        .iter()
+        .find(|r| r["id"].as_str() == Some(&role_id.to_string()))
+        .expect("角色列表里应找得到刚更新的角色");
+    assert_eq!(
+        updated["data"]["created_at"].as_str(),
+        from_list["created_at"].as_str(),
+        "更新响应的 created_at 应等于库里的值，不能是 now(): {updated}"
+    );
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// `POST /users/:id/roles` 与用户表单走同一套归一化。
+///
+/// 否则同一个角色经表单提交 "admin" 成功、经本接口提交 "Admin" 却 404。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn append_role_endpoint_normalizes_the_role_name() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let role_name = unique("appendable");
+    let _role_id = create_role_via_api(&app, &token, &role_name).await;
+
+    let username = unique("user_append");
+    let (status, body) = create_user_via_api(&app, &token, &username, "user").await;
+    assert_eq!(status, StatusCode::OK, "创建测试用户失败: {body}");
+    let user_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{user_id}/roles"),
+            Some(&token),
+            Some(json!({ "user_id": user_id, "role_name": format!("  {}  ", role_name.to_uppercase()) })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "追加角色应先归一化再查库: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{user_id}/roles"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut roles: Vec<String> = body["data"]
+        .as_array()
+        .expect("data 应为数组")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    roles.sort();
+    let mut expected = vec!["user".to_string(), role_name.clone()];
+    expected.sort();
+    assert_eq!(roles, expected, "{body}");
+}
+
 /// 契约测试：每个 `/api/admin/*` handler 都必须声明类型化权限码守卫。
 ///
 /// 防止将来新增管理接口时漏接守卫，从而绕过授权体系。守卫是签名里的提取器参数
@@ -853,11 +1836,14 @@ fn every_admin_handler_declares_a_permission_guard() {
             }
             checked += 1;
 
-            // 守卫是签名里的类型化提取器参数，在提取阶段完成校验
-            let has_guard = signature.contains("_perm: Perm");
+            // 守卫是签名里的类型化提取器参数，在提取阶段完成校验。
+            // 参数名允许带或不带 `_` 前缀：v0.5.0 PR-3 起部分 handler 除提取阶段校验外，
+            // 还要在函数体里用它做"能否授予他人权限"的包含关系判定，
+            // 此时写成 `perm: Perm…`（去掉 `_` 以免 unused 警告）。
+            let has_guard = signature.contains("_perm: Perm") || signature.contains("perm: Perm");
             if !has_guard {
                 offenders.push(format!(
-                    "{}::{name} 未声明类型化权限码守卫（_perm: Perm…）",
+                    "{}::{name} 未声明类型化权限码守卫（_perm/perm: Perm…）",
                     path.file_name().unwrap().to_string_lossy()
                 ));
             }
@@ -873,4 +1859,673 @@ fn every_admin_handler_declares_a_permission_guard() {
         "以下管理接口缺少权限码守卫:\n  {}",
         offenders.join("\n  ")
     );
+}
+
+/// **PR-3 核心不变量的回归防线**：凡是"能把权限给别人"的写路径，
+/// 都必须在函数体里做授权下界判定（能授予的 ⊆ 自己已持有的）。
+///
+/// 撤掉 `require_role("admin")` 后，权限码守卫只回答"这个接口能不能调"，
+/// 不再回答"能不能把权限给别人"。少了下面这层，包含 `system:user:create`
+/// 的角色就能建出 admin 用户、包含 `system:user:update` 的角色就能
+/// 重置 admin 口令——**接口级 403 全绿，系统却已完成提权**，
+/// 只看接口返回码的测试发现不了，所以这条按源码结构断言。
+#[test]
+fn every_authority_delegating_handler_checks_the_superset_rule() {
+    /// (文件名, handler 名, 必须在函数体里出现的判定调用)
+    const REQUIRED: &[(&str, &str, &str)] = &[
+        // ── 授予角色：建号 / 改号 / 追加角色 ──
+        ("user.rs", "create_user", "ensure_can_grant_roles"),
+        ("user.rs", "update_user", "ensure_can_grant_roles"),
+        ("role.rs", "assign_user_role", "ensure_can_grant_roles"),
+        // ── 作用于既有账号：接管/停用/删除 ──
+        // reset_user_password 是其中最直接的一条：拿到 admin 的新口令
+        // 就等于登录成 admin，不需要再走"授予角色"。
+        ("user.rs", "reset_user_password", "ensure_can_grant_roles"),
+        ("user.rs", "delete_user", "ensure_can_grant_roles"),
+        ("user.rs", "batch_delete_users", "ensure_can_grant_roles"),
+        ("user.rs", "toggle_user_status", "ensure_can_grant_roles"),
+        // ── 直接分配权限码：meta 能力，漏掉就能自授全部码 ──
+        ("menu.rs", "assign_role_menus", "ensure_covers"),
+        // 改写已授权按钮的 permission = 绕过 role_menus 链当场自授
+        ("menu.rs", "update_menu", "ensure_covers"),
+    ];
+
+    let controller_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/controller");
+    let mut offenders: Vec<String> = Vec::new();
+
+    for (file, name, needle) in REQUIRED {
+        let path = controller_dir.join(file);
+        let source = std::fs::read_to_string(&path).expect("读取 controller 源文件失败");
+
+        // 与 every_admin_handler_declares_a_permission_guard 同一套切分逻辑
+        let needle_marker = format!("pub async fn {name}(");
+        let Some(start) = source.find(&needle_marker) else {
+            offenders.push(format!("{file}::{name} 未找到 handler 定义"));
+            continue;
+        };
+        let body_start = source[start..]
+            .find('{')
+            .map(|o| start + o)
+            .expect("handler 应有函数体");
+        let rest = &source[body_start..];
+        let body = match rest.find("\npub async fn ") {
+            Some(o) => &rest[..o],
+            None => rest,
+        };
+
+        if !body.contains(needle) {
+            offenders.push(format!(
+                "{file}::{name} 是能授予权限的写路径，但缺少 {needle} 授权下界判定"
+            ));
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "以下写路径缺少授权下界判定（撤掉角色闸门后即提权）:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// 角色闸门必须保持删除状态。
+///
+/// `require_role("admin")` 与权限码守卫曾是 AND 语义：它天然盖住了提权路径，
+/// 但也因此让"能进管理区"变成角色名说了算。PR-3 把它连同函数一起删掉，
+/// 避免留下一个无人调用的角色闸门，在下一次改动里被误当成"更安全的兜底"接回去。
+#[test]
+fn the_role_gate_stays_removed() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    /// 去掉 `//` 行注释后再匹配：
+    /// 注释里提到 `require_role` 是**有意保留的迁移说明**，不是调用点。
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|line| match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    let router = strip_line_comments(
+        &std::fs::read_to_string(manifest.join("src/router/mod.rs"))
+            .expect("读取 src/router/mod.rs 失败"),
+    );
+    assert!(
+        !router.contains("require_role"),
+        "路由层不应再挂角色闸门：权限码守卫已是唯一闸门"
+    );
+
+    let auth = strip_line_comments(
+        &std::fs::read_to_string(manifest.join("src/middleware/auth.rs"))
+            .expect("读取 src/middleware/auth.rs 失败"),
+    );
+    assert!(
+        !auth.contains("fn require_role"),
+        "require_role 已无调用方，应删除而不是留着备用"
+    );
+}
+
+// ──────────────────────────────────────────────
+// PR-3：角色闸门撤掉后的授权下界
+// ──────────────────────────────────────────────
+
+async fn user_id_by_username(username: &str) -> uuid::Uuid {
+    sqlx::query_scalar::<_, uuid::Uuid>("SELECT id FROM users WHERE username = $1")
+        .bind(username)
+        .fetch_one(&pool().await)
+        .await
+        .expect("按用户名查 id 失败")
+}
+
+/// 造一个**不是 admin**、只持有指定权限码的操作员，返回 (token, role_id, user_id)
+///
+/// 这是 PR-3 的核心夹具。撤掉 `require_role("admin")` 之后，"能进管理区"
+/// 完全由这些码决定，所以提权面**必须用持有部分码的非 admin 才能测出来**——
+/// 拿 admin 当夹具会把所有"应被拒"的断言都测成"当然通过"。
+async fn operator_with_codes(
+    app: &Router,
+    admin_tok: &str,
+    prefix: &str,
+    codes: &[&str],
+) -> (String, uuid::Uuid, uuid::Uuid) {
+    let role_name = unique(&format!("{prefix}_role"));
+    let role_id = create_role_via_api(app, admin_tok, &role_name).await;
+
+    let mut menu_ids = Vec::new();
+    for code in codes {
+        menu_ids.push(menu_id_of(code).await);
+    }
+    let (status, body) = assign_menus(app, admin_tok, role_id, &menu_ids).await;
+    assert_eq!(status, StatusCode::OK, "给测试角色授权失败: {body}");
+
+    let username = unique(&format!("{prefix}_user"));
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "user1234",
+                "role": role_name
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建测试操作员失败: {body}");
+    let user_id = body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("创建用户响应里没有 id: {body}"));
+
+    let token = login_token(app, &username, "user1234").await;
+    let (_, mine) = send(
+        app,
+        request("GET", "/api/auth/permissions", Some(&token), None),
+    )
+    .await;
+    let held: Vec<String> =
+        serde_json::from_value(mine["data"].clone()).expect("权限码响应格式错误");
+    assert_eq!(
+        held.len(),
+        codes.len(),
+        "夹具应恰好只持有指定权限码（admin 全码会让提权断言失去意义），实际 {held:?}"
+    );
+
+    (token, role_id, user_id)
+}
+
+/// **正向**：持有 `system:user:list` 的非 admin 现在能进管理区。
+///
+/// PR-3 之前这里必然 403——`require_role("admin")` 拦在权限码之前，
+/// 于是"只管查用户"这类自定义角色形同虚设，权限码授权树对它没有意义。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_non_admin_holding_the_code_can_reach_the_interface() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (tok, _role_id, _uid) =
+        operator_with_codes(&app, &admin_tok, "readonly_op", &[permission::USER_LIST]).await;
+
+    let (status, body) = send(&app, request("GET", "/api/admin/users", Some(&tok), None)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "持有 system:user:list 的角色应能读用户列表: {body}"
+    );
+
+    // 但只有 list 就不能改：权限码仍然逐接口强制
+    let admin_id = user_id_by_username("admin").await;
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{admin_id}"),
+            Some(&tok),
+            Some(json!({
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+                "role": "user"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "只有 list 码时不应能改用户: {body}"
+    );
+
+    // 403 必须发生在校验入参之前，admin 未被误改
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": "admin", "password": "admin123" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin 账号应未被误改");
+}
+
+/// **核心提权防线**：能建号 ≠ 能建管理员。
+///
+/// 这条正是 PR-2 记下的遗留："持有 `system:user:create` 的管理员可以建出
+/// admin 用户——创建用户即等于授予管理员"。闸门撤掉后它从"被角色闸门
+/// 顺手盖住"变成"接口级守卫放行"，必须由授权下界显式拦住。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn creating_a_user_with_a_role_you_do_not_hold_is_denied() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (tok, _role_id, _uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "creator_op",
+        &[permission::USER_LIST, permission::USER_CREATE],
+    )
+    .await;
+
+    let username = unique("escalated_admin");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "user1234",
+                "role": "admin"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "system:user:create 不得被用来建出 admin: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("admin"),
+        "403 文案应指名缺失的权限码，让管理员知道该去勾哪个按钮: {body}"
+    );
+
+    // 反向对照：授予无权限码的 user 角色必须放行，
+    // 否则这条规则就退化成"一律不许建用户"
+    let plain = unique("plain_created");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&tok),
+            Some(json!({
+                "username": plain,
+                "email": format!("{plain}@example.com"),
+                "password": "user1234",
+                "role": "user"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "授予无权限码的 user 角色不应被拦（它不授予任何能力）: {body}"
+    );
+}
+
+/// **最直接的接管路径**：重置高权限账号的口令。
+///
+/// 比"授予角色"更直接——拿到 admin 的新口令就等于登录成 admin，
+/// 不需要再走任何授权链。此前只要有 `system:user:update` 就能做到。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn resetting_a_stronger_account_password_is_denied() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (tok, _role_id, uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "resetter_op",
+        &[permission::USER_LIST, permission::USER_UPDATE],
+    )
+    .await;
+
+    let admin_id = user_id_by_username("admin").await;
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{admin_id}/reset-password"),
+            Some(&tok),
+            Some(json!({ "password": "hijacked123" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "system:user:update 不得被用来重置 admin 口令: {body}"
+    );
+
+    // 反向对照：重置一个权限不高于自己的账号必须放行
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{uid}/reset-password"),
+            Some(&tok),
+            Some(json!({ "password": "user1234" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重置平级账号口令不应被拦: {body}");
+}
+
+/// 追加语义的角色接口曾是一条**独立**的提权路径。
+///
+/// `POST /users/:id/roles` 是追加而非整体替换，用户表单那道守卫覆盖不到它，
+/// 所以 `role_name=admin` 曾可独立生效（PR-2 已记录该语义差异）。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn appending_a_stronger_role_to_a_user_is_denied() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (tok, _role_id, uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "appender_op",
+        &[permission::USER_LIST, permission::USER_UPDATE],
+    )
+    .await;
+
+    // 给自己追加 admin —— 典型的自我提权
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{uid}/roles"),
+            Some(&tok),
+            // 只给 role_name：与路径重复的 user_id 已是可选，
+            // 否则漏传它会得到 422 而不是 403——那就不是在测授权了
+            Some(json!({ "role_name": "admin" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "不得给自己追加 admin 角色: {body}"
+    );
+}
+
+/// `system:menu:grant` 本身就是"把权限码授予角色"的元能力。
+///
+/// 不设包含关系的话，持有它的角色把全部按钮菜单授予**自己的角色**即可
+/// 自授全部权限码——一条与用户/角色完全无关的独立提权路径。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn menu_grant_cannot_self_escalate() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (tok, role_id, _uid) =
+        operator_with_codes(&app, &admin_tok, "granter_op", &[permission::MENU_GRANT]).await;
+
+    // 试图把 user:delete 那个按钮授予自己的角色
+    let delete_btn = menu_id_of(permission::USER_DELETE).await;
+    let (status, body) = assign_menus(&app, &tok, role_id, &[delete_btn]).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "menu:grant 不得被用来授予自己没有的权限码: {body}"
+    );
+    assert!(
+        !granted_menu_ids(role_id).await.contains(&delete_btn),
+        "被拒后授权必须完全没写入"
+    );
+
+    // 授予自己已持有的 menu:grant 是等集，必须放行
+    // （否则该角色连维持自己的授权都做不到）
+    let grant_btn = menu_id_of(permission::MENU_GRANT).await;
+    let (status, body) = assign_menus(&app, &tok, role_id, &[grant_btn]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "授予自己已持有的权限码不应被拦（等集是子集）: {body}"
+    );
+
+    // 边界另一侧：把**未持有**的码授予**别的**角色必须放行。
+    //
+    // 这是"定义权限码"与"持有权限码"两件事的分离点——admin 造一个新码再分发给
+    // 各角色是权限码即数据的核心工作流，若一并禁掉，权限码就退化成只能读不能写。
+    // 授给别人不会让调用者变强；而那个角色之后若被授给调用者，
+    // 会在 `ensure_can_grant_roles` 的包含关系判定处被拦住。
+    let other_role = create_role_via_api(&app, &admin_tok, &unique("grantee_role")).await;
+    let (status, body) = assign_menus(&app, &tok, other_role, &[delete_btn]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "把未持有的码授予别的角色不应被拦: {body}"
+    );
+    assert!(
+        granted_menu_ids(other_role).await.contains(&delete_btn),
+        "授予必须真的写入"
+    );
+}
+
+/// 改写**已授权菜单**的 `permission` 是绕过 `role_menus` 链自授权限码的旁路。
+///
+/// 只守 `assign_role_menus` 是不够的：`menus.permission` 本身就是权限码，
+/// 把一个已经授予调用者的按钮改成自己没持有的码，
+/// "角色→菜单→权限码"这条链会当场在自己身上生效——既不需要 `menu:grant`，
+/// 也不需要新建菜单。
+///
+/// **为什么用一次性临时码，而不是直接拿 `system:user:delete` 做演示：**
+/// 真实码已经挂在"删除用户"那行上，`menus.permission` 的唯一索引（迁移 007）
+/// 会先于守卫报错；绕开它就得先清空那一行，于是这条用例会顺手把 admin 的
+/// `system:user:delete` 摘掉——共享测试库里 admin 平白少一个码，
+/// 症状要等到别的用例才爆出来。临时码没这个副作用：
+/// 守卫只比对**码的集合关系**，与码值本身无关，拦下 `tmp:priv:xxxxxx`
+/// 就等于拦下 `system:user:delete`。
+///
+/// 同样地，攻击需要**两步**才能绕过唯一索引：先清空临时按钮腾出这个码，
+/// 再把它改指到自己已获授权的按钮上。断言因此真的落在守卫上，
+/// 而不是被数据库挡在前面。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn rewriting_a_granted_menu_permission_to_an_unheld_code_is_denied() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (tok, role_id, _uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "menu_editor",
+        &[permission::MENU_LIST, permission::MENU_UPDATE],
+    )
+    .await;
+
+    let list_btn = menu_id_of(permission::MENU_LIST).await;
+    assert!(
+        granted_menu_ids(role_id).await.contains(&list_btn),
+        "夹具应已把 menu:list 按钮授予自己的角色"
+    );
+
+    // admin 造一个带一次性临时码的按钮，**不授予任何角色**——
+    // 正好落在"存在于系统、但调用者不持有"这个位置。
+    let tmp_code = format!("tmp:priv:{}", &unique("p")[5..]);
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&admin_tok),
+            Some(json!({
+                "name": unique("tmp_priv_dir"),
+                "type": "directory",
+                "path": format!("/{}", unique("tmp")),
+                "sort_order": 99
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时目录失败: {body}");
+    let tmp_dir =
+        uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).expect("临时目录响应里没有 id");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&admin_tok),
+            Some(json!({
+                "parent_id": tmp_dir,
+                "name": "临时私有按钮",
+                "type": "button",
+                "permission": tmp_code,
+                "sort_order": 99
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时按钮失败: {body}");
+    let tmp_btn =
+        uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).expect("临时按钮响应里没有 id");
+
+    // 第一步：清空临时按钮的 permission，腾出这个码。
+    // 清空是"移除权限"而非"授予权限"，守卫不拦它。
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{tmp_btn}"),
+            Some(&tok),
+            Some(json!({ "permission": "" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清空按钮权限码应放行: {body}");
+
+    // 第二步：唯一索引已经腾出位置，此时改指必须由守卫拦住
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{list_btn}"),
+            Some(&tok),
+            Some(json!({ "permission": tmp_code })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "两步改指（先清空再改写）应被守卫拦住: {body}"
+    );
+
+    // 该按钮的 permission 必须原样未被改写：查库确认，而不是只看响应码
+    let actual: Option<String> = sqlx::query_scalar("SELECT permission FROM menus WHERE id = $1")
+        .bind(list_btn)
+        .fetch_one(&pool().await)
+        .await
+        .expect("读取菜单 permission 失败");
+    assert_eq!(
+        actual.as_deref(),
+        Some(permission::MENU_LIST),
+        "被拒后 permission 必须原样未被改写"
+    );
+
+    // 该操作员仍不应持有这个临时码
+    let (_, mine) = send(
+        &app,
+        request("GET", "/api/auth/permissions", Some(&tok), None),
+    )
+    .await;
+    let held: Vec<String> = serde_json::from_value(mine["data"].clone()).expect("权限码格式错误");
+    assert!(!held.contains(&tmp_code), "提权未生效，实际持有 {held:?}");
+
+    // 清理：临时按钮没授予过任何角色，删掉父目录即级联清掉，不碰任何真实码。
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{tmp_dir}"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除临时目录失败: {body}");
+    assert!(
+        !menu_still_exists(tmp_dir).await,
+        "临时目录应已从共享测试库清干净"
+    );
+    assert!(
+        !menu_still_exists(tmp_btn).await,
+        "临时按钮应随父目录级联删除"
+    );
+}
+
+/// 正向对照：持有全部权限码的 admin 仍然能建出 admin 用户。
+///
+/// 授权下界是"包含关系"而非"角色名白名单"，所以这条必须通——
+/// 否则规则就退化成"谁都不许管理管理员"，等于把系统锁死。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn admin_can_still_create_another_admin() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+
+    let username = unique("second_admin");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "admin123",
+                "role": "admin"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "admin 持全部码，应仍能授予 admin 角色: {body}"
+    );
+    assert!(
+        body["data"]["roles"]
+            .as_array()
+            .map(|a| a.iter().any(|v| v == "admin"))
+            .unwrap_or(false),
+        "响应应回显 admin 角色: {body}"
+    );
+
+    // 必须清理掉这个第二管理员。
+    //
+    // 测试库是**长期存在**的共享库，而 `last_admin_cannot_be_demoted_or_deleted`
+    // 断言的前提是"库里只有一名管理员"（它把当前登录的 admin 自己降级，
+    // 期望被"不能移除最后一名管理员"拦下）。留下第二名管理员会让那个前提
+    // 不成立，降级就会真的成功，随后**所有**用 admin 令牌的用例集体 403——
+    // 症状出现在别的测试上，极难定位。
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/users/{}", user_id_by_username(&username).await),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理第二个管理员失败: {body}");
 }

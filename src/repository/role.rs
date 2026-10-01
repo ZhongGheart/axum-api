@@ -38,6 +38,19 @@ impl RoleRepository {
         .map_err(|e| AppError::InternalServerError(format!("查询角色失败: {e}")))
     }
 
+    /// 按 ID 查角色名
+    ///
+    /// `assign_role_menus` 的入参是 `role_id`，而授权下界判定要比较
+    /// "这个角色是不是调用者自己的"，后者以角色名为准——
+    /// [`crate::middleware::auth::AuthenticatedUser::roles`] 里存的是名字。
+    pub async fn find_name_by_id(&self, id: Uuid) -> Result<Option<String>, AppError> {
+        sqlx::query_scalar::<_, String>("SELECT name FROM roles WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("查询角色名失败: {e}")))
+    }
+
     /// 查询所有角色（含用户数）
     pub async fn list_all(&self) -> Result<Vec<(RoleRow, i64)>, AppError> {
         let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, DateTime<Utc>, i64)>(

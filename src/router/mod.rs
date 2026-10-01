@@ -146,21 +146,44 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
             auth_middleware,
         ));
 
-    // ── 需要 admin 角色的路由 ──────────────────────────────────
+    // ── 系统管理路由（权限码闸门，无角色闸门）────────────────
+    //
+    // v0.5.0 PR-3 起不再叠加 `require_role("admin")`：
+    // "能不能进管理区"完全由各 handler 的类型化权限码守卫决定，
+    // 持有 `system:user:list` 这类码的自定义角色即可管理对应模块。
+    // 授权下界（能授予的 ⊆ 自己已持有的）见 `middleware::permission`。
     let admin_routes = Router::new()
         .route("/api/admin/test", get(rbac::admin_test))
-        .route("/api/admin/users", get(user::list_users).post(user::create_user))
-        .route("/api/admin/users/{id}", axum::routing::put(user::update_user).delete(user::delete_user))
-        .route("/api/admin/roles", get(role::list_roles).post(role::create_role))
-        .route("/api/admin/roles/{id}", axum::routing::put(role::update_role).delete(role::delete_role))
-        .route("/api/admin/users/{user_id}/roles", get(role::get_user_roles).post(role::assign_user_role))
-        .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware))
-        .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-            async move { crate::middleware::auth::require_role("admin", req, next).await }
-        }))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route(
+            "/api/admin/users",
+            get(user::list_users).post(user::create_user),
+        )
+        .route(
+            "/api/admin/users/{id}",
+            axum::routing::put(user::update_user).delete(user::delete_user),
+        )
+        .route(
+            "/api/admin/roles",
+            get(role::list_roles).post(role::create_role),
+        )
+        .route(
+            "/api/admin/roles/{id}",
+            axum::routing::put(role::update_role).delete(role::delete_role),
+        )
+        .route(
+            "/api/admin/users/{user_id}/roles",
+            get(role::get_user_roles).post(role::assign_user_role),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit_log_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
-    // ── 菜单管理路由（仅 admin） ────────────────────────────
+    // ── 菜单管理路由 ────────────────────────────────────────
     let menu_routes = Router::new()
         .route(
             "/api/admin/menus",
@@ -178,27 +201,39 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
             state.clone(),
             audit_log_middleware,
         ))
-        .route_layer(middleware::from_fn(move |req, next| async move {
-            crate::middleware::auth::require_role("admin", req, next).await
-        }))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ));
 
-    // ── 数据字典路由（仅 admin） ────────────────────────────
+    // ── 数据字典管理路由 ────────────────────────────────────
     let dict_routes = Router::new()
-        .route("/api/admin/dict/types", get(dict::list_types).post(dict::create_type))
-        .route("/api/admin/dict/types/{id}", axum::routing::put(dict::update_type).delete(dict::delete_type))
-        .route("/api/admin/dict/items", get(dict::list_items).post(dict::create_item))
-        .route("/api/admin/dict/items/{id}", axum::routing::put(dict::update_item).delete(dict::delete_item))
+        .route(
+            "/api/admin/dict/types",
+            get(dict::list_types).post(dict::create_type),
+        )
+        .route(
+            "/api/admin/dict/types/{id}",
+            axum::routing::put(dict::update_type).delete(dict::delete_type),
+        )
+        .route(
+            "/api/admin/dict/items",
+            get(dict::list_items).post(dict::create_item),
+        )
+        .route(
+            "/api/admin/dict/items/{id}",
+            axum::routing::put(dict::update_item).delete(dict::delete_item),
+        )
         .route("/api/admin/dict/cached", get(dict::list_all_cached))
         .route("/api/admin/dict/refresh", post(dict::refresh_cache))
-        .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware))
-        .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-            async move { crate::middleware::auth::require_role("admin", req, next).await }
-        }))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit_log_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // ── 数据字典读取（任意已登录用户） ──────────────────────
     // 字典是通用展示数据；要求 admin 会让所有非管理页面的 DictSelect 直接 403
@@ -213,33 +248,66 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
             auth_middleware,
         ));
 
-    // ── 能力测试路由（仅 admin） ────────────────────────────
+    // ── 能力测试与用户写操作路由 ────────────────────────────
     let demo_routes = Router::new()
-        .route("/api/admin/export/users", axum::routing::get(demo::export_users))
-        .route("/api/admin/validate", axum::routing::post(demo::validate_test))
-        .route("/api/admin/audit-logs", axum::routing::get(demo::list_audit_logs))
-        .route("/api/admin/logs/audit/export", axum::routing::get(demo::export_audit_logs))
-        .route("/api/admin/users/batch-delete", axum::routing::post(user::batch_delete_users))
-        .route("/api/admin/users/{id}/status", axum::routing::put(user::toggle_user_status))
-        .route("/api/admin/users/{id}/reset-password", axum::routing::post(user::reset_user_password))
-        .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware))
-        .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-            async move { crate::middleware::auth::require_role("admin", req, next).await }
-        }))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route(
+            "/api/admin/export/users",
+            axum::routing::get(demo::export_users),
+        )
+        .route(
+            "/api/admin/validate",
+            axum::routing::post(demo::validate_test),
+        )
+        .route(
+            "/api/admin/audit-logs",
+            axum::routing::get(demo::list_audit_logs),
+        )
+        .route(
+            "/api/admin/logs/audit/export",
+            axum::routing::get(demo::export_audit_logs),
+        )
+        .route(
+            "/api/admin/users/batch-delete",
+            axum::routing::post(user::batch_delete_users),
+        )
+        .route(
+            "/api/admin/users/{id}/status",
+            axum::routing::put(user::toggle_user_status),
+        )
+        .route(
+            "/api/admin/users/{id}/reset-password",
+            axum::routing::post(user::reset_user_password),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit_log_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
-    // ── 系统监控路由（仅 admin） ────────────────────────────
+    // ── 系统监控路由 ────────────────────────────────────────
     let monitor_routes = Router::new()
         .route("/api/admin/monitor/system", get(monitor::system_info))
         .route("/api/admin/monitor/api-metrics", get(monitor::api_metrics))
         .route("/api/admin/monitor/alerts", get(monitor::alerts))
-        .route("/api/admin/monitor/metrics/reset", post(monitor::reset_metrics))
-        .route("/api/admin/monitor/system/export", get(monitor::export_system))
-        .layer(middleware::from_fn_with_state(state.clone(), audit_log_middleware))
-        .route_layer(middleware::from_fn(move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
-            async move { crate::middleware::auth::require_role("admin", req, next).await }
-        }))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route(
+            "/api/admin/monitor/metrics/reset",
+            post(monitor::reset_metrics),
+        )
+        .route(
+            "/api/admin/monitor/system/export",
+            get(monitor::export_system),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit_log_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // ── 合并所有路由并应用全局中间件 ──────────────────────────
     let rate_limit_state = (

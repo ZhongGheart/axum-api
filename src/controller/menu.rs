@@ -148,10 +148,22 @@ pub async fn create_menu(
 )]
 pub async fn update_menu(
     State(state): State<AppState>,
-    _perm: PermMenuUpdate,
+    perm: PermMenuUpdate,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
+    // 授权下界（v0.5.0 PR-3）：`menus.permission` 是权限码本身。
+    // 把一个**已授权给调用者的**按钮菜单的 permission 改掉，
+    // 等于让"角色→菜单→权限码"这条链在自己身上当场生效：
+    // 持 `system:menu:update` 的角色可以把已授权按钮改成 `system:user:delete`，
+    // 不需要 `menu:grant`，也不需要新建菜单——绕过授予下界的旁路。
+    // 因此改写 permission 必须持有目标码。
+    if let Some(new_permission) = req.permission.as_deref().filter(|p| !p.is_empty()) {
+        let required = vec![new_permission.to_string()];
+        perm.guard()
+            .ensure_covers(&required, "把菜单的权限码改为该值")?;
+    }
+
     let saved = state.menu_repo.update(id, &req).await?;
     Ok(Json(ApiResponse::success(MenuNode::from(saved))))
 }
@@ -186,10 +198,40 @@ pub async fn delete_menu(
 )]
 pub async fn assign_role_menus(
     State(state): State<AppState>,
-    _perm: PermMenuGrant,
+    perm: PermMenuGrant,
+    auth_user: AuthenticatedUser,
     Path(role_id): Path<Uuid>,
     Json(req): Json<AssignMenuRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    // 授权下界（v0.5.0 PR-3）：`system:menu:grant` 是"把权限码授予角色"的元能力，
+    // 持有它就能把全部按钮菜单授予某个角色，因此**自授**必须拦住。
+    //
+    // 判定只针对"调用者自己的角色"，而不是"全部授权"：
+    //
+    // - 授给**别的**角色不会让调用者变强。而且这条不能禁——admin 造一个新权限码
+    //   再分发给各角色，正是"权限码即数据"的核心工作流；若要求"只能授予自己
+    //   已持有的码"，admin 连自己刚造的码都发不出去。
+    // - 间接路径仍然闭合：先授给别的角色、之后该角色被授给调用者时，
+    //   `ensure_can_grant_roles` 的包含关系判定会按"目标角色的码 ⊆ 你的码"拦住。
+    //
+    // 只有 `type='button'` 的行携带权限码（见 repo 层的过滤条件）；
+    // 目录/页面菜单只影响导航可见性，不授予接口能力，故不受此限。
+    let target_role_name = state
+        .auth_service
+        .role_repo
+        .find_name_by_id(role_id)
+        .await?;
+    if let Some(name) = target_role_name.as_deref() {
+        if auth_user.roles.iter().any(|r| r == name) {
+            let granted_codes = state
+                .menu_repo
+                .find_permission_codes_by_menu_ids(&req.menu_ids)
+                .await?;
+            perm.guard()
+                .ensure_covers(&granted_codes, "把该菜单集合授予自己的角色")?;
+        }
+    }
+
     state
         .menu_repo
         .assign_role_menus(role_id, &req.menu_ids)

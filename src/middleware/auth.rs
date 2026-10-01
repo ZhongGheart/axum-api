@@ -3,10 +3,15 @@
 //! 从请求的 `Authorization: Bearer <token>` 头中提取并验证 JWT 令牌。
 //! 验证通过后将用户信息注入到请求扩展中，供后续处理器使用。
 //!
-//! 同时提供 `require_role`（粗粒度角色闸门）。细粒度的权限码闸门见 `super::permission`。
+//! 粗粒度的角色闸门已于 v0.5.0 PR-3 移除：`require_role` 连同 `router` 里 5 处
+//! `require_role("admin")` 一起删掉了。
 //!
-//! 两者是 AND 语义：`require_role("admin")` 决定"能不能进管理区"，
-//! `PermissionGuard::require(权限码)` 决定"能进管理区的哪一部分"。
+//! 两者曾是 AND 语义——角色闸门天然是权限码的上游闸门，因此也顺带挡住了
+//! "持有 `system:user:create` 就能建出 admin 用户"这类提权。闸门一撤，
+//! 授权改由权限码独占决定，**能授予的 ⊆ 自己已持有的**这层下界
+//! 见 [`crate::middleware::permission`]。保留一个无人调用的角色闸门
+//! 只会在下一次改动里被误当成"更安全的兜底"接回去，所以直接删掉。
+//!
 //! 权限码存放在 `menus.permission`（`type='button'` 的菜单行），经 `role_menus` 授权，
 //! 定义见 [`crate::model::permission`]。
 
@@ -155,33 +160,4 @@ where
             .cloned()
             .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "未认证，请先登录"))
     }
-}
-
-/// 角色权限验证中间件
-pub async fn require_role(
-    role: &'static str,
-    req: Request,
-    next: Next,
-) -> Result<impl IntoResponse, Response> {
-    let auth_user = req
-        .extensions()
-        .get::<AuthenticatedUser>()
-        .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "未认证"))?;
-
-    let has_role = auth_user.roles.iter().any(|r| r == role) || auth_user.role == role;
-
-    if !has_role {
-        tracing::warn!(
-            "require_role({}): 用户 {} 角色 {:?} 权限不足",
-            role,
-            auth_user.user_id,
-            auth_user.roles
-        );
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            format!("需要 {role} 角色权限"),
-        ));
-    }
-
-    Ok(next.run(req).await)
 }

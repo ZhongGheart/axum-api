@@ -48,7 +48,15 @@
           <n-input v-model:value="formData.password" type="password" />
         </n-form-item>
         <n-form-item label="角色" path="role">
-          <n-select v-model:value="formData.role" :options="roleOptions" />
+          <n-select
+            v-model:value="formData.role"
+            :options="roleOptions"
+            :disabled="!!rolesUnavailable"
+            :placeholder="rolesUnavailable ? '角色列表不可用' : '请选择角色'"
+          />
+          <div v-if="rolesUnavailable" style="color: #d03050; font-size: 12px; margin-top: 4px">
+            {{ rolesUnavailable }}
+          </div>
         </n-form-item>
         <n-form-item label="状态">
           <n-switch v-model:value="formData.is_active" />
@@ -76,6 +84,15 @@ import BaseTable from '@/components/common/BaseTable.vue'
 import SearchForm from '@/components/common/SearchForm.vue'
 import PermissionButton from '@/components/common/PermissionButton.vue'
 import { PERM } from '@/constants/permission'
+import { ADMIN_ROLE_NAME } from '@/constants/builtin'
+import { roleApi, type RoleItem } from '@/api/role'
+import type { RoleListItem, RoleSelectOption } from '@/utils/role'
+import {
+  buildRoleSelectOptions,
+  currentRoleName,
+  DEFAULT_ROLE_NAME,
+  pickDefaultRole,
+} from '@/utils/role'
 
 // ── 状态 ────────────────────────────────────────────────────────
 
@@ -90,10 +107,26 @@ const page = ref(1)
 const pageSize = ref(10)
 const formRef = ref<FormInst | null>(null)
 
-const roleOptions = [
-  { label: '管理员', value: 'admin' },
-  { label: '普通用户', value: 'user' },
-]
+const roleOptions = ref<RoleSelectOption[]>([])
+const availableRoles = ref<RoleListItem[]>([])
+const rolesUnavailable = ref<string | null>(null)
+
+/**
+ * 按需加载角色列表，并缓存结果
+ *
+ * 刻意懒加载：`GET /admin/roles` 需要 `system:role:list`，
+ * 只浏览用户列表、没有建/改用户权限的账号根本不该被要求具备这个权限。
+ * 失败不重试——多半是权限不足，重试只会刷一遍错误提示。
+ */
+async function ensureRolesLoaded() {
+  if (availableRoles.value.length > 0 || rolesUnavailable.value) return
+  try {
+    // 响应拦截器已拆出 data.data，但类型上仍是 AxiosResponse——沿用仓库既有写法
+    availableRoles.value = (await roleApi.list()) as unknown as RoleItem[]
+  } catch {
+    rolesUnavailable.value = '无法读取角色列表，请检查是否具备角色查看权限'
+  }
+}
 
 interface UserForm {
   username: string
@@ -107,7 +140,7 @@ const formData = ref<UserForm>({
   username: '',
   email: '',
   password: '',
-  role: 'user',
+  role: DEFAULT_ROLE_NAME,
   is_active: true,
 })
 
@@ -136,7 +169,9 @@ const columns: DataTableColumn[] = [
     width: 100,
     render(row: Record<string, unknown>) {
       const r = row as unknown as UserInfo
-      return h(NTag, { type: r.role === 'admin' ? 'warning' : 'info', size: 'small' }, () => r.role)
+      // 显示真实角色集合：r.role 是两值枚举，自定义角色会被塌缩成 "user"
+      const name = currentRoleName(r)
+      return h(NTag, { type: name === ADMIN_ROLE_NAME ? 'warning' : 'info', size: 'small' }, () => name)
     },
   },
   {
@@ -202,21 +237,35 @@ function onSearchClear() {
 
 // ── 新建/编辑 ───────────────────────────────────────────────────
 
-function openCreate() {
+async function openCreate() {
+  await ensureRolesLoaded()
   isEditing.value = false
   editingId.value = ''
-  formData.value = { username: '', email: '', password: '', role: 'user', is_active: true }
+  roleOptions.value = buildRoleSelectOptions(availableRoles.value)
+  formData.value = {
+    username: '',
+    email: '',
+    password: '',
+    role: pickDefaultRole(availableRoles.value),
+    is_active: true,
+  }
   showModal.value = true
 }
 
-function openEdit(user: UserInfo) {
+async function openEdit(user: UserInfo) {
+  await ensureRolesLoaded()
   isEditing.value = true
   editingId.value = user.id
+  // 必须取真实角色集合，不能用 user.role：后者是非 admin 一律塌缩成 "user"
+  // 的展示枚举，回填它会把自定义角色静默改掉
+  const current = currentRoleName(user)
+  // 带上当前角色：它可能不在列表里（历史遗留的非归一化角色名）
+  roleOptions.value = buildRoleSelectOptions(availableRoles.value, current)
   formData.value = {
     username: user.username,
     email: user.email,
     password: '',
-    role: user.role,
+    role: current,
     is_active: user.is_active,
   }
   showModal.value = true
