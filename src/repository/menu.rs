@@ -159,6 +159,42 @@ impl MenuRepository {
         Ok(codes)
     }
 
+    /// 查询指定菜单集合携带的权限码（v0.5.0 PR-3：授权下界判定用）
+    ///
+    /// `assign_role_menus` 要判断"调用者能否把这些菜单授予该角色"，
+    /// 必须先把菜单集合翻译成权限码集合再和调用者已持有的码比较。
+    ///
+    /// 与 [`Self::find_permission_codes`] 用同一条过滤条件
+    /// （`type = 'button'` 且 `permission` 非空）：**只有按钮行携带权限码**，
+    /// 目录/页面菜单只影响导航可见性，不授予任何接口调用能力，因此不参与判定。
+    /// 否则"整理菜单结构"这种无害操作也会被误判为提权。
+    pub async fn find_permission_codes_by_menu_ids(
+        &self,
+        menu_ids: &[Uuid],
+    ) -> Result<Vec<String>, AppError> {
+        if menu_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let codes = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT permission
+            FROM menus
+            WHERE id = ANY($1)
+              AND type = 'button'
+              AND permission IS NOT NULL
+              AND permission <> ''
+            ORDER BY permission ASC
+            "#,
+        )
+        .bind(menu_ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询菜单权限码失败: {e}")))?;
+
+        Ok(codes)
+    }
+
     /// 更新菜单
     pub async fn update(
         &self,

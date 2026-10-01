@@ -14,17 +14,26 @@
 //! ```ignore
 //! pub async fn create_user(
 //!     State(state): State<AppState>,
-//!     _perm: PermUserCreate,
+//!     perm: PermUserCreate,
 //!     Json(req): Json<UserManageRequest>,
 //! ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
 //!     // 走到这里说明已持有 system:user:create
 //! }
 //! ```
 //!
-//! 参数名前缀 `_` 是必须的：提取器只做校验，本身无需在函数体里使用。
+//! 参数名前缀 `_` 不是必须的：只做校验、不在函数体里用时写 `_perm` 即可；
+//! 需要再做"能否授予他人权限"这类判定时，去掉 `_` 取 `perm.guard()`。
+//!
+//! ## 授权下界：能授予的 ⊆ 已持有的
+//!
+//! 权限码只回答"这个接口能不能调"。**它不回答"能不能把权限给别人"**。
+//! 撤掉 `require_role("admin")` 之后必须自己补上这一层，否则持有
+//! `system:user:create` 的角色能直接建出 admin 用户。
+//!
+//! [`PermissionGuard::ensure_covers`] 就是这层下界，判定依据是权限码包含关系
+//! 而非角色名——与"角色是数据、不是常量"一致。
 
 use std::collections::HashSet;
-use std::marker::PhantomData;
 
 use axum::{
     extract::FromRequestParts,
@@ -61,6 +70,37 @@ impl PermissionGuard {
     /// 该用户是否拥有指定权限码
     pub fn has(&self, code: &str) -> bool {
         self.codes.contains(code)
+    }
+
+    /// 该用户是否覆盖 `required` 中的**每一个**权限码
+    ///
+    /// 这是 v0.5.0 PR-3 撤掉 `require_role("admin")` 之后的授权下界：
+    /// **你能授予的权限，必须全部是你自己已持有的。**
+    ///
+    /// 此前 `require_role("admin")` 与权限码守卫是 AND 语义，角色闸门天然盖住了
+    /// 提权路径。闸门一撤，持有 `system:user:create` 的自定义角色就能建出 admin
+    /// 用户——**创建用户即等于授予管理员**。用包含关系判定后，这条约束与
+    /// "admin" 这个名字无关：谁持有全部权限码，谁才有能力授予全部权限码。
+    ///
+    /// 返回**第一个**未覆盖的权限码，供 403 文案指名道姓。
+    pub fn first_uncovered<'a>(&self, required: &'a [String]) -> Option<&'a str> {
+        required
+            .iter()
+            .find(|code| !self.codes.contains(code.as_str()))
+            .map(String::as_str)
+    }
+
+    /// 断言 `required` 全被覆盖，否则 `PermissionDenied`
+    ///
+    /// 提示语点名 `action` 与缺失的码：单说"权限不足"，管理员在授权树里
+    /// 看不出该去勾哪个按钮，也看不出是哪一步被拒。
+    pub fn ensure_covers(&self, required: &[String], action: &str) -> Result<(), AppError> {
+        match self.first_uncovered(required) {
+            None => Ok(()),
+            Some(missing) => Err(AppError::PermissionDenied(format!(
+                "{action}需要「{missing}」，而你未持有该权限码；只能授予自己已持有的权限"
+            ))),
+        }
     }
 
     /// 该用户拥有的全部权限码（字典序）
@@ -107,6 +147,35 @@ impl PermissionGuard {
     }
 }
 
+// ────────────────────────────────────────────
+// 授权下界：把"目标对象"翻译成权限码，再与调用者已持有的码比较
+// ────────────────────────────────────────────
+
+/// 一组角色经 `role_menus` 授权后实际携带的权限码
+pub async fn codes_of_roles(state: &AppState, roles: &[String]) -> Result<Vec<String>, AppError> {
+    state.menu_repo.find_permission_codes(roles).await
+}
+
+/// 断言调用者有权把 `target_roles` 授予他人（建用户 / 改用户 / 追加角色）
+///
+/// 判定依据是权限码包含关系，**不是角色名**——与"角色是数据不是常量"一致。
+/// 副作用是它天然堵住三条提权路径：建出 admin 用户、追加 admin 角色、
+/// 以及把权限比自己高的角色指派给自己。
+///
+/// `target_roles` 是**目标对象持有的角色**：授予角色时传将被赋予的角色，
+/// 改动/删除/停用/重置密码某用户时传该用户当前的角色
+/// （**重置一个权限高于自己的账号的密码，等于直接登录成那个账号**，
+/// 比授予角色更直接，所以这几条写路径不能只看 `system:user:update`）。
+pub async fn ensure_can_grant_roles(
+    state: &AppState,
+    guard: &PermissionGuard,
+    target_roles: &[String],
+    action: &str,
+) -> Result<(), AppError> {
+    let required = codes_of_roles(state, target_roles).await?;
+    guard.ensure_covers(&required, action)
+}
+
 /// 为每个权限码生成一个类型化提取器
 ///
 /// 生成的类型在提取阶段校验权限码，因此：
@@ -119,7 +188,17 @@ macro_rules! permission_guards {
                 "提取阶段校验权限码 `", stringify!($code),
                 "`（早于入参解析，鉴权先于校验）"
             )]
-            pub struct $ty(PhantomData<()>);
+            pub struct $ty(PermissionGuard);
+
+            impl $ty {
+                /// 取出底层权限守卫
+                ///
+                /// handler 多数时候不需要它（提取阶段已经校验过），
+                /// 但涉及"能否授予他人权限"时要用 `guard().ensure_covers(..)`。
+                pub fn guard(&self) -> &PermissionGuard {
+                    &self.0
+                }
+            }
 
             impl FromRequestParts<AppState> for $ty {
                 type Rejection = Response;
@@ -137,7 +216,7 @@ macro_rules! permission_guards {
                     };
 
                     match guard.require($code) {
-                        Ok(()) => Ok($ty(PhantomData)),
+                        Ok(()) => Ok($ty(guard)),
                         Err(AppError::PermissionDenied(_)) => {
                             Err(error_response(StatusCode::FORBIDDEN, format!("缺少权限：{}", $code)))
                         }
@@ -230,5 +309,72 @@ mod tests {
             AppError::PermissionDenied(code) => assert_eq!(code, permission::USER_DELETE),
             other => panic!("期望 PermissionDenied，实际 {other:?}"),
         }
+    }
+
+    // ── 授权下界：能授予的必须是自己已持有的 ──────────────────
+
+    fn owned(codes: &[&str]) -> Vec<String> {
+        codes.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn covering_a_superset_is_allowed() {
+        let g = guard(&[permission::USER_LIST, permission::USER_CREATE]);
+        assert_eq!(g.first_uncovered(&owned(&[permission::USER_CREATE])), None);
+        assert!(g
+            .ensure_covers(&owned(&[permission::USER_LIST]), "授予角色")
+            .is_ok());
+    }
+
+    #[test]
+    fn empty_target_is_always_coverable() {
+        // 无权限码的角色（如 `user`）任何人都能授予——它不授予任何能力
+        assert_eq!(guard(&[]).first_uncovered(&[]), None);
+        assert!(guard(&[]).ensure_covers(&[], "授予角色").is_ok());
+    }
+
+    #[test]
+    fn granting_a_code_you_lack_is_denied() {
+        // 核心防线：持有 user:create 的角色不能借它授予自己没有的 user:delete
+        let g = guard(&[permission::USER_CREATE]);
+        let err = g
+            .ensure_covers(
+                &owned(&[permission::USER_CREATE, permission::USER_DELETE]),
+                "授予角色",
+            )
+            .expect_err("多出一个未持有的码应被拒绝");
+        match err {
+            AppError::PermissionDenied(msg) => {
+                assert!(
+                    msg.contains(permission::USER_DELETE),
+                    "应指名缺失的码: {msg}"
+                );
+                assert!(msg.contains("授予角色"), "应说明是哪一步被拒: {msg}");
+            }
+            other => panic!("期望 PermissionDenied，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_uncovered_reports_the_first_missing_code_in_order() {
+        let g = guard(&[permission::USER_LIST]);
+        let required = owned(&[
+            permission::ROLE_LIST,
+            permission::ROLE_CREATE,
+            permission::USER_LIST,
+        ]);
+        assert_eq!(g.first_uncovered(&required), Some(permission::ROLE_LIST));
+    }
+
+    #[test]
+    fn identical_permission_set_is_not_a_subset_violation() {
+        // 两个都持 admin 全码的角色互相授权必须放行（等集是子集）
+        let g = guard(&[permission::USER_LIST, permission::USER_DELETE]);
+        assert!(g
+            .ensure_covers(
+                &owned(&[permission::USER_DELETE, permission::USER_LIST]),
+                "授予角色"
+            )
+            .is_ok());
     }
 }

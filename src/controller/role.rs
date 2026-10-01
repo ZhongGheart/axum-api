@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::permission::{
-    PermRoleCreate, PermRoleDelete, PermRoleList, PermRoleUpdate, PermUserList, PermUserUpdate,
+    ensure_can_grant_roles, PermRoleCreate, PermRoleDelete, PermRoleList, PermRoleUpdate,
+    PermUserList, PermUserUpdate,
 };
 use crate::model::{normalize_role_name, ApiResponse, BUILTIN_ROLES};
 use crate::router::AppState;
@@ -29,8 +30,14 @@ pub struct RoleItem {
 /// 分配角色请求
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct AssignRoleRequest {
+    /// 与路径参数 `user_id` 重复，服务端一律以**路径**为准。
+    ///
+    /// 刻意是可选的：它曾是必填，于是漏传时 `Json` 提取器先失败、返回 422，
+    /// 无权限调用者因此拿到了本不该看到的入参结构反馈——正是
+    /// `middleware::permission` 开头那条"鉴权必须早于入参校验"要避免的事。
+    /// 保留字段只为兼容既有客户端（含前端 `api/role.ts`）。
     #[allow(dead_code)]
-    pub user_id: Uuid,
+    pub user_id: Option<Uuid>,
     pub role_name: String,
 }
 
@@ -98,13 +105,23 @@ pub async fn get_user_roles(
 )]
 pub async fn assign_user_role(
     State(state): State<AppState>,
-    _perm: PermUserUpdate,
+    perm: PermUserUpdate,
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
     Json(req): Json<AssignRoleRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     // 与用户表单的 role 字段走同一套归一化，否则同一个角色
     // 经本接口提交 "Admin" 会 404、经表单提交 "admin" 却成功
     let role_name = normalize_role_name(&req.role_name)?;
+    // 授权下界（v0.5.0 PR-3）：本接口是**追加**语义，不会覆盖既有角色，
+    // 因此用户表单那道"整体替换"的守卫覆盖不到它——`role_name=admin`
+    // 曾经是一条独立的提权路径，必须单独判定。
+    ensure_can_grant_roles(
+        &state,
+        perm.guard(),
+        std::slice::from_ref(&role_name),
+        &format!("追加角色「{role_name}」"),
+    )
+    .await?;
     state
         .auth_service
         .role_repo

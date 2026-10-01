@@ -548,3 +548,138 @@ v0.4.0 把权限码变成了强制鉴权，但**没有任何一条正常路径�
 上一会话的 `/tmp/e2e-perm.mjs` 用 Node 22 内置 `WebSocket` 直连 Chrome CDP（零依赖）。
 踩过的坑：**模板字符串里的 `\s` 不是正则转义**，会被折叠成字母 `s`，
 要写成 `\\s`；`JSON.stringify` 会把 SQL 换行转义成字面量 `\n`，需先压掉换行。
+
+# v0.5.0 PR-3 — 撤掉 `require_role("admin")`（角色闸门降级为权限码）
+
+## 当前目标
+
+删掉 `src/router/mod.rs` 里 5 处 `require_role("admin")` 中间件，让"能进管理区"
+完全由权限码决定，不再叠加一道角色硬闸门。
+
+**前置核查（重做了上一轮那个错结论）**：上一轮用 `/tmp/check_guards.py` 正则扫描，
+报"38 个 admin handler 里 36 个缺 `_perm: Perm`"。**这个结论是脚本 bug**——
+签名跨多行且含嵌套括号，`[^)]*` 匹配不到。仓库里已有的契约测试
+`every_admin_handler_declares_a_permission_guard`（`tests/api_integration.rs`，
+非 `#[ignore]`，随 `cargo test --lib` 一起跑）用 `rfind("\npub async fn ")` 切函数体，
+照抄它的切分逻辑重查后：
+
+- 38 个 `/api/admin/*` handler，**38 个都有类型化守卫，0 个缺失**；
+- 29 个权限码定义，**29 个都被某个守卫用到**，无有码无入口；
+- 因此拆掉角色闸门不会暴露任何裸接口。
+
+## 关键设计决定：提权面用"权限码包含关系"判定，不用新增权限码
+
+拆闸门后真正的风险不是"接口没守卫"，而是 **AND 语义消失**：
+此前 `require_role("admin")` 与权限码守卫是 AND，等于"角色是权限码的上游闸门"。
+闸门一撤，持有 `system:user:create` 的自定义角色就能直接建出 **admin 用户**——
+**创建用户即等于授予管理员**（PR-2 遗留里点名的那条）。
+
+候选方案与取舍：
+
+- (a) 新增权限码 `system:user:grant-admin`：语义最正，但要动种子 + 前端 PERM 常量 +
+  文档 + 授权树，且"谁能授予管理员"本身又变成一个新的提权面（谁授予 grant-admin？）。
+- (b) 窄角色检查（仅 admin 持有者可授予 admin）：改动小，但把 `admin` 重新写回代码，
+  与 PR-2"角色不是常量"的方向相反。
+- **(c) 采用：权限码包含关系（authority superset）**。
+
+(c) 的规则：**你能授予的权限码，必须全部是你自己已持有的。**
+即调用者的权限码集合 ⊇ 目标角色/目标用户的权限码集合。这条规则同时覆盖
+建用户、改用户、追加角色、重置密码、停用、删除、角色授权菜单全部写路径，
+且**不需要新权限码、不需要新增种子**，与既有 `find_permission_codes` 同源。
+
+它同时天然堵住了三条原本没被点名的提权路径：
+
+1. `create_user(role=admin)` — 建出管理员
+2. `update_user(role=admin)` / `assign_user_role(admin)` — 追加语义同样能提权
+3. `delete_user` / `toggle_user_status` / `reset_user_password` / `batch_delete` —
+   目标若是权限比自己高的人（如 admin），这几条同样是越权接管账号
+   （**重置 admin 密码 = 直接登录成 admin**，比授予角色更直接）
+
+另外 `assign_role_menus`（`system:menu:grant`）本身就是"把权限码授予角色"的元能力，
+若不设包含关系，持有它的角色可以**给自己授权全部权限码**，同样必须纳入判定。
+
+## 起始 git 状态
+
+- 分支 `v0.5.0`，工作区干净，HEAD = `88ca4055 docs(handoff): 记录 PR-2 commit 号`
+- 之前 4 个 commit：`cc582550` / `1d1e0887` / `aa532547` / `9fb5e359`
+- 仍未合并、未 tag、未发 Release
+
+## PR-3 完成记录（2026-10-02）
+
+### 落地范围
+
+10 个文件，全部未提交：
+
+| 文件 | 改动 |
+|---|---|
+| `src/middleware/permission.rs` | 核心：`first_uncovered` / `ensure_covers` / `codes_of_roles` / `ensure_can_grant_roles`；类型化守卫改为携带 `PermissionGuard`（`perm.guard()`）；+5 单测 |
+| `src/middleware/auth.rs` | 删除 `require_role` |
+| `src/router/mod.rs` | 删除 5 处 `require_role("admin")` |
+| `src/controller/user.rs` | 7 条写路径接入授权下界 |
+| `src/controller/role.rs` | 接入授权下界；`AssignRoleRequest.user_id` 改为 `Option<Uuid>` |
+| `src/controller/menu.rs` | `update_menu` 严格守卫；`assign_role_menus` 只拦自授 |
+| `src/repository/menu.rs` | `find_permission_codes_by_menu_ids` |
+| `src/repository/role.rs` | `find_name_by_id` |
+| `tests/api_integration.rs` | +10 集成测试、+3 契约测试、1 旧测试注释修正 |
+| `docs/AI_HANDOFF.md` | 本文件 |
+
+### 三个容易想错、已定案的点
+
+1. **`assign_role_menus` 只拦"自授"**，不拦授予别人。禁掉"授予未持有的码给别的角色"
+   会让 admin 无法分发新建的码（权限码即数据的核心工作流），且 PR-1 的
+   `role_menu_query_keeps_grants_whose_ancestors_are_not_authorized` 会挂。
+   间接路径仍闭合：先授给别人、之后该角色被授给自己时，由
+   `ensure_can_grant_roles` 的包含关系拦住。
+2. **`update_menu` 保留严格守卫**（改写 permission 必须持有目标码），
+   因为 `menus.permission` 本身就是权限码，改写等于让"角色→菜单→码"这条链当场生效。
+3. **`require_role` 整个函数删掉**，不留死代码——留着会被下一个人接回去。
+
+### 测试与验证
+
+- `cargo test --lib`：**49 passed**（44 → 49）
+- `cargo test --test api_integration -- --include-ignored --test-threads=1`：**44 passed**（34 → 44）
+- `cargo fmt --check` clean；`cargo clippy --all-targets -- -D warnings` clean
+- `frontend` vitest：**81 passed**
+- **缺陷注入 3 处**（摘掉守卫 → 用例如期失败 → 还原 → 全绿）：
+  `resetting_a_stronger_account_password_is_denied`、
+  `menu_grant_cannot_self_escalate`、
+  `rewriting_a_granted_menu_permission_to_an_unheld_code_is_denied`
+- 第三个用例改用**一次性临时码** `tmp:priv:xxxxxx`（admin 造一个不授予任何角色的按钮）。
+  原写法拿真实码 `system:user:delete` 做两步攻击，会顺手把 admin 的该码摘掉，
+  复原时又被守卫拦住（403）→ 共享库留一个洞，症状在别的用例上炸。
+  守卫只比对**码的集合关系**、与码值无关，拦临时码 == 拦真实码。
+
+### ⚠️ 共享测试库操作红线（本轮实际踩到）
+
+清理测试库时我写了 `DELETE FROM menus WHERE permission IS NULL OR permission=''`，
+**把 16 个种子目录菜单一起删了**（目录菜单的 permission 本来就是 NULL），
+`menus` 表被清空、admin 码数归 0。
+
+- 恢复方式：直接跑一次测试即可。`RbacService::init_defaults` 见到
+  `roles` 非空但 `menus` 为空时仍会执行 `seed_navigation` →
+  `seed_menus_if_empty`（menus 空则重灌）+ `seed_permission_codes`（**无条件**补齐 29 个码）。
+  恢复后：42 菜单 / admin 28 码 / 28 按钮。
+- **红线**：只按 `type='button' AND (permission IS NULL OR permission='')` 清理，
+  绝不带 `type<>'button'`；或干脆让用例自己建、自己删。
+
+### 运行测试的固定姿势
+
+- 必须 `--test-threads=1`：共享库，并行会互相踩。
+- **不要**用 `cargo test -- --include-ignored`：会把 doctest 一起强制跑，产生假失败。
+  分开跑：`cargo test --lib` 和 `cargo test --test api_integration -- --include-ignored --test-threads=1`。
+- 依赖环境：`eval "$(./scripts/test_env.sh env)"`（PG 55432 / `axum_api_test` / Redis 56379）。
+
+### 遗留（未修，均已确认非本 PR 阻塞）
+
+1. `update_menu` 把某按钮的 permission 清空后，该码**只能靠新建按钮恢复**——
+   守卫不允许把别的菜单改指成这个未持有的码。属于"授权下界"的固有代价，
+   管理员在 UI 上"清空权限码"后想反悔会比较绕。是否放开需产品决策。
+2. 前端未改动：路由已按权限码/菜单动态注册，无角色闸门，逻辑上不受拆闸门影响
+   （`frontend` 81 测试全绿佐证）。但**未做浏览器端人工回归**。
+3. 缺陷注入时守卫被摘掉，测试真的把 admin 口令改成了 `hijacked123`
+   （证明提权真实有效）。已用临时测试 `hash_password("admin123")` 直接 UPDATE 修复并删除该临时测试。
+
+### 下一步
+
+未 commit、未合并、未 tag、未发 Release。用户此前意图是走完 v0.3.0 同流程
+（合并 → tag → Release），需先确认再执行。

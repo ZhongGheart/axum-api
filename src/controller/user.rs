@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::auth::AuthenticatedUser;
-use crate::middleware::permission::{PermUserCreate, PermUserDelete, PermUserList, PermUserUpdate};
+use crate::middleware::permission::{
+    ensure_can_grant_roles, PermUserCreate, PermUserDelete, PermUserList, PermUserUpdate,
+};
 use crate::model::{normalize_role_name, ApiResponse, UserInfo, ADMIN_ROLE};
 use crate::router::AppState;
 use crate::utils::validation;
@@ -177,7 +179,7 @@ pub async fn list_users(
 )]
 pub async fn create_user(
     State(state): State<AppState>,
-    _perm: PermUserCreate,
+    perm: PermUserCreate,
     Json(req): Json<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     use crate::utils::password::hash_password;
@@ -187,6 +189,16 @@ pub async fn create_user(
     // 角色存在性校验必须在写用户之前：仓库层的校验在 replace_user_roles 里，
     // 那时用户行已经落库且两者不在同一事务，失败会留下"没有任何角色的用户"
     let role = resolve_role(&state, &req.role).await?;
+    // 授权下界（v0.5.0 PR-3）：能创建用户 ≠ 能创建管理员。
+    // 闸门撤掉后 `system:user:create` 只说明"可以建号"，建出来的号带什么角色
+    // 仍要按"你只能授予自己已持有的权限码"判定。
+    ensure_can_grant_roles(
+        &state,
+        perm.guard(),
+        std::slice::from_ref(&role),
+        &format!("创建用户并赋予角色「{role}」"),
+    )
+    .await?;
 
     let password = req.password.as_deref().unwrap_or("password123");
     validation::validate_password(password)?;
@@ -246,7 +258,7 @@ pub async fn create_user(
 )]
 pub async fn update_user(
     State(state): State<AppState>,
-    _perm: PermUserUpdate,
+    perm: PermUserUpdate,
     Path(id): Path<Uuid>,
     Json(req): Json<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
@@ -259,6 +271,20 @@ pub async fn update_user(
         .role_repo
         .find_roles_by_user_id(id)
         .await?;
+
+    // 授权下界（v0.5.0 PR-3）：两道都要查，缺一不可。
+    // ① 目标用户当前的权限不得高于自己——否则可以把 admin 降级成普通用户，
+    //    借此绕过"最后一名管理员"保护之外的管理边界（改别人权限 = 越权）。
+    ensure_can_grant_roles(&state, perm.guard(), &current_roles, "修改该用户").await?;
+    // ② 新角色不得高于自己——否则 `role=admin` 就是自我提权。
+    ensure_can_grant_roles(
+        &state,
+        perm.guard(),
+        std::slice::from_ref(&role),
+        &format!("赋予角色「{role}」"),
+    )
+    .await?;
+
     let new_roles = vec![role.clone()];
 
     // 先做守卫，避免"基础字段已更新但角色变更被拒绝"的半成品状态
@@ -303,7 +329,7 @@ pub async fn update_user(
 )]
 pub async fn delete_user(
     State(state): State<AppState>,
-    _perm: PermUserDelete,
+    perm: PermUserDelete,
     auth_user: AuthenticatedUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
@@ -317,6 +343,10 @@ pub async fn delete_user(
         .role_repo
         .find_roles_by_user_id(id)
         .await?;
+    // 授权下界（v0.5.0 PR-3）：`system:user:delete` 不该等于"能删 admin"。
+    // 注意这条与下面的"最后一名管理员"是两回事：那条防的是把系统锁死，
+    // 这条防的是权限高于自己的账号被越权删除。
+    ensure_can_grant_roles(&state, perm.guard(), &roles, "删除该用户").await?;
     ensure_not_last_admin(&state, &roles, &[]).await?;
 
     // user_roles 通过外键 ON DELETE CASCADE 一并清理
@@ -344,7 +374,7 @@ pub async fn delete_user(
 )]
 pub async fn batch_delete_users(
     State(state): State<AppState>,
-    _perm: PermUserDelete,
+    perm: PermUserDelete,
     auth_user: AuthenticatedUser,
     Json(req): Json<BatchDeleteRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
@@ -364,6 +394,8 @@ pub async fn batch_delete_users(
             .role_repo
             .find_roles_by_user_id(*id)
             .await?;
+        // 授权下界（v0.5.0 PR-3）：整批先校验，任一目标权限高于自己就整批拒绝
+        ensure_can_grant_roles(&state, perm.guard(), &roles, "批量删除中的用户").await?;
         if roles.iter().any(|r| r == ADMIN_ROLE) {
             admins_in_batch += 1;
         }
@@ -414,7 +446,7 @@ pub struct BatchDeleteRequest {
 )]
 pub async fn toggle_user_status(
     State(state): State<AppState>,
-    _perm: PermUserUpdate,
+    perm: PermUserUpdate,
     auth_user: AuthenticatedUser,
     Path(id): Path<Uuid>,
     Json(req): Json<ToggleStatusRequest>,
@@ -424,6 +456,17 @@ pub async fn toggle_user_status(
     }
 
     let user = state.auth_service.user_repo.find_by_id(id).await?;
+    // 授权下界（v0.5.0 PR-3）：停用一个权限高于自己的账号 = 拒绝其服务，
+    // 与删除同级，属于越权。仅在停用时校验，启用是放宽而非收紧。
+    if !req.is_active {
+        let current_roles = state
+            .auth_service
+            .role_repo
+            .find_roles_by_user_id(id)
+            .await?;
+        ensure_can_grant_roles(&state, perm.guard(), &current_roles, "停用该用户").await?;
+    }
+
     let updated = state
         .auth_service
         .user_repo
@@ -466,7 +509,7 @@ pub struct ToggleStatusRequest {
 )]
 pub async fn reset_user_password(
     State(state): State<AppState>,
-    _perm: PermUserUpdate,
+    perm: PermUserUpdate,
     Path(id): Path<Uuid>,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
@@ -474,6 +517,16 @@ pub async fn reset_user_password(
 
     // 先确认用户存在（不存在则 404），再校验新口令
     let user = state.auth_service.user_repo.find_by_id(id).await?;
+    // 授权下界（v0.5.0 PR-3）：**这条是所有写路径里最直接的一条**——
+    // 拿到 admin 的新口令就等于登录成 admin，不需要再走"授予角色"那一步。
+    // 因此 `system:user:update` 单独不足以重置高权限账号的口令。
+    let target_roles = state
+        .auth_service
+        .role_repo
+        .find_roles_by_user_id(id)
+        .await?;
+    ensure_can_grant_roles(&state, perm.guard(), &target_roles, "重置该用户口令").await?;
+
     validation::validate_password(&req.password)?;
 
     let hashed =
