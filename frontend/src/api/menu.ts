@@ -53,4 +53,13 @@ export const menuApi = {
   delete(id: string) {
     return http.delete<null>(`/admin/menus/${id}`)
   },
+
+  /**
+   * GET /api/admin/menus?role_id= — 某角色已授权的菜单树
+   *
+   * 与 `list()` 一样返回 `type='button'` 的节点：授权树需要展示并勾选权限码按钮。
+   */
+  listByRole(roleId: string) {
+    return http.get<MenuNode[]>('/admin/menus', { params: { role_id: roleId } })
+  },
 }

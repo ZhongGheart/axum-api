@@ -219,11 +219,11 @@ v0.4.0 把权限码变成了强制鉴权，但**没有任何一条正常路径�
 | 步骤 | 内容 | 状态 |
 |---|---|---|
 | 0 | 建立 `v0.5.0` 分支、记录计划 | ✅ |
-| 1 | 修 `assign_role_menus`：去 `.ok()`，错误上抛，保持单事务 | 🔄 |
-| 2 | 修 `delete_role`：单事务 + 禁止删内置 admin + 报告影响用户数 | ⬜ |
-| 3 | 修 `delete_menu` 递归吞错（同一根因，避免只修一半） | ⬜ |
-| 4 | 后端集成测试：撤销生效 / 非法 ID 报错 / 拒绝删内置角色 | ⬜ |
-| 5 | 前端 `roleApi` 补 create/update/delete/assignMenus | ⬜ |
+| 1 | 修 `assign_role_menus`：去 `.ok()`，错误上抛，保持单事务 | ✅ `cc582550` |
+| 2 | 修 `delete_role`：单事务 + 禁止删内置 admin + 报告影响用户数 | ✅ `cc582550` |
+| 3 | 修 `delete_menu` 递归吞错（同一根因，避免只修一半） | ✅ `cc582550` |
+| 4 | 后端集成测试：撤销生效 / 非法 ID 报错 / 拒绝删内置角色 | ✅ `cc582550`（16→25） |
+| 5 | 前端 `roleApi` 补 create/update/delete/assignMenus | 🔄 |
 | 6 | 角色管理页可写 + 菜单/权限码授权树 | ⬜ |
 | 7 | 新按钮按权限码 gate（`system:role:*`、`system:menu:grant`） | ⬜ |
 | 8 | 前端测试 + 全量回归 | ⬜ |
@@ -245,6 +245,29 @@ v0.4.0 把权限码变成了强制鉴权，但**没有任何一条正常路径�
    属同一类保护——防止把系统改造成无人能管理的状态。
 4. 授权树直接用 `GET /api/admin/menus`（`find_tree()` 不做类型过滤，返回含 button 节点），
    数据已现成，无需新接口。
+
+### 步骤 5-7 前端（动手前记录）
+
+5. **授权弹窗用「全量菜单树」渲染，只把 `listByRole()` 的结果当默认勾选值**。
+    不用 `listByRole()` 的树本身渲染：它经 `build_tree(filtered, None)` 后，
+    父节点未被授权的子节点会**上浮成根节点**，父子关系与真实结构不一致；
+    此时 naive-ui `cascade` 勾选一个菜单页会连带勾上"恰好已授权"的子孙按钮 →
+    **静默扩权**。用全量树则 cascade 语义稳定，提交的是完整勾选集合，
+    既不静默扩权也不静默丢授权。
+6. **纯逻辑抽到 `src/utils/menu.ts`**（`flattenMenuIds` / `buildGrantTreeOptions`），
+    用 vitest 直接覆盖。前端没有 `@vue/test-utils`，组件内部状态无法单测，
+    因此把值得测的部分移出 `.vue`。
+7. **内置角色名不在前端另立定义**：`constants/builtin.ts` 的 `BUILTIN_ROLE_NAMES`
+    由契约测试对着后端 `model/role.rs` 的 `BUILTIN_ROLES` 校验（含 `ADMIN_ROLE`
+    必须在集合内）。内置角色直接不渲染删除按钮——一个必然 400 的按钮不该存在。
+8. **顺带修 `views/system/menu/index.vue` 的 ungated 按钮**（v0.4.0 遗留）：
+    新增/编辑/删除三个入口都没接权限码，等于权限码体系在菜单页自己身上漏了。
+    同属"权限码闭环"，一并修而不是留着。
+
+> 步骤 5-7 涉及的受影响文件：`frontend/src/api/role.ts`、`frontend/src/api/menu.ts`、
+> `frontend/src/utils/menu.ts`、`frontend/src/constants/builtin.ts`、
+> `frontend/src/views/system/role/index.vue`、`frontend/src/views/system/menu/index.vue`。
+> 预期下一步：前端单测覆盖上述纯逻辑与 API 契约，再做全量回归。
 
 ## 后续版本候选
 

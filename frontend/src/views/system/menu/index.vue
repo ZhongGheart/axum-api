@@ -2,7 +2,7 @@
   <div class="page-container">
     <n-page-header title="菜单管理">
       <template #extra>
-        <n-button type="primary" @click="openCreate(null)">新增根菜单</n-button>
+        <PermissionButton :permission="PERM.MENU_CREATE" type="primary" @click="openCreate(null)">新增根菜单</PermissionButton>
       </template>
     </n-page-header>
 
@@ -54,12 +54,14 @@
 
 <script setup lang="ts">
 import { ref, h, onMounted } from 'vue'
-import { NButton, NSpace, NIcon } from 'naive-ui'
+import { NSpace, NIcon } from 'naive-ui'
 import { AddOutline as AddIcon, CreateOutline as EditIcon, TrashOutline as DelIcon } from '@vicons/ionicons5'
 import type { FormInst, FormRules, TreeOption } from 'naive-ui'
 import { menuApi } from '@/api/menu'
 import type { MenuNode, CreateMenuReq } from '@/api/menu'
+import { PERM } from '@/constants/permission'
 import { showConfirm, showSuccess } from '@/utils/message'
+import PermissionButton from '@/components/common/PermissionButton.vue'
 
 const formRef = ref<FormInst | null>(null)
 const showModal = ref(false)
@@ -113,9 +115,11 @@ function renderLabel({ option }: { option: TreeOption }) {
     h('span', option.label as string),
     h(NSpace, { size: 'small' }, {
       default: () => [
-        h(NButton, { size: 'tiny', quaternary: true, onClick: () => openCreate(option.key as string) }, { default: () => h(NIcon, null, () => h(AddIcon)) }),
-        h(NButton, { size: 'tiny', quaternary: true, onClick: () => openEdit(option.key as string) }, { default: () => h(NIcon, null, () => h(EditIcon)) }),
-        h(NButton, { size: 'tiny', quaternary: true, type: 'error', onClick: () => handleDelete(option.key as string) }, { default: () => h(NIcon, null, () => h(DelIcon)) }),
+        // 行内三个入口按权限码显隐：v0.4.0 之前这里完全没接，
+        // 等于权限码体系在菜单页自己身上漏了（后端仍会 403，但 UI 会误导）
+        h(PermissionButton, { permission: PERM.MENU_CREATE, size: 'tiny', quaternary: true, onClick: () => openCreate(option.key as string) }, { default: () => h(NIcon, null, () => h(AddIcon)) }),
+        h(PermissionButton, { permission: PERM.MENU_UPDATE, size: 'tiny', quaternary: true, onClick: () => openEdit(option.key as string) }, { default: () => h(NIcon, null, () => h(EditIcon)) }),
+        h(PermissionButton, { permission: PERM.MENU_DELETE, size: 'tiny', quaternary: true, type: 'error', onClick: () => handleDelete(option.key as string) }, { default: () => h(NIcon, null, () => h(DelIcon)) }),
       ],
     }),
   ])
