@@ -4,8 +4,8 @@
 
 基于 **Rust Axum** 后端 + **Vue 3** 前端的企业级全栈管理平台。
 
-> v0.3.0 补齐了此前遗留的两项「声明与实现差距」：**OpenAPI 由代码生成**、
-> **前端导航由后端菜单驱动**。变更明细见 [CHANGELOG.md](CHANGELOG.md)。
+> v0.5.0 补上了角色与授权闭环：授权写路径不再静默失效，
+> 并把此前只能改数据库的授权配置接到了界面上。变更明细见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 能力清单（与运行时一致）
 
@@ -19,6 +19,7 @@
 | 数据字典 | ✅ | Redis 缓存 + 写操作真实失效；读取接口对**任意已登录用户**开放 |
 | 菜单管理 | ✅ | 菜单是导航的唯一来源：`/api/auth/menus` 决定侧栏与前端动态路由 |
 | 权限码 | ✅ | 28 个 `<模块>:<资源>:<动作>` 权限码存于 `menus.permission`（按钮型菜单），后端强制鉴权 + 前端按码判定 |
+| 角色与授权 | ✅ | 角色增删改 + 菜单/权限码授权树；授权**要么完整成功、要么整体回滚**；内置角色不可删除 |
 | 用户管理 | ✅ | 增删改查、批量删除、状态切换、重置密码；含"最后一个管理员"保护 |
 | 系统监控 | ✅ | CPU/内存/磁盘、DB/Redis 状态、接口耗时统计（进程内，重启丢失） |
 | Excel 导出 | ✅ | 用户列表、操作日志、系统信息 |
@@ -182,9 +183,10 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | PUT | `/api/admin/users/{id}/status` | 启用 / 停用（停用即吊销会话） |
 | POST | `/api/admin/users/{id}/reset-password` | 重置密码（并吊销会话） |
 | GET/POST | `/api/admin/users/{id}/roles` | 查询 / 追加用户角色 |
-| GET/POST | `/api/admin/roles`、`PUT/DELETE /api/admin/roles/{id}` | 角色管理 |
+| GET/POST | `/api/admin/roles`、`PUT/DELETE /api/admin/roles/{id}` | 角色管理（内置角色不可删除；仍被用户占用的角色拒绝删除） |
 | GET/POST | `/api/admin/menus`、`PUT/DELETE /api/admin/menus/{id}` | 菜单管理（改动即时影响前端导航） |
-| PUT | `/api/admin/roles/{id}/menus` | 角色-菜单关联 |
+| PUT | `/api/admin/roles/{id}/menus` | 角色-菜单关联（**全量覆盖**；任一 ID 非法即整体 400） |
+| GET | `/api/admin/menus?role_id={id}` | 某角色已授权的菜单树（授权弹窗的默认勾选值） |
 | GET/POST | `/api/admin/dict/types`、`PUT/DELETE /api/admin/dict/types/{id}` | 字典类型管理 |
 | GET/POST | `/api/admin/dict/items`、`PUT/DELETE /api/admin/dict/items/{id}` | 字典项管理 |
 | POST | `/api/admin/dict/refresh` | 刷新字典缓存 |
@@ -301,6 +303,22 @@ pnpm build
   已获得全部权限码**（「角色管理」→ 菜单授权），否则相关接口会返回 403
 - 前端按钮显隐改为按权限码判定，不再依赖角色名。若你扩展了后端权限码，
   需同步 `frontend/src/constants/permission.ts`（有契约测试拦截漏改）
+
+## 从 v0.4 升级到 v0.5
+
+无新增迁移，**存量库直接重启即可**。但有四处行为变化需要注意：
+
+- **授权接口不再吞错误**。`PUT /api/admin/roles/{id}/menus` 若收到非法菜单 ID，
+  此前会静默跳过并返回「权限分配成功」，现在返回 **400**「提交的菜单 ID 不存在」。
+  如果你有脚本在调这个接口，请先校验 ID
+- **删除角色新增守卫**。内置角色（`admin` / `user`）与仍被用户占用的角色一律拒绝删除
+ （400，message 里带占用用户数）。这是防止把系统改造成"无人能管理"的状态：
+ 角色种子只在 `roles` 表为空时写入，删掉不会重建
+- **删除菜单改为依赖数据库级联**。原先手写递归删除会吞掉子节点的错误，
+ 可能留下 `parent_id` 指向已删父节点的孤儿菜单；现在由 `ON DELETE CASCADE`
+ 原子完成。行为上等价，但不会再产生脏数据
+- **授权弹窗是全量覆盖**。打开授权、取消几个勾选并保存，会把该角色
+ **未勾选**的既有授权一并撤销——这是接口一直以来的语义，现在界面终于如实呈现
 
 ## License
 

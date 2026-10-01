@@ -223,11 +223,12 @@ v0.4.0 把权限码变成了强制鉴权，但**没有任何一条正常路径�
 | 2 | 修 `delete_role`：单事务 + 禁止删内置 admin + 报告影响用户数 | ✅ `cc582550` |
 | 3 | 修 `delete_menu` 递归吞错（同一根因，避免只修一半） | ✅ `cc582550` |
 | 4 | 后端集成测试：撤销生效 / 非法 ID 报错 / 拒绝删内置角色 | ✅ `cc582550`（16→25） |
-| 5 | 前端 `roleApi` 补 create/update/delete/assignMenus | 🔄 |
-| 6 | 角色管理页可写 + 菜单/权限码授权树 | ⬜ |
-| 7 | 新按钮按权限码 gate（`system:role:*`、`system:menu:grant`） | ⬜ |
-| 8 | 前端测试 + 全量回归 | ⬜ |
-| 9 | 文档（CHANGELOG / README / 版本号） | ⬜ |
+| 5 | 前端 `roleApi` 补 create/update/delete/assignMenus | ✅ `1d1e0887` |
+| 6 | 角色管理页可写 + 菜单/权限码授权树 | ✅ `1d1e0887` |
+| 7 | 新按钮按权限码 gate（`system:role:*`、`system:menu:grant`） | ✅ `1d1e0887` |
+| 8 | 前端测试 + 全量回归 | ✅ 69 前端 / 36 单测 / 26 集成 / 36 E2E |
+| 8.5 | 接 UI 时发现并修掉 v0.4.0 遗留的 `?role_id=` 空树缺陷 | ✅ `aa532547` |
+| 9 | 文档（CHANGELOG / README / 版本号） | ✅ 版本号 0.4.0 → 0.5.0 |
 
 ## 起始 git 状态
 
@@ -268,6 +269,73 @@ v0.4.0 把权限码变成了强制鉴权，但**没有任何一条正常路径�
 > `frontend/src/utils/menu.ts`、`frontend/src/constants/builtin.ts`、
 > `frontend/src/views/system/role/index.vue`、`frontend/src/views/system/menu/index.vue`。
 > 预期下一步：前端单测覆盖上述纯逻辑与 API 契约，再做全量回归。
+
+### 步骤 5-8 进展日志
+
+#### `1d1e0887` feat(role): 角色管理页可写 + 菜单/权限码授权树
+
+- `roleApi` 补 `create/update/delete/assignMenus`（后端早已就绪，前端无入口）。
+- 角色页从 63 行只读表格改为可写：增删改 + 授权树（含 `type='button'` 权限码节点），
+  按钮按 `system:role:*` 与 `system:menu:grant` gate。
+- 内置角色（admin/user）不渲染删除按钮——后端必然 400。前端名单
+  `constants/builtin.ts` 由 `builtinRoles.spec.ts` 对着后端 `BUILTIN_ROLES` 校验。
+- 顺带修 v0.4.0 遗留缺口：菜单页三个行内入口与「新增根菜单」此前完全没接权限码。
+- 前端测试 36 → 69（+33）。注入缺陷验证：去掉 ID 过滤、前端名单多加一个角色，各自失败。
+
+#### `aa532547` fix(menu): 按角色查菜单树不再丢弃父节点未授权的节点
+
+**v0.4.0 就存在的缺陷，只是从没人调过 `GET /api/admin/menus?role_id=`。**
+接授权弹窗时实测：给一个只被授予「角色管理 + 其 4 个按钮」的角色，
+`role_menus` 有 5 行，接口却返回 `[]`。
+
+- 根因：`build_tree(filtered, None)` 只把 `parent_id IS NULL` 当根，
+  父节点不在过滤结果里的节点被**静默丢弃**。
+- admin 恰好看不出问题：种子把它授满全部 42 个菜单，所有祖先都在集合里。
+- 危害：授权弹窗对部分授权的角色显示「该角色没有任何权限」，
+  管理员一保存就按**全量覆盖**把授权清空——静默的数据丢失。
+- 改成森林语义（父不在集合内即视为根）。同一函数也服务 `/api/auth/menus`，
+  因此「授权了菜单页但没授权其上级目录」的用户，之前侧栏里根本看不到那个页面，
+  现在会以顶层出现。
+- 测试 +4 单元 / +1 集成（25→26）。**注入缺陷验证**：改回旧语义后，
+  集成测试报 `只授权一个菜单时应只返回它，实际: []`，2 个单元测试同时失败。
+
+> 教训：交接文档里「授权树数据已现成，无需新接口」的判断是**只看了代码、没跑数据**。
+> 下次给类似结论前，先用 curl 打一次真实响应。
+
+#### naive-ui `n-tree` 的 DOM 结构（写 E2E 时踩的坑）
+
+```
+.n-tree-node
+  ├ .n-tree-node-indent
+  ├ .n-tree-node-switcher
+  ├ .n-tree-node-checkbox        ← 复选框外层
+  │   └ .n-checkbox[role=checkbox][aria-checked]
+  └ .n-tree-node-content         ← 标签文本，与复选框是**兄弟**不是后代
+```
+
+用 `row.querySelector('.n-checkbox')`（row 取 content）会拿到 `null`。
+勾选状态读 `aria-checked` 比 `classList.contains('n-checkbox--checked')` 稳。
+另：关闭的 `n-modal` 仍留在 DOM 里（`display:none`），
+要按**内容特征**定位弹窗，不能靠出现顺序。
+
+#### `cascade` 的半选语义（授权弹窗的真实行为）
+
+勾选父菜单会连带勾上全部子孙（符合预期）。但**取消一个子按钮**后，
+父菜单变为半选（indeterminate），就不在 `checked-keys` 里了 →
+保存时父菜单的授权也被撤销。所以「取消 1 个按钮」实际让 `role_menus`
+从 5 行减到 3 行。这是 naive-ui 的既定语义、UI 也如实显示了半选，
+但容易被误解，已在弹窗提示里写明。
+
+#### E2E 结果（`/tmp/e2e-role.mjs` + `/tmp/e2e-lib.mjs`）
+
+- ✅ **36/36 通过**（真实 Chrome headless + CDP 直连，Node 22 内置 WebSocket，零依赖）。
+- 覆盖：内置角色无删除按钮、UI 新建角色落库、授权树展示权限码、
+  cascade 勾父带子（且不波及无关模块）、保存后 DB 落库、**重新打开正确回显**、
+  取消勾选后 DB 真的撤销、半选语义、撤销 `system:role:create` 后按钮从 DOM 移除
+  且接口 403、UI 删除角色后 `role_menus` 级联清理无残留。
+- 截图 `/tmp/e2e-role-0*.png` 已人工复核。
+- 起服务注意：后台进程会随 shell 退出被回收，必须用长驻 session 跑
+  `./target/debug/axum-api` 与 `pnpm dev`；`pnpm dev` 需 `--host 127.0.0.1`。
 
 ## 后续版本候选
 

@@ -1,6 +1,6 @@
 [package]
 name = "axum-api"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Production-grade Rust backend API with Axum, SQLx, JWT auth"
 authors = ["dev"]
@@ -68,4 +68,3 @@ axum-extra = { version = "0.10", features = ["typed-header"] }
 sysinfo = "0.33"
 # OpenAPI 规范由代码生成（handler 注解 + DTO 派生）
 utoipa = { version = "5.5.0", features = ["axum_extras", "uuid", "chrono"] }
-
