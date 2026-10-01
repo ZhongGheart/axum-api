@@ -737,3 +737,45 @@ SELECT count(*) FROM users WHERE username='evil1' -> 0   （没留下半成品�
   上一轮用 `nohup ... &` 起的进程会随 exec 的 shell 退出被回收，
   表现为 curl 返回 000、server 日志停在启动那一行——不是服务有问题，是进程没了。
 - 同一端口只跑一个实例：v0.4.0 用 8081、v0.5.0 用 8082，便于对照。
+
+## ✅ v0.5.0 已发布（2026-10-02）
+
+- PR：https://github.com/ZhongGheart/axum-api/pull/4 （CI 三个 job 全绿后合并）
+- 合并方式：merge commit `8768cd7c`（两个 parent，8 个提交历史全保留，未 squash）
+- tag：`v0.5.0`（annotated，指向 merge commit `8768cd7c`）
+- Release：https://github.com/ZhongGheart/axum-api/releases/tag/v0.5.0
+- 已删除已合并分支 `v0.5.0`（本地 + 远程），master CI 复核全绿（run 36895031336）
+
+### 发版流程里新增的一个坑（比 v0.4.0 多一条）
+
+**本地分支与 tag 同名会让 ref 变得 ambiguous。** 打完 tag 后
+`git rev-parse v0.5.0` 解析到的是**分支** tip（`a82a061c`）而不是 tag
+（`8768cd7c`），并打印 `warning: refname 'v0.5.0' is ambiguous`。
+tag 本身是对的（`refs/tags/v0.5.0^{commit}` 指向 merge commit），但任何走短名的
+命令都会拿到错的 commit。
+
+- 校验 tag 必须写全：`git rev-parse refs/tags/v0.5.0^{commit}`
+- 推 tag 同理：`git push origin refs/tags/v0.5.0`（别写 `git push origin v0.5.0`）
+- v0.4.0 记的 `dst refspec matches more than one` 是同一个根因的另一面
+- 最省事的解法：tag 之前先 `git checkout master` 并删掉本地 `v0.5.0` 分支，
+  名字就不会撞了。本轮是先 tag 后删分支，验证时必须用全 refspec。
+
+其余照抄 v0.4.0 即可（`gh` 版本差异见上文）：`gh pr merge` 用 `-t/-b` 而非
+`--title/--body`；`gh release create` 用 `--notes-file` + `--verify-tag`。
+
+## 下一版候选方向（未开工，供取舍）
+
+按"解除限制"的价值排序，不含推测性重构：
+
+1. **多角色用户的前端表达**（当前唯一的语义不一致）：用户表单是整体替换、
+   `POST /users/:id/roles` 是追加语义，多角色用户经表单保存会丢角色。
+   这是本版遗留里唯一会导致**静默丢授权**的，其余都是能力缺口
+2. **权限码清空后的恢复路径**：现在只能新建按钮才能拿回一个被清空的码，
+   管理员在界面上"误清空 → 想反悔"没有出路。加一个"用已持有的码重建按钮"
+   的入口，或让清空操作可撤销
+3. **补前端入口**：`system:monitor:export`、`system:test:access` 后端已有码但前端无入口
+4. **审计日志保留策略** + **接口耗时跨副本聚合**：都属运维债，
+   接口耗时现在重启就丢
+5. **浏览器端人工回归**：本版前端逻辑未改（路由按权限码动态注册），
+   81 个前端测试 + 真实二进制升级验证已覆盖，但**没有做真人浏览器回归**。
+   下一版动前端时建议补上
