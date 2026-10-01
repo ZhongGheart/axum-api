@@ -558,3 +558,319 @@ async fn every_documented_route_is_implemented() {
         "以下接口已写入 OpenAPI 文档但实际不存在: {missing:?}"
     );
 }
+
+// ──────────────────────────────────────────────
+// 权限码（menus.permission 从元数据变为强制拦截）
+// ──────────────────────────────────────────────
+
+/// 测试库连接（直接操作数据，验证授权变更的效果）
+async fn pool() -> sqlx::PgPool {
+    sqlx::PgPool::connect(&test_database_url())
+        .await
+        .expect("连接测试库失败")
+}
+
+/// 撤销角色对某个权限码的授权，返回是否确实删除了授权行
+async fn revoke_permission_code(role_name: &str, code: &str) -> bool {
+    let result = sqlx::query(
+        "DELETE FROM role_menus rm \
+         USING menus m, roles r \
+         WHERE rm.menu_id = m.id AND rm.role_id = r.id \
+           AND r.name = $1 AND m.permission = $2",
+    )
+    .bind(role_name)
+    .bind(code)
+    .execute(&pool().await)
+    .await
+    .expect("撤销权限码失败");
+    result.rows_affected() > 0
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn permission_codes_are_seeded_and_returned_to_admin() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/auth/permissions", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let codes: Vec<String> = serde_json::from_value(body["data"].clone()).expect("权限码格式错误");
+
+    // 种子必须覆盖权限码定义表里的每一条，且权限码唯一
+    let declared: Vec<&str> = axum_api::model::permission::PERMISSION_DEFS
+        .iter()
+        .map(|d| d.code)
+        .collect();
+    assert_eq!(
+        codes.len(),
+        declared.len(),
+        "admin 拿到的权限码数量应与定义表一致"
+    );
+    for code in &declared {
+        assert!(
+            codes.iter().any(|c| c == code),
+            "admin 缺少权限码 {code}（实际: {codes:?}）"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn ordinary_user_has_no_permission_codes() {
+    let app = app().await;
+    let username = unique("perm_user");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "user1234"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let token = login_token(&app, &username, "user1234").await;
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/auth/permissions", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"].as_array().map(|a| a.len()),
+        Some(0),
+        "普通用户不应持有任何权限码"
+    );
+}
+
+/// **核心用例**：权限码不只是元数据，撤销后接口立即 403。
+///
+/// 这是 v0.3.0「已知限制」里点名的那条差距，本用例是它的回归防线。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn revoked_permission_code_blocks_the_interface() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    // 先确认撤销前可用
+    let (before, body) = send(&app, request("GET", "/api/admin/users", Some(&token), None)).await;
+    assert_eq!(before, StatusCode::OK, "撤销前应可访问: {body}");
+
+    assert!(
+        revoke_permission_code("admin", axum_api::model::permission::USER_LIST).await,
+        "撤销前应存在 admin 的 system:user:list 授权"
+    );
+
+    // 撤销后同一接口立即 403（无缓存窗口）
+    let (after, body) = send(&app, request("GET", "/api/admin/users", Some(&token), None)).await;
+    assert_eq!(after, StatusCode::FORBIDDEN, "撤销权限码后应被拦截: {body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("system:user:list"),
+        "403 应指明缺失的权限码，便于排查: {body}"
+    );
+
+    // 未被撤销的接口不受影响，证明拦截是按权限码精确到接口的
+    let (roles_status, roles_body) =
+        send(&app, request("GET", "/api/admin/roles", Some(&token), None)).await;
+    assert_eq!(
+        roles_status,
+        StatusCode::OK,
+        "撤销 system:user:list 不应影响 system:role:list: {roles_body}"
+    );
+
+    // 恢复授权，避免影响其他用例
+    let pool = pool().await;
+    sqlx::query(
+        "INSERT INTO role_menus (role_id, menu_id) \
+         SELECT r.id, m.id FROM roles r, menus m \
+         WHERE r.name = 'admin' AND m.permission = $1 \
+         ON CONFLICT (role_id, menu_id) DO NOTHING",
+    )
+    .bind(axum_api::model::permission::USER_LIST)
+    .execute(&pool)
+    .await
+    .expect("恢复权限码授权失败");
+}
+
+/// **鉴权必须早于入参校验**：无权限 + 畸形请求体也必须返回 403，而不是 422。
+///
+/// 曾经的缺陷：把校验写在 handler 函数体里，而 axum 先解析 `Json`，
+/// 于是缺字段的请求拿到 422，等于把接口的参数结构反馈给了无权限调用者。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn permission_is_checked_before_body_validation() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    assert!(revoke_permission_code("admin", axum_api::model::permission::USER_DELETE).await);
+
+    // 请求体字段名写错（真实字段是 ids），若先解析请求体会得到 422
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users/batch-delete",
+            Some(&token),
+            Some(json!({ "wrong_field": [] })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "应先鉴权后校验入参，实际响应: {body}"
+    );
+
+    let pool = pool().await;
+    sqlx::query(
+        "INSERT INTO role_menus (role_id, menu_id) \
+         SELECT r.id, m.id FROM roles r, menus m \
+         WHERE r.name = 'admin' AND m.permission = $1 \
+         ON CONFLICT (role_id, menu_id) DO NOTHING",
+    )
+    .bind(axum_api::model::permission::USER_DELETE)
+    .execute(&pool)
+    .await
+    .expect("恢复权限码授权失败");
+}
+
+/// 权限码授权的增删改接口本身也受权限码保护（防止越权授予自己权限）
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn permission_grant_endpoint_requires_grant_code() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (before, _) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/admin/roles/00000000-0000-0000-0000-000000000000/menus",
+            Some(&token),
+            Some(json!({ "menu_ids": [] })),
+        ),
+    )
+    .await;
+    // 角色不存在会返回 404/404 类错误，但绝不能是 200，也不能是权限码 403
+    assert_ne!(before, StatusCode::FORBIDDEN, "撤销前不应被权限码拦截");
+
+    assert!(revoke_permission_code("admin", axum_api::model::permission::MENU_GRANT).await);
+
+    let (after, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/admin/roles/00000000-0000-0000-0000-000000000000/menus",
+            Some(&token),
+            Some(json!({ "menu_ids": [] })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        after,
+        StatusCode::FORBIDDEN,
+        "撤销 system:menu:grant 后授权接口应 403: {body}"
+    );
+
+    let pool = pool().await;
+    sqlx::query(
+        "INSERT INTO role_menus (role_id, menu_id) \
+         SELECT r.id, m.id FROM roles r, menus m \
+         WHERE r.name = 'admin' AND m.permission = $1 \
+         ON CONFLICT (role_id, menu_id) DO NOTHING",
+    )
+    .bind(axum_api::model::permission::MENU_GRANT)
+    .execute(&pool)
+    .await
+    .expect("恢复权限码授权失败");
+}
+
+/// 契约测试：每个 `/api/admin/*` handler 都必须声明类型化权限码守卫。
+///
+/// 防止将来新增管理接口时漏接守卫，从而绕过授权体系。守卫是签名里的提取器参数
+/// （`_perm: PermUserList`），在**提取阶段**完成校验，因此早于 `Json` 入参解析。
+#[test]
+fn every_admin_handler_declares_a_permission_guard() {
+    let controller_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/controller");
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+
+    for entry in std::fs::read_dir(&controller_dir).expect("读取 src/controller 失败") {
+        let path = entry.expect("目录项读取失败").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("读取 controller 源文件失败");
+
+        // 按 `pub async fn name(...) -> ... {` 切分函数体
+        let mut cursor = 0usize;
+        while let Some(start) = source[cursor..].find("pub async fn ") {
+            let abs_start = cursor + start;
+            let body_start = match source[abs_start..].find('{') {
+                Some(offset) => abs_start + offset,
+                None => break,
+            };
+            let signature = &source[abs_start..body_start];
+            let name: String = signature
+                .trim_start_matches("pub async fn ")
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+
+            // 路由路径写在函数上方的 `#[utoipa::path(...)]` 属性里，不在签名中
+            let attr_start = source[..abs_start]
+                .rfind("#[utoipa::path(")
+                .unwrap_or(abs_start);
+            let attr = &source[attr_start..abs_start];
+
+            // 函数体到下一个 `pub async fn` 或文件末尾
+            let rest = &source[body_start..];
+            let body = match rest.find("\npub async fn ") {
+                Some(offset) => &rest[..offset],
+                None => rest,
+            };
+            cursor = body_start + body.len();
+
+            // 只校验挂在 /api/admin/ 下的 handler
+            if !attr.contains("\"/api/admin/") {
+                continue;
+            }
+            checked += 1;
+
+            // 守卫是签名里的类型化提取器参数，在提取阶段完成校验
+            let has_guard = signature.contains("_perm: Perm");
+            if !has_guard {
+                offenders.push(format!(
+                    "{}::{name} 未声明类型化权限码守卫（_perm: Perm…）",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        checked > 20,
+        "应至少校验 20 个 admin handler，实际 {checked}"
+    );
+    assert!(
+        offenders.is_empty(),
+        "以下管理接口缺少权限码守卫:\n  {}",
+        offenders.join("\n  ")
+    );
+}

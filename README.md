@@ -12,17 +12,18 @@
 | 能力 | 状态 | 说明 |
 |------|------|------|
 | JWT 认证 | ✅ | HS256；令牌带 `jti`，支持**单令牌注销**与**用户级会话吊销** |
-| RBAC | ✅ | 角色唯一数据源为 `user_roles` 表；接口按角色拦截（admin / user） |
+| RBAC | ✅ | 角色唯一数据源为 `user_roles` 表；admin 路由再按**权限码**逐接口鉴权 |
 | 登录防护 | ✅ | 账号 + 客户端 IP 双维度失败计数，超阈值锁定；客户端 IP 默认取 TCP 真实来源 |
 | 限流 | ✅ | 基于 Redis 的固定窗口限流（IP 维度） |
 | 操作日志 | ✅ | 受保护路由写入 `audit_logs`（仅方法/路径/查询串，不记录请求体） |
 | 数据字典 | ✅ | Redis 缓存 + 写操作真实失效；读取接口对**任意已登录用户**开放 |
 | 菜单管理 | ✅ | 菜单是导航的唯一来源：`/api/auth/menus` 决定侧栏与前端动态路由 |
+| 权限码 | ✅ | 28 个 `<模块>:<资源>:<动作>` 权限码存于 `menus.permission`（按钮型菜单），后端强制鉴权 + 前端按码判定 |
 | 用户管理 | ✅ | 增删改查、批量删除、状态切换、重置密码；含"最后一个管理员"保护 |
 | 系统监控 | ✅ | CPU/内存/磁盘、DB/Redis 状态、接口耗时统计（进程内，重启丢失） |
 | Excel 导出 | ✅ | 用户列表、操作日志、系统信息 |
 | OpenAPI 文档 | ✅ | utoipa 从 handler 注解与 DTO 派生生成；双向覆盖测试保证文档与路由同步 |
-| 按钮级权限 | ⚠️ | 前端为**基于角色**的显隐（`PermissionButton`）；无独立权限码体系 |
+| 接口级权限码 | ⚠️ | 仅 admin 路由细化到权限码；非 admin 角色仍被 `require_role("admin")` 整体挡住 |
 
 > 表中 ⚠️ 项是明确的能力边界，不再作为"已实现"宣传。
 
@@ -194,6 +195,34 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 
 > 完整字段定义见 Swagger UI。集成测试会校验"文档里声明的每条路由都真实存在"。
 
+## 权限码
+
+每个 `/api/admin/*` 接口都要求一个权限码，缺失即 403（响应体带具体缺失的码）。
+权限码保存在 `menus.permission` 列，对应 `type = 'button'` 的菜单行，
+经既有的「角色-菜单」关联授权——**没有独立的权限表**，在「菜单管理」页即可调整。
+
+| 模块 | 权限码 |
+|------|--------|
+| 用户 | `system:user:list` `system:user:create` `system:user:update` `system:user:delete` |
+| 角色 | `system:role:list` `system:role:create` `system:role:update` `system:role:delete` |
+| 菜单 | `system:menu:list` `system:menu:create` `system:menu:update` `system:menu:delete` `system:menu:grant` |
+| 字典 | `system:dict:list` `system:dict:create` `system:dict:update` `system:dict:delete` `system:dict:refresh` |
+| 日志 | `system:log:list` `system:log:export` |
+| 监控 | `system:monitor:system` `system:monitor:api` `system:monitor:alert` `system:monitor:reset` `system:monitor:export` |
+| 其他 | `system:export:user` `system:test:access` `system:validate:test` |
+
+前后端共用同一套字符串：后端由 `src/model/permission.rs` 的 const 定义（单一数据源，
+同时驱动启动种子），前端经 `GET /api/auth/permissions` 获取，并用
+`v-permission="'system:user:create'"` 或 `<PermissionButton code="...">` 判定显隐。
+
+```vue
+<PermissionButton code="system:user:create">新建用户</PermissionButton>
+<button v-permission="'system:user:delete'">删除</button>
+```
+
+权限码**不做缓存**：撤销后立即生效，不会出现"撤销了还能用一会儿"的窗口。
+启动种子只给**新建的**权限码补授 admin，因此管理员被显式撤销的权限不会被重启悄悄恢复。
+
 ## 新增一个页面（菜单驱动）
 
 前端不再有静态业务路由表，加页面只需两步：
@@ -258,6 +287,20 @@ pnpm build
 - 字典读取接口路径由 `/api/admin/dict/{code}/items` 改为 `/api/dict/{code}/items`
 - 移除端点：`PUT /api/admin/users/{id}/roles`（非事务且未被前端使用，
   请改用 `POST /api/admin/users/{id}/roles` 或用户更新的 `role` 字段）
+
+## 从 v0.3 升级到 v0.4
+
+- 迁移 `007` 为 `menus.permission` 建**部分唯一索引**。若库中已存在重复权限码，
+  启动会明确报错（而不是抛看不懂的原始索引错误）；重复说明菜单被手工改坏，
+  请在「菜单管理」页修正后重启——程序**不会**静默去重
+- 启动时自动补齐 28 条权限码按钮行。菜单树本身仍只在 `menus` 表为空时写入，
+  你对菜单的增删不会被覆盖
+- `menus.permission` 从此**参与鉴权**，不再只是元数据：如果你的库里存在同名但语义不符的
+  权限码，它会开始影响接口放行，请对照上表核对
+- `/api/admin/*` 现按权限码鉴权。新装环境无需操作；**存量环境请确认 admin 角色
+  已获得全部权限码**（「角色管理」→ 菜单授权），否则相关接口会返回 403
+- 前端按钮显隐改为按权限码判定，不再依赖角色名。若你扩展了后端权限码，
+  需同步 `frontend/src/constants/permission.ts`（有契约测试拦截漏改）
 
 ## License
 

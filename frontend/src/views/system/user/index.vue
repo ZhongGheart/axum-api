@@ -7,7 +7,7 @@
   <div class="page-container">
     <n-page-header title="用户管理">
       <template #extra>
-        <PermissionButton permission="admin" type="primary" @click="openCreate">
+        <PermissionButton :permission="PERM.USER_CREATE" type="primary" @click="openCreate">
           <template #icon><n-icon><AddIcon /></n-icon></template>
           新建用户
         </PermissionButton>
@@ -75,6 +75,7 @@ import { showSuccess, showConfirm } from '@/utils/message'
 import BaseTable from '@/components/common/BaseTable.vue'
 import SearchForm from '@/components/common/SearchForm.vue'
 import PermissionButton from '@/components/common/PermissionButton.vue'
+import { PERM } from '@/constants/permission'
 
 // ── 状态 ────────────────────────────────────────────────────────
 
@@ -154,8 +155,8 @@ const columns: DataTableColumn[] = [
     render(row: Record<string, unknown>) {
       const r = row as unknown as UserInfo
       return h('div', { style: 'display:flex;gap:8px' }, [
-        h(PermissionButton, { permission: 'admin', size: 'small', onClick: () => openEdit(r) }, () => '编辑'),
-        h(PermissionButton, { permission: 'admin', size: 'small', type: 'error', onClick: () => handleDelete(r.id) }, () => '删除'),
+        h(PermissionButton, { permission: PERM.USER_UPDATE, size: 'small', onClick: () => openEdit(r) }, () => '编辑'),
+        h(PermissionButton, { permission: PERM.USER_DELETE, size: 'small', type: 'error', onClick: () => handleDelete(r.id) }, () => '删除'),
       ])
     },
   },

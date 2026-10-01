@@ -6,6 +6,9 @@
 use axum::{extract::State, Json};
 
 use crate::error::AppError;
+use crate::middleware::permission::{
+    PermMonitorAlert, PermMonitorApi, PermMonitorExport, PermMonitorReset, PermMonitorSystem,
+};
 use crate::model::ApiResponse;
 use crate::router::AppState;
 use crate::service::monitor::MonitorService;
@@ -20,6 +23,7 @@ use crate::service::monitor::MonitorService;
 )]
 pub async fn system_info(
     State(state): State<AppState>,
+    _perm: PermMonitorSystem,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let sys = MonitorService::get_system_info()?;
     let db = MonitorService::get_database_status(&state).await?;
@@ -43,6 +47,7 @@ pub async fn system_info(
 )]
 pub async fn api_metrics(
     State(state): State<AppState>,
+    _perm: PermMonitorApi,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let metrics = state.metrics_collector;
     let snapshot = metrics.snapshot().await;
@@ -79,6 +84,7 @@ pub async fn api_metrics(
 )]
 pub async fn alerts(
     State(state): State<AppState>,
+    _perm: PermMonitorAlert,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     let sys = MonitorService::get_system_info()?;
     let snapshot = state.metrics_collector.snapshot().await;
@@ -103,6 +109,7 @@ pub async fn alerts(
 )]
 pub async fn reset_metrics(
     State(state): State<AppState>,
+    _perm: PermMonitorReset,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     state.metrics_collector.reset().await;
     Ok(Json(ApiResponse::success("指标已重置")))
@@ -118,6 +125,7 @@ pub async fn reset_metrics(
 )]
 pub async fn export_system(
     State(state): State<AppState>,
+    _perm: PermMonitorExport,
 ) -> Result<axum::response::Response, AppError> {
     use crate::utils::export::{ExcelColumn, ExcelExport};
 

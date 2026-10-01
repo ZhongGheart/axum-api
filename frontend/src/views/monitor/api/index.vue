@@ -2,7 +2,7 @@
   <div class="monitor-page">
     <n-page-header title="接口监控" subtitle="接口性能排行 / 报错统计">
       <template #extra>
-        <n-button size="tiny" @click="resetMetrics">重置统计</n-button>
+        <n-button v-permission="PERM.MONITOR_RESET" size="tiny" @click="resetMetrics">重置统计</n-button>
         <n-button :loading="loading" @click="fetchData">刷新</n-button>
       </template>
     </n-page-header>
@@ -39,6 +39,7 @@ import type { DataTableColumn } from 'naive-ui'
 import { monitorApi } from '@/api/monitor'
 import type { ApiMetric, AlertItem } from '@/api/monitor'
 import { showSuccess } from '@/utils/message'
+import { PERM } from '@/constants/permission'
 
 const loading = ref(false)
 const errorMsg = ref('')

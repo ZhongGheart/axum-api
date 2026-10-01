@@ -8,6 +8,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { getToken } from '@/utils/storage'
 import { useMenuStore } from '@/stores/menu'
+import { usePermissionsStore } from '@/stores/permissions'
 import { buildRoutesFromMenus } from './menuRoutes'
 
 /** 白名单路由（无需登录 + 无侧栏） */
@@ -133,19 +134,27 @@ router.beforeEach(async (to, _from, next) => {
   // 未登录拦截
   if (!token) return next('/login')
 
-  // ── 加载菜单并注册动态路由 ─────────────────────────────────
+  // ── 加载菜单与权限码并注册动态路由 ─────────────────────────
   // 首次进入（含刷新）时业务路由尚未注册，必须先加载菜单再重新匹配当前地址，
   // 否则会先落到 404 匹配结果上。
+  // 权限码与菜单同时加载：两者都是首屏渲染的前提（侧栏 + 按钮级显隐），
+  // 且权限码加载失败时 fail-closed（按钮全藏），不阻塞路由放行。
   const menuStore = useMenuStore()
+  const permissionsStore = usePermissionsStore()
   if (!menuStore.loaded) {
     try {
-      const menus = await menuStore.load()
+      const [menus] = await Promise.all([menuStore.load(), permissionsStore.load()])
       registerMenuRoutes(menus)
     } catch {
       // 加载失败已由 store 弹出提示；这里放行，由 404 页面兜底，避免守卫死循环
       return next()
     }
     return next({ ...to, replace: true })
+  }
+
+  // 菜单已加载但权限码尚未加载（例如权限码接口单独失败后刷新）
+  if (!permissionsStore.loaded) {
+    await permissionsStore.load()
   }
 
   next()

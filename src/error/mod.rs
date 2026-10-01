@@ -31,6 +31,10 @@ pub enum AppError {
     #[error("权限不足")]
     Forbidden,
 
+    /// 权限码不足（细粒度授权拦截，附带缺失的权限码）
+    #[error("缺少权限：{0}")]
+    PermissionDenied(String),
+
     /// 资源未找到
     #[error("资源未找到: {0}")]
     NotFound(String),
@@ -67,6 +71,7 @@ impl IntoResponse for AppError {
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, self.to_string()),
             AppError::Forbidden => (StatusCode::FORBIDDEN, self.to_string()),
+            AppError::PermissionDenied(_) => (StatusCode::FORBIDDEN, self.to_string()),
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             AppError::Conflict(_) => (StatusCode::CONFLICT, self.to_string()),
             AppError::InvalidCredentials(_) => (StatusCode::UNAUTHORIZED, self.to_string()),

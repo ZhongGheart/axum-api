@@ -132,6 +132,11 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route("/api/auth/logout", post(auth::logout))
         // 当前用户的导航菜单：前端据此动态生成路由与侧栏
         .route("/api/auth/menus", get(crate::controller::menu::my_menus))
+        // 当前用户的权限码：前端 v-permission 据此判定按钮级权限
+        .route(
+            "/api/auth/permissions",
+            get(crate::controller::menu::my_permissions),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             audit_log_middleware,

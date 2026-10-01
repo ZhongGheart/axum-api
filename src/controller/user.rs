@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::auth::AuthenticatedUser;
+use crate::middleware::permission::{PermUserCreate, PermUserDelete, PermUserList, PermUserUpdate};
 use crate::model::{ApiResponse, UserInfo};
 use crate::router::AppState;
 use crate::utils::validation;
@@ -124,6 +125,7 @@ fn same_role_set(a: &[String], b: &[String]) -> bool {
 )]
 pub async fn list_users(
     State(state): State<AppState>,
+    _perm: PermUserList,
     Query(params): Query<UserListParams>,
 ) -> Result<Json<ApiResponse<UserListResponse>>, AppError> {
     let page = params.page.unwrap_or(1);
@@ -174,6 +176,7 @@ pub async fn list_users(
 )]
 pub async fn create_user(
     State(state): State<AppState>,
+    _perm: PermUserCreate,
     Json(req): Json<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     use crate::utils::password::hash_password;
@@ -240,6 +243,7 @@ pub async fn create_user(
 )]
 pub async fn update_user(
     State(state): State<AppState>,
+    _perm: PermUserUpdate,
     Path(id): Path<Uuid>,
     Json(req): Json<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
@@ -296,6 +300,7 @@ pub async fn update_user(
 )]
 pub async fn delete_user(
     State(state): State<AppState>,
+    _perm: PermUserDelete,
     auth_user: AuthenticatedUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
@@ -336,6 +341,7 @@ pub async fn delete_user(
 )]
 pub async fn batch_delete_users(
     State(state): State<AppState>,
+    _perm: PermUserDelete,
     auth_user: AuthenticatedUser,
     Json(req): Json<BatchDeleteRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
@@ -405,6 +411,7 @@ pub struct BatchDeleteRequest {
 )]
 pub async fn toggle_user_status(
     State(state): State<AppState>,
+    _perm: PermUserUpdate,
     auth_user: AuthenticatedUser,
     Path(id): Path<Uuid>,
     Json(req): Json<ToggleStatusRequest>,
@@ -456,6 +463,7 @@ pub struct ToggleStatusRequest {
 )]
 pub async fn reset_user_password(
     State(state): State<AppState>,
+    _perm: PermUserUpdate,
     Path(id): Path<Uuid>,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {

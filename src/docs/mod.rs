@@ -18,7 +18,7 @@ use utoipa::OpenApi as _;
 #[openapi(
     info(
         title = "Axum Admin API",
-        version = "0.3.0",
+        version = "0.4.0",
         description = "基于 Axum + SQLx + JWT 的管理后台 API。规范由代码生成，与实现保持同步。",
     ),
     paths(
@@ -28,6 +28,7 @@ use utoipa::OpenApi as _;
         crate::controller::auth::me,
         crate::controller::auth::logout,
         crate::controller::menu::my_menus,
+        crate::controller::menu::my_permissions,
         crate::controller::rbac::admin_test,
         crate::controller::user::list_users,
         crate::controller::user::create_user,

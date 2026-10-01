@@ -3,7 +3,12 @@
 //! 从请求的 `Authorization: Bearer <token>` 头中提取并验证 JWT 令牌。
 //! 验证通过后将用户信息注入到请求扩展中，供后续处理器使用。
 //!
-//! 同时提供 `require_role` 函数用于接口权限拦截。
+//! 同时提供 `require_role`（粗粒度角色闸门）。细粒度的权限码闸门见 `super::permission`。
+//!
+//! 两者是 AND 语义：`require_role("admin")` 决定"能不能进管理区"，
+//! `PermissionGuard::require(权限码)` 决定"能进管理区的哪一部分"。
+//! 权限码存放在 `menus.permission`（`type='button'` 的菜单行），经 `role_menus` 授权，
+//! 定义见 [`crate::model::permission`]。
 
 use axum::{
     extract::{FromRequestParts, Request, State},

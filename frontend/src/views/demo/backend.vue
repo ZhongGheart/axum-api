@@ -3,7 +3,9 @@
     <n-page-header title="后端能力示例" subtitle="分页 / 导出 / 校验 / CRUD 模板" />
 
     <n-card title="1. Excel 导出测试" class="demo-card">
-      <n-button type="primary" @click="handleExport">导出用户列表 (Excel)</n-button>
+      <n-button v-permission="PERM.EXPORT_USER" type="primary" @click="handleExport">
+        导出用户列表 (Excel)
+      </n-button>
     </n-card>
 
     <n-card title="2. 通用分页查询" class="demo-card">
@@ -23,7 +25,7 @@
     <n-card title="3. 参数校验测试" class="demo-card">
       <n-space>
         <n-input v-model:value="testUsername" placeholder="输入用户名测试校验" style="width:200px" />
-        <n-button @click="testValidation">测试校验</n-button>
+        <n-button v-permission="PERM.VALIDATE_TEST" @click="testValidation">测试校验</n-button>
       </n-space>
       <p v-if="validationResult" style="margin-top:8px">{{ validationResult }}</p>
     </n-card>
@@ -35,6 +37,7 @@ import { ref } from 'vue'
 import { useMessage } from 'naive-ui'
 import type { DataTableColumn } from 'naive-ui'
 import http from '@/api/index'
+import { PERM } from '@/constants/permission'
 
 const message = useMessage()
 

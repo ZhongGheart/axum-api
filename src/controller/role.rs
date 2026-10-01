@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::middleware::permission::{
+    PermRoleCreate, PermRoleDelete, PermRoleList, PermRoleUpdate, PermUserList, PermUserUpdate,
+};
 use crate::model::ApiResponse;
 use crate::router::AppState;
 
@@ -38,6 +41,7 @@ pub struct AssignRoleRequest {
 )]
 pub async fn list_roles(
     State(state): State<AppState>,
+    _perm: PermRoleList,
 ) -> Result<Json<ApiResponse<Vec<RoleItem>>>, AppError> {
     let rows = state.auth_service.role_repo.list_all().await?;
     let items: Vec<RoleItem> = rows
@@ -64,6 +68,7 @@ pub async fn list_roles(
 )]
 pub async fn get_user_roles(
     State(state): State<AppState>,
+    _perm: PermUserList,
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, AppError> {
     let roles = state
@@ -89,6 +94,7 @@ pub async fn get_user_roles(
 )]
 pub async fn assign_user_role(
     State(state): State<AppState>,
+    _perm: PermUserUpdate,
     axum::extract::Path(user_id): axum::extract::Path<Uuid>,
     Json(req): Json<AssignRoleRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
@@ -111,6 +117,7 @@ pub async fn assign_user_role(
 )]
 pub async fn create_role(
     State(state): State<AppState>,
+    _perm: PermRoleCreate,
     Json(req): Json<CreateRoleReq>,
 ) -> Result<Json<ApiResponse<RoleItem>>, AppError> {
     let id = Uuid::new_v4();
@@ -142,6 +149,7 @@ pub async fn create_role(
 )]
 pub async fn update_role(
     State(state): State<AppState>,
+    _perm: PermRoleUpdate,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     Json(req): Json<CreateRoleReq>,
 ) -> Result<Json<ApiResponse<RoleItem>>, AppError> {
@@ -172,6 +180,7 @@ pub async fn update_role(
 )]
 pub async fn delete_role(
     State(state): State<AppState>,
+    _perm: PermRoleDelete,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     sqlx::query("DELETE FROM user_roles WHERE role_id = $1")
