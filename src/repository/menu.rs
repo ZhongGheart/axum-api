@@ -131,7 +131,14 @@ impl MenuRepository {
         .bind(menu.is_visible)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| AppError::InternalServerError(format!("创建菜单失败: {e}")))
+        .map_err(|e| match e.as_database_error().and_then(|db| db.constraint()) {
+            // 并发下两个请求可能都通过了 controller 的占用预查，
+            // 最终由唯一索引裁决。此时同样报冲突，而不是 500。
+            Some("idx_menus_permission_unique") => AppError::Conflict(
+                "该权限码已被其他菜单使用".to_string(),
+            ),
+            _ => AppError::InternalServerError(format!("创建菜单失败: {e}")),
+        })
     }
 
     /// 查询给定角色集合拥有的权限码
@@ -317,6 +324,50 @@ impl MenuRepository {
         .await
         .map_err(|e| AppError::InternalServerError(format!("恢复菜单权限码失败: {e}")))?
         .ok_or_else(|| AppError::BadRequest("该菜单没有可恢复的权限码".into()))
+    }
+
+    /// 该权限码是否已被某个菜单占用
+    ///
+    /// 用于把"声明一个已被占用的权限码"翻译成可操作的冲突消息，
+    /// 而不是让唯一索引抛出 500。见 [`Self::create`]。
+    pub async fn is_permission_taken(&self, code: &str) -> Result<bool, AppError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM menus WHERE permission = $1)")
+            .bind(code)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("查询权限码占用状态失败: {e}")))
+    }
+
+    /// 该菜单**及其整棵子树**里，所有"已被授予至少一个角色"的权限码
+    ///
+    /// 删除是级联的（见 [`Self::delete`]）：`menus.parent_id` 声明了
+    /// `ON DELETE CASCADE`，删一个目录会连带删掉整棵子树。
+    /// 因此删除守卫必须看整棵子树——只看目标节点自身的 `permission`
+    /// 会漏掉"删父目录、连带删掉子树里承载码的按钮"这条路，
+    /// 而它与直接删那个按钮的效果完全相同。
+    ///
+    /// 只返回**已授予**的码：没人依赖的码删掉不改变任何人的权限，
+    /// 不该计入守卫要求（否则"整理菜单结构"这类无害操作会全线报错）。
+    pub async fn granted_codes_in_subtree(&self, id: Uuid) -> Result<Vec<String>, AppError> {
+        sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE subtree AS (
+                SELECT id FROM menus WHERE id = $1
+                UNION ALL
+                SELECT m.id FROM menus m JOIN subtree s ON m.parent_id = s.id
+            )
+            SELECT DISTINCT m.permission
+            FROM menus m
+            JOIN subtree s ON m.id = s.id
+            JOIN role_menus rm ON rm.menu_id = m.id
+            WHERE m.permission IS NOT NULL AND m.permission <> ''
+            ORDER BY m.permission
+            "#,
+        )
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询菜单子树被授予的权限码失败: {e}")))
     }
 
     /// 该菜单是否已被授予至少一个角色

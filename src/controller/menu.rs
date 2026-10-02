@@ -118,6 +118,18 @@ pub async fn create_menu(
     _perm: PermMenuCreate,
     Json(req): Json<CreateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
+    // 权限码必须唯一：迁移 `007` 的部分唯一索引 `idx_menus_permission_unique`
+    // 会挡住重复声明，但索引抛出来的是 500 "服务器内部错误"——
+    // 入参错误被当成服务端故障，既污染错误监控，管理员也看不懂发生了什么。
+    // 这里先查一次，给出可操作的消息；索引仍作为并发下的最终兜底。
+    if let Some(code) = req.permission.as_deref().filter(|p| !p.is_empty()) {
+        if state.menu_repo.is_permission_taken(code).await? {
+            return Err(AppError::Conflict(format!(
+                "权限码「{code}」已被其他菜单使用，请换一个未被占用的码"
+            )));
+        }
+    }
+
     let menu = Menu {
         id: Uuid::new_v4(),
         parent_id: req.parent_id,
@@ -254,9 +266,27 @@ pub async fn restore_menu_permission(
 )]
 pub async fn delete_menu(
     State(state): State<AppState>,
-    _perm: PermMenuDelete,
+    perm: PermMenuDelete,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    // 授权下界（v0.8.0 第 1 项）：删除是级联的，删掉一个**承载权限码的菜单**
+    // 等价于把那个码从所有依赖它的角色身上剥掉，与 `update_menu` 清空该码的
+    // 效果完全一样。v0.7.0 已给 update 装了这道守卫，delete 这条路当时没管，
+    // 于是同一件事有两个入口、一个拦住一个放行。
+    //
+    // 守卫覆盖**整棵子树**：`menus.parent_id` 是 `ON DELETE CASCADE`，
+    // 删父目录会连带删掉子树里承载码的按钮，只看目标节点会漏掉这条路。
+    //
+    // 只对"已被授予至少一个角色"的码设限：没人依赖的码删掉不改变任何人的权限
+    // （与 v0.7.0 的"清空无害"同理），否则"整理菜单结构"这类无害操作会全线报错。
+    let granted_codes = state.menu_repo.granted_codes_in_subtree(id).await?;
+    if !granted_codes.is_empty() {
+        perm.guard().ensure_covers(
+            &granted_codes,
+            &format!("删除承载权限码「{}」的菜单", granted_codes.join("、")),
+        )?;
+    }
+
     state.menu_repo.delete(id).await?;
     Ok(Json(ApiResponse::success("删除成功")))
 }

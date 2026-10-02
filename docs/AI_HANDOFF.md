@@ -1596,3 +1596,64 @@ carrier holds after  = []
 - HEAD = `0715ece9 docs(handoff): 记录 v0.7.0 发布结果与 ref 歧义坑复发`
 - 上一版：v0.7.0 已发布（tag `v0.7.0` → merge commit `66f26595`）
 - `v0.7.0` 分支已删（远端与本地）
+
+---
+
+## v0.8.0 第 1 项完成记录（delete_menu 授权下界）
+
+### 落地内容
+
+- `MenuRepository::granted_codes_in_subtree(id)`：递归 CTE，取该菜单**整棵子树**里
+ 所有"已被授予至少一个角色"的权限码
+- `MenuRepository::is_permission_taken(code)`：权限码占用预查
+- `delete_menu` 装上授权下界，与 v0.7.0 的 update 守卫语义对齐
+- `create_menu` 加占用预查；`MenuRepository::create` 把唯一索引冲突映射成 `Conflict`
+
+### 一个设计要点：守卫不能把菜单锁死
+
+`admin` 造出一个码后**并不持有**它，所以 admin 也不能直接删承载该码的菜单。
+这不是缺陷，是规则的必然推论。出路是**先撤销授权、再删除**
+（撤销需 `system:menu:grant`），菜单变成"没人依赖"后删除即放行。
+
+既有三条 v0.7.0 用例的**清理步骤**正是在这里拿到 403——那是正确行为。
+新增 `cleanup_temp_menu_dir` 走恢复路径清理，并把"没有锁死"变成了断言。
+
+刻意**没有**给 admin 开后门：handoff 里既定的设计决定第 3 条
+"admin 是数据上的超级用户，不是代码里的后门"仍然成立。
+
+### 测试：集成测试 63 → 67（新增 4 条）
+
+`deleting_a_granted_button_others_rely_on_requires_holding_it`、
+`deleting_a_directory_with_a_granted_button_below_is_denied`、
+`deleting_a_button_no_role_relies_on_is_allowed`、
+`declaring_an_already_used_permission_code_is_a_conflict`
+
+### 缺陷注入验证（四条，含一条鉴别性结果）
+
+| 注入 | 结果 |
+|---|---|
+| 移除 delete 守卫 | 两条删除用例同时变红 |
+| 子树查询去掉递归 | 目录级联那条变红，直接删按钮那条**仍绿** |
+| 移除占用预查 | 冲突用例**仍绿** |
+| 预查与索引映射都移除 | 冲突用例变红 |
+
+第二条证明递归查询真正承重，且两条用例覆盖**不同的**攻击路径
+（删按钮 / 删父目录）。这是本轮最有价值的一次注入。
+
+第三条暴露**诚实的覆盖缺口**：占用预查与唯一索引映射两层都报冲突，
+测试只能区分"两层都没了"，即**预查本身没有被独立覆盖**。
+预查负责的是可操作的消息文案，正确性由索引映射那层兜底。
+记在这里以免后人误以为预查已被测试保护。
+
+### 门禁结果（全绿）
+
+- `cargo fmt --all --check` / `cargo clippy --locked --all-targets --all-features -D warnings`：clean
+- 单元测试 55（未变，本项无纯逻辑单元可拆）
+- 集成测试 63 → 67
+- 前端未改动，故未重跑前端门禁（本项 diff 只碰 3 个 Rust 文件 + 文档/版本）
+
+### 起始 git 状态
+
+- 分支 `v0.8.0`（从 master 切出）
+- HEAD = `0715ece9 docs(handoff): 记录 v0.7.0 发布结果与 ref 歧义坑复发`
+

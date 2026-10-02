@@ -3314,6 +3314,46 @@ async fn restore_slot(menu_id: uuid::Uuid) -> (Option<String>, Option<uuid::Uuid
         .expect("读取恢复槽位失败")
 }
 
+/// 清理临时菜单目录
+///
+/// `delete_menu` 自 v0.8.0 第 1 项起对"已被授予角色的码"设了守卫，而 admin
+/// 造这些一次性临时码时**并没有持有**它们，于是 admin 不能直接删掉——
+/// 403 是正确行为，不是缺陷。
+///
+/// 恢复路径是产品设计的一部分：先撤销该菜单的授权（需 `system:menu:grant`），
+/// 菜单变成"没人依赖"后删除即放行。
+///
+/// 这里直连 SQL 删 `role_menus` 而不是走 `PUT /roles/:id/menus`：
+/// 后者是**全量替换**，会顺手清掉那些临时角色身上别的授权。
+async fn cleanup_temp_menu_dir(app: &Router, admin_tok: &str, dir_id: uuid::Uuid) {
+    sqlx::query(
+        "DELETE FROM role_menus WHERE menu_id IN (
+             WITH RECURSIVE subtree AS (
+                 SELECT id FROM menus WHERE id = $1
+                 UNION ALL
+                 SELECT m.id FROM menus m JOIN subtree s ON m.parent_id = s.id
+             )
+             SELECT id FROM subtree
+         )",
+    )
+    .bind(dir_id)
+    .execute(&pool().await)
+    .await
+    .expect("清理临时授权失败");
+
+    let (status, body) = send(
+        app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{dir_id}"),
+            Some(admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
+}
+
 /// 核心闭环：清空 → 记录凭据 → **死路演示** → 恢复 → 凭据一次性作废
 ///
 /// "死路演示"那一步是本 PR 存在的理由：清空后没有任何角色再持有该码，
@@ -3407,17 +3447,7 @@ async fn clearing_a_permission_code_can_be_restored_by_the_clearing_user() {
         "凭据用过后不应能重复恢复: {body}"
     );
 
-    let (status, body) = send(
-        &app,
-        request(
-            "DELETE",
-            &format!("/api/admin/menus/{dir_id}"),
-            Some(&admin_tok),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
+    cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
     assert!(!menu_still_exists(btn_id).await, "临时按钮应已清干净");
 }
 
@@ -3466,17 +3496,7 @@ async fn clearing_a_code_others_rely_on_requires_holding_it() {
         "被拒后码必须原样未被清空"
     );
 
-    let (status, body) = send(
-        &app,
-        request(
-            "DELETE",
-            &format!("/api/admin/menus/{dir_id}"),
-            Some(&admin_tok),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
+    cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
 }
 
 /// 清空一个**没授予任何角色**的码不改变任何人的权限，应放行
@@ -3639,17 +3659,7 @@ async fn only_the_clearing_user_can_restore_a_permission_code() {
     assert_eq!(status, StatusCode::OK, "清空者本人应能恢复: {body}");
     assert_eq!(permission_of(btn_id).await.as_deref(), Some(code.as_str()));
 
-    let (status, body) = send(
-        &app,
-        request(
-            "DELETE",
-            &format!("/api/admin/menus/{dir_id}"),
-            Some(&admin_tok),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
+    cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
 }
 
 /// 菜单树要告诉前端"这个按钮的码可以恢复"，否则恢复入口无从发现
@@ -3785,4 +3795,254 @@ async fn admin_can_still_create_another_admin() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "清理第二个管理员失败: {body}");
+}
+
+// ===== v0.8.0 第 1 项：菜单删除的授权下界 =====
+
+/// 删除一个**别的角色正依赖**的按钮，必须持有该码
+///
+/// v0.7.0 修好了 `update_menu` 清空已授权按钮的码（要求持该码），
+/// 但 `delete_menu` 完全没检查——而两者的**效果等价**：
+/// 码都会从目标角色身上消失。区别只是 delete 连按钮行都没了。
+///
+/// 实测（修复前）：deleter 角色只持 `menu:list` + `menu:delete`，
+/// 既不持那个一次性码，也没有 `system:menu:grant`，
+/// 却能把别的角色依赖的码整个剥掉，完成一次绕过 `menu:grant` 的跨角色撤权。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_a_granted_button_others_rely_on_requires_holding_it() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (dir_id, btn_id, code, holder_tok, _holder_uid) =
+        granted_temp_button(&app, &admin_tok, "tmp:del").await;
+
+    // 操作员只持 menu:delete，不持那个一次性码，也没有 menu:grant
+    let (tok, _role_id, _uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "delete_denied",
+        &[permission::MENU_LIST, permission::MENU_DELETE],
+    )
+    .await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{btn_id}"),
+            Some(&tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "删除别人依赖的码应被拒: {body}"
+    );
+
+    // 被拒后两件事都必须成立：按钮还在，且持有者的码没被剥掉
+    assert_eq!(
+        permission_of(btn_id).await.as_deref(),
+        Some(code.as_str()),
+        "被拒后按钮必须原样存在、码未被清掉"
+    );
+    let (_, mine) = send(
+        &app,
+        request("GET", "/api/auth/permissions", Some(&holder_tok), None),
+    )
+    .await;
+    let held: Vec<String> =
+        serde_json::from_value(mine["data"].clone()).expect("权限码响应格式错误");
+    assert!(
+        held.contains(&code),
+        "持有者必须仍然持有该码，实际持有: {held:?}"
+    );
+
+    // 守卫不能把菜单永久锁死：admin 造了这个码但没持有它，
+    // 因此 admin 也无法**直接**删除。出路是先撤销该菜单的授权（需 `menu:grant`），
+    // 菜单变成"没人依赖"后删除即放行。这条恢复路径是守卫成立的前提，必须验。
+    let holder_role = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT role_id FROM role_menus WHERE menu_id = $1 LIMIT 1",
+    )
+    .bind(btn_id)
+    .fetch_one(&pool().await)
+    .await
+    .expect("查询持有该按钮的角色失败");
+
+    let (status, body) = assign_menus(&app, &admin_tok, holder_role, &[]).await;
+    assert_eq!(status, StatusCode::OK, "撤销对该按钮的授权失败: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{dir_id}"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "撤销授权后应可删除: {body}");
+}
+
+/// 删除一个**没授予任何角色**的按钮不改变任何人的权限，应放行
+///
+/// 这是守卫的另一半，与 `clearing_a_code_no_role_relies_on_is_allowed` 同理：
+/// 连这种无害操作也拦的话，"整理菜单结构"会全线报错。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_a_button_no_role_relies_on_is_allowed() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let code = format!("tmp:ungranted:{}", &unique("p")[5..]);
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&admin_tok),
+            Some(json!({
+                "name": unique("tmp_ungranted_btn"),
+                "type": "button",
+                "permission": code
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建未被授予的按钮失败: {body}");
+    let btn_id = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    let (tok, _role_id, _uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "delete_allowed",
+        &[permission::MENU_LIST, permission::MENU_DELETE],
+    )
+    .await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{btn_id}"),
+            Some(&tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除没人依赖的按钮应放行: {body}");
+}
+
+/// 声明一个**已被占用**的权限码应报冲突，而不是服务器内部错误
+///
+/// 修复前实测返回 500 "服务器内部错误"：迁移 `007` 的部分唯一索引挡住了它，
+/// 但入参错误被当成服务端故障，污染错误监控，管理员也看不懂。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn declaring_an_already_used_permission_code_is_a_conflict() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&admin_tok),
+            Some(json!({
+                "name": unique("dup_code_btn"),
+                "type": "button",
+                "permission": permission::USER_DELETE
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "声明已被占用的码应报冲突，实际: {body}"
+    );
+
+    // 原有那个按钮必须完好无损
+    assert_eq!(
+        permission_of(menu_id_of(permission::USER_DELETE).await)
+            .await
+            .as_deref(),
+        Some(permission::USER_DELETE),
+        "冲突不应改动既有按钮"
+    );
+}
+
+/// 删除**父级目录**同样要拦住——删除是级联的
+///
+/// `menus.parent_id` 声明了 `ON DELETE CASCADE`，所以删一个目录会连带删掉
+/// 整棵子树。若守卫只看目标节点自身的 `permission`，那么
+/// "删承载码的按钮"被拦住了，"删它的父目录"却能绕过去——两条路效果完全一样。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_a_directory_with_a_granted_button_below_is_denied() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (dir_id, btn_id, code, holder_tok, _holder_uid) =
+        granted_temp_button(&app, &admin_tok, "tmp:delcascade").await;
+
+    let (tok, _role_id, _uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "cascade_denied",
+        &[permission::MENU_LIST, permission::MENU_DELETE],
+    )
+    .await;
+
+    // 目标节点是目录，本身不携带任何码
+    assert_eq!(
+        permission_of(dir_id).await,
+        None,
+        "夹具前提：目录自身不应携带权限码"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{dir_id}"),
+            Some(&tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "删除子树里有别人依赖的码的目录应被拒: {body}"
+    );
+
+    assert_eq!(
+        permission_of(btn_id).await.as_deref(),
+        Some(code.as_str()),
+        "被拒后子树里的按钮必须完好"
+    );
+    let (_, mine) = send(
+        &app,
+        request("GET", "/api/auth/permissions", Some(&holder_tok), None),
+    )
+    .await;
+    let held: Vec<String> =
+        serde_json::from_value(mine["data"].clone()).expect("权限码响应格式错误");
+    assert!(
+        held.contains(&code),
+        "持有者必须仍然持有该码，实际持有: {held:?}"
+    );
+
+    cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
 }
