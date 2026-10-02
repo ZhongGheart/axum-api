@@ -1416,3 +1416,51 @@ DELETE FROM audit_logs WHERE id IN (
   本地门禁已全绿（见各项完成记录），但**远端 CI 尚未验证**
 - 下一步（未做，需用户确认）：开 PR → 合并 → 打 tag `v0.7.0` → 发 Release → 删分支。
   合并与打 tag 是有后果的操作，不自行执行
+
+## PR #6 已开 + 按 CI 原始命令复核（v0.7.0）
+
+- 开 PR：<https://github.com/ZhongGheart/axum-api/pull/6>（v0.7.0 → master）
+- **CI 由此首次真正跑起来**。此前 v0.7.0 分支上零 CI 记录
+
+### 关键补测：本地门禁此前并不等于 CI 门禁
+
+CI 的 clippy 与 test 都带 `--locked --all-targets --all-features`。
+上一轮本地跑的命令比这窄 —— 不含集成测试 target、也不含全 feature 组合。
+故按 CI 原始命令重跑了一遍：
+
+| 命令（CI 原始） | 结果 |
+|---|---|
+| cargo fmt --all --check | clean |
+| cargo clippy --locked --all-targets --all-features -- -D warnings | clean，无新警告 |
+| cargo test --locked --all-targets --all-features | 55 passed |
+| cargo test --locked --test api_integration -- --ignored --test-threads=1 | 60 passed |
+| pnpm lint（exit code 实测） | 0，脚本无 --max-warnings，历史 warning 不会红 CI |
+| pnpm typecheck / pnpm test / pnpm build | clean / 84 passed / exit 0 |
+
+集成测试口径澄清：CI 用 `--ignored`，只跑被标记的那 60 条。
+另 3 条普通测试被 filtered out。两者相加正好 63，与前文记录的 63 一致。
+所以不是少跑了 3 条，而是 63 条里有 60 条带 ignore 标记。
+
+### 本机无法覆盖的门禁
+
+- docker job 只能靠 CI。本机没有可用 Docker daemon，
+ 镜像构建与 compose 配置校验无法本地复现
+
+### CI 结果（run 36946178817，PR #6）
+
+三个 job 全绿：
+
+| job | 结果 | 耗时 |
+|---|---|---|
+| Rust (fmt / clippy / unit / integration) | success | 2m8s |
+| Frontend (lint / typecheck / test / build) | success | 39s |
+| Docker images and compose config | success | 2m10s |
+
+即 v0.7.0 的远端门禁首次得到验证。docker job 是本机唯一无法复现的一个。
+
+### 工具坑（写本文件时必读）
+
+- 工具坑：apply_patch 在上一行以全角逗号结尾时会吃掉下一行的新增前缀
+  - 现象：报 "invalid hunk at line N"，看起来像上下文没匹配上，实际是前缀被吃
+  - 规避：写本文件时让每行都不以全角逗号 `，` 收尾，改用句号或分号
+  - 同源坑：正文里出现连续两个 at 符号也会让解析器以为换了 hunk，报 End Patch 缺失
