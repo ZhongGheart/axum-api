@@ -2459,3 +2459,63 @@ FAIL  除预期的 403/404 外无 4xx/5xx  ::  429 /api/admin/users ...
    "授权的两面只装了一面"。新增写入口时问一句：**它等价于什么已有操作的镜像？**
 3. **部署物的新旧要用行为探针验，不要看 mtime**。撞同一分钟时不可信，
    一次通过的探针只能证明它验的那一处
+
+---
+
+# ✅ v0.9.0 已发布（2026-10-02）
+
+- Release: https://github.com/ZhongGheart/axum-api/releases/tag/v0.9.0
+- tag `v0.9.0`（**附注标签**，与 v0.2.0 起各版一致）打在 `14d6ca25`
+- `master` = `14d6ca25`，已推送，本地与 `origin/master` 同步（0 提交待推）
+- 两个提交：`440b27cb`（v0.9.0 本体）+ `14d6ca25`（handoff 记录）
+
+## ref 歧义坑第三次：这次没有复发
+
+`git push origin v0.9.0` 会踩本地分支与 tag 同名的坑（v0.5.0 记过、
+v0.7.0 又踩了一次）。本轮**事先查了** `git branch --list '*v0.9.0*'`——
+本地并没有 `v0.9.0` 分支，即便如此仍按记下的纪律用完整 refspec：
+
+```
+git push origin refs/tags/v0.9.0:refs/tags/v0.9.0
+```
+
+**纪律**：打与分支同名的 tag 时，推送一律用完整 refspec，不用短名。
+且动手前先确认是否真有同名分支，别凭记忆判断。
+
+## tag 打在 HEAD 而非分支 tip
+
+与 v0.5.0 / v0.6.0 / v0.8.0 的做法一致。本轮没有走 PR/合并（用户直接指示
+推送 + 打 tag），tag 就落在包含 handoff 记录的最后一个提交上，核验过
+`git rev-list -n1 v0.9.0 == git rev-parse HEAD`。
+
+## Release 正文取自 CHANGELOG 对应段落
+
+与 v0.8.0 同一做法：取 `## [0.9.0]` 段落去掉标题行，前面加一段摘要与
+**升级前必读的「⚠️ 行为变化」提示**——因为本版有三处会改变现有运维动作的行为，
+不提前说清楚会踩坑。
+
+## 发布前本地门禁已按 CI 原始 flag 复核
+
+v0.7.0 记过"本地门禁比 CI 窄"的坑。本轮本地跑的即 CI 原始命令：
+`cargo fmt --all --check`、`cargo clippy --locked --all-targets --all-features
+-D warnings`、`cargo test --locked --all-targets --all-features`、
+`cargo test --test api_integration -- --ignored --test-threads=1`，
+外加 CI 不跑的两层（e2e 真实 Chrome、授权探针）与前端四项。
+
+## 一条自我纠正的记录
+
+我原本在上一节写了"遗留：远端仍有 `v0.7.0` 分支，建议清掉"，
+理由是"历史发布分支与同名 tag 并存正是 ref 歧义坑的成因"。**动手前实测，
+发现这条是错的**：
+
+```
+$ git ls-remote --heads origin
+14d6ca25...	refs/heads/master
+```
+
+远端**只有 `master` 一个分支**，`v0.7.0` 分支早已不存在。
+v0.7.0 那轮记的"删分支：未做，待用户确认"后来实际已处理，
+我在读旧记录时把"当时未做"当成了"至今未做"。
+
+**教训**：交接日志记的是**当时的快照**，不是现状。
+照着旧记录下结论前必须实测一次——这次若不查，就凭空给用户派了个不存在的活。
