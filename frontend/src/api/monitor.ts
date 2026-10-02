@@ -52,4 +52,6 @@ export const monitorApi = {
   getApiMetrics() { return http.get<{ metrics: ApiMetric[]; summary: Record<string, unknown> }>('/admin/monitor/api-metrics') },
   getAlerts() { return http.get<{ alerts: AlertItem[]; alert_count: number }>('/admin/monitor/alerts') },
   resetMetrics() { return http.post<null>('/admin/monitor/metrics/reset') },
+  /** GET /api/admin/monitor/system/export — 导出系统信息 Excel（需 system:monitor:export） */
+  exportSystem() { return http.get<Blob>('/admin/monitor/system/export', { responseType: 'blob' }) },
 }

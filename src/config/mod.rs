@@ -61,6 +61,32 @@ pub struct SecurityConfig {
     pub login_failure_window_seconds: u64,
 }
 
+/// 审计日志保留策略
+#[derive(Debug, Clone)]
+pub struct AuditLogConfig {
+    /// 保留天数；`0` 表示关闭自动清理（由运维手工处理）
+    pub retention_days: u32,
+    /// 清理任务运行间隔（秒）
+    pub cleanup_interval_seconds: u64,
+    /// 单批删除行数上限：把长事务切碎，避免长时间持锁与 WAL 膨胀
+    pub cleanup_batch_size: i64,
+    /// 单轮清理最多执行多少批；删空即提前结束
+    pub cleanup_max_batches: u32,
+}
+
+/// 接口耗时指标聚合配置
+#[derive(Debug, Clone)]
+pub struct MetricsConfig {
+    /// 本地增量缓冲的刷新间隔（秒）
+    ///
+    /// 决定"进程崩溃最多丢多少指标"的上界：间隔内的增量还在本地缓冲里。
+    pub flush_interval_seconds: u64,
+    /// Redis 指标键的存活时间（秒），兜底防止长期不再访问的键堆积
+    pub key_ttl_seconds: u64,
+    /// 本地缓冲允许的最大端点数：Redis 长期不可用时防止无限增长
+    pub max_buffered_endpoints: usize,
+}
+
 /// 应用全局配置
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -80,6 +106,10 @@ pub struct Config {
     pub security: SecurityConfig,
     /// 数据库连接配置
     pub database: DatabaseConfig,
+    /// 审计日志保留策略
+    pub audit_log: AuditLogConfig,
+    /// 接口耗时指标聚合配置
+    pub metrics: MetricsConfig,
     /// 启动时是否自动执行数据库迁移
     pub migrate_on_startup: bool,
 }
@@ -155,6 +185,45 @@ impl Config {
         let migrate_on_startup =
             env::var("MIGRATE_ON_STARTUP").unwrap_or_else(|_| "true".to_string()) != "false";
 
+        // 审计日志保留策略
+        let audit_log = AuditLogConfig {
+            retention_days: env::var("AUDIT_LOG_RETENTION_DAYS")
+                .unwrap_or_else(|_| "90".to_string())
+                .parse()
+                .expect("AUDIT_LOG_RETENTION_DAYS 必须是有效的数字（0 表示关闭自动清理）"),
+            cleanup_interval_seconds: env::var("AUDIT_LOG_CLEANUP_INTERVAL_SECONDS")
+                .unwrap_or_else(|_| "3600".to_string())
+                .parse()
+                .expect("AUDIT_LOG_CLEANUP_INTERVAL_SECONDS 必须是有效的数字"),
+            cleanup_batch_size: env::var("AUDIT_LOG_CLEANUP_BATCH_SIZE")
+                .unwrap_or_else(|_| "10000".to_string())
+                .parse()
+                .expect("AUDIT_LOG_CLEANUP_BATCH_SIZE 必须是有效的数字"),
+            cleanup_max_batches: env::var("AUDIT_LOG_CLEANUP_MAX_BATCHES")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()
+                .expect("AUDIT_LOG_CLEANUP_MAX_BATCHES 必须是有效的数字"),
+        };
+
+        // 间隔为 0 会让定时任务空转刷 Redis，这里兜底成 1 秒
+        let metrics_flush_interval_seconds = env::var("METRICS_FLUSH_INTERVAL_SECONDS")
+            .unwrap_or_else(|_| "5".to_string())
+            .parse::<u64>()
+            .expect("METRICS_FLUSH_INTERVAL_SECONDS 必须是有效的数字")
+            .max(1);
+
+        let metrics = MetricsConfig {
+            flush_interval_seconds: metrics_flush_interval_seconds,
+            key_ttl_seconds: env::var("METRICS_KEY_TTL_SECONDS")
+                .unwrap_or_else(|_| "604800".to_string())
+                .parse()
+                .expect("METRICS_KEY_TTL_SECONDS 必须是有效的数字"),
+            max_buffered_endpoints: env::var("METRICS_MAX_BUFFERED_ENDPOINTS")
+                .unwrap_or_else(|_| "10000".to_string())
+                .parse()
+                .expect("METRICS_MAX_BUFFERED_ENDPOINTS 必须是有效的数字"),
+        };
+
         // 限流配置
         let rate_limit = RateLimitConfig {
             ip_max_requests: env::var("RATE_LIMIT_IP_MAX")
@@ -198,6 +267,8 @@ impl Config {
             rate_limit,
             security,
             database,
+            audit_log,
+            metrics,
             migrate_on_startup,
         }
     }

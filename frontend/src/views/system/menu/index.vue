@@ -54,8 +54,8 @@
 
 <script setup lang="ts">
 import { ref, h, onMounted } from 'vue'
-import { NSpace, NIcon } from 'naive-ui'
-import { AddOutline as AddIcon, CreateOutline as EditIcon, TrashOutline as DelIcon } from '@vicons/ionicons5'
+import { NSpace, NIcon, NTooltip, NTag } from 'naive-ui'
+import { AddOutline as AddIcon, CreateOutline as EditIcon, TrashOutline as DelIcon, RefreshOutline as RestoreIcon } from '@vicons/ionicons5'
 import type { FormInst, FormRules, TreeOption } from 'naive-ui'
 import { menuApi } from '@/api/menu'
 import type { MenuNode, CreateMenuReq } from '@/api/menu'
@@ -70,6 +70,14 @@ const editingId = ref('')
 const parentId = ref<string | null>(null)
 const submitting = ref(false)
 const treeData = ref<TreeOption[]>([])
+/**
+ * 菜单 id → 可恢复的权限码
+ *
+ * 权限码被清空后全系统就没有任何角色再持有它，后端"改写权限码必须持有
+ * 目标码"的守卫会把**写回**也一并拦死。这个映射让树行能显示恢复入口，
+ * 否则管理员看到的就是一个"这个按钮怎么没权限了"的按钮，无从找回。
+ */
+const restorableById = ref<Record<string, string>>({})
 
 const typeOptions = [
   { label: '目录', value: 'directory' },
@@ -98,6 +106,15 @@ const rules: FormRules = {
 
 async function fetchTree() {
   const res = await menuApi.list()
+  const restorable: Record<string, string> = {}
+  const collect = (nodes: MenuNode[]) => {
+    for (const n of nodes) {
+      if (n.restorable_permission) restorable[n.id] = n.restorable_permission
+      if (n.children?.length) collect(n.children)
+    }
+  }
+  collect(res as unknown as MenuNode[])
+  restorableById.value = restorable
   treeData.value = buildTreeOptions(res as unknown as MenuNode[])
 }
 
@@ -111,14 +128,29 @@ function buildTreeOptions(nodes: MenuNode[]): TreeOption[] {
 }
 
 function renderLabel({ option }: { option: TreeOption }) {
+  const restorable = restorableById.value[option.key as string]
   return h('div', { style: 'display:flex;align-items:center;gap:8px;padding:4px 0' }, [
     h('span', option.label as string),
+    // 码被清空但留了恢复凭据：明确标出来，而不是让管理员对着一棵
+    // "这个按钮怎么没权限了"的树猜
+    restorable
+      ? h(NTag, { size: 'small', type: 'warning', bordered: false }, {
+          default: () => `码已清空，可恢复 ${restorable}`,
+        })
+      : null,
     h(NSpace, { size: 'small' }, {
       default: () => [
         // 行内三个入口按权限码显隐：v0.4.0 之前这里完全没接，
         // 等于权限码体系在菜单页自己身上漏了（后端仍会 403，但 UI 会误导）
         h(PermissionButton, { permission: PERM.MENU_CREATE, size: 'tiny', quaternary: true, onClick: () => openCreate(option.key as string) }, { default: () => h(NIcon, null, () => h(AddIcon)) }),
         h(PermissionButton, { permission: PERM.MENU_UPDATE, size: 'tiny', quaternary: true, onClick: () => openEdit(option.key as string) }, { default: () => h(NIcon, null, () => h(EditIcon)) }),
+        restorable
+          ? h(NTooltip, null, {
+              trigger: () =>
+                h(PermissionButton, { permission: PERM.MENU_UPDATE, size: 'tiny', quaternary: true, type: 'warning', onClick: () => handleRestore(option.key as string) }, { default: () => h(NIcon, null, () => h(RestoreIcon)) }),
+              default: () => `恢复权限码 ${restorable}`,
+            })
+          : null,
         h(PermissionButton, { permission: PERM.MENU_DELETE, size: 'tiny', quaternary: true, type: 'error', onClick: () => handleDelete(option.key as string) }, { default: () => h(NIcon, null, () => h(DelIcon)) }),
       ],
     }),
@@ -161,6 +193,17 @@ async function handleDelete(id: string) {
   if (!ok) return
   await menuApi.delete(id)
   showSuccess('删除成功')
+  fetchTree()
+}
+
+async function handleRestore(id: string) {
+  const code = restorableById.value[id]
+  const ok = await showConfirm({
+    content: `确定恢复权限码「${code}」？只有清空者本人可以恢复。`,
+  })
+  if (!ok) return
+  await menuApi.restorePermission(id)
+  showSuccess('权限码已恢复')
   fetchTree()
 }
 

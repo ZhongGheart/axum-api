@@ -19,6 +19,21 @@ pub struct Menu {
     pub is_visible: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// 最近一次被清空掉的权限码（见迁移 `009`）
+    ///
+    /// 存在的唯一理由是**恢复**：权限码一旦被清空，全系统就没有任何角色
+    /// 再持有它，而 `update_menu` 的守卫要求"改写权限码必须持有目标码"，
+    /// 于是写回去会被自己的守卫拦死。这里留住旧值，
+    /// 让清空者能撤销自己的误操作。
+    #[serde(default)]
+    pub prev_permission: Option<String>,
+    /// 清空 `prev_permission` 的操作者 id
+    ///
+    /// 恢复接口只放行"本人撤销本人的误操作"——能清空已授予角色的按钮
+    /// 说明当时就持有该码，恢复即回到清空前状态，净零提权。
+    /// 存 id 而非用户名：用户名可改，id 不会。
+    #[serde(default)]
+    pub prev_permission_cleared_by: Option<Uuid>,
 }
 
 /// 菜单树节点（含子节点）
@@ -36,6 +51,12 @@ pub struct MenuNode {
     pub permission: Option<String>,
     pub is_visible: bool,
     pub created_at: DateTime<Utc>,
+    /// 可恢复的权限码；`None` 表示没有可恢复的清空记录
+    ///
+    /// 刻意**不**把 `prev_permission_cleared_by` 暴露给前端：
+    /// 界面只需要知道"能不能恢复"，"是不是你清的"由服务端判定，
+    /// 客户端不该也不能靠它做鉴权。
+    pub restorable_permission: Option<String>,
     pub children: Vec<MenuNode>,
 }
 
@@ -53,6 +74,7 @@ impl From<Menu> for MenuNode {
             permission: m.permission,
             is_visible: m.is_visible,
             created_at: m.created_at,
+            restorable_permission: m.prev_permission,
             children: vec![],
         }
     }

@@ -47,7 +47,11 @@ pub struct AppState {
 }
 
 /// 构建应用路由
-pub async fn create_router(config: Config) -> Result<Router, AppError> {
+///
+/// 同时返回 `AppState`：后台任务（指标 flush、审计日志清理）由 `main` 启动，
+/// 它们属于进程生命周期而非应用组装，因此不放在这里 spawn——
+/// 否则集成测试反复构建应用会留下一堆任务去打共享测试库。
+pub async fn create_router(config: Config) -> Result<(Router, AppState), AppError> {
     // ── 初始化读写分离数据库连接池 ────────────────────────
     let db_pool = DatabasePool::new(&config.database).await?;
 
@@ -67,7 +71,11 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
 
     // ── 初始化各层 ──────────────────────────────────────────────
     let jwt_util = Arc::new(JwtUtil::new(&config.jwt_secret));
-    let metrics_collector = Arc::new(MetricsCollector::new());
+    // 指标聚合到 Redis：多副本共享同一份计数，重启与"重置"都不再只作用于本进程
+    let metrics_collector = Arc::new(MetricsCollector::new(
+        Arc::clone(&redis_client),
+        config.metrics.clone(),
+    ));
 
     let user_repo = UserRepository::new(pool.clone());
     let role_repo = RoleRepository::new(pool.clone());
@@ -192,6 +200,10 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         .route(
             "/api/admin/menus/{id}",
             axum::routing::put(menu::update_menu).delete(menu::delete_menu),
+        )
+        .route(
+            "/api/admin/menus/{id}/restore-permission",
+            axum::routing::post(menu::restore_menu_permission),
         )
         .route(
             "/api/admin/roles/{role_id}/menus",
@@ -351,7 +363,7 @@ pub async fn create_router(config: Config) -> Result<Router, AppError> {
         // CORS
         .layer(cors)
         // 注入共享状态
-        .with_state(state);
+        .with_state(state.clone());
 
-    Ok(app)
+    Ok((app, state))
 }

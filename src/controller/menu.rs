@@ -131,6 +131,9 @@ pub async fn create_menu(
         is_visible: req.is_visible.unwrap_or(true),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        // 新建的按钮从未被清空过，没有可恢复的码
+        prev_permission: None,
+        prev_permission_cleared_by: None,
     };
     let saved = state.menu_repo.create(&menu).await?;
     Ok(Json(ApiResponse::success(MenuNode::from(saved))))
@@ -149,6 +152,7 @@ pub async fn create_menu(
 pub async fn update_menu(
     State(state): State<AppState>,
     perm: PermMenuUpdate,
+    auth_user: AuthenticatedUser,
     Path(id): Path<Uuid>,
     Json(req): Json<UpdateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
@@ -164,8 +168,79 @@ pub async fn update_menu(
             .ensure_covers(&required, "把菜单的权限码改为该值")?;
     }
 
-    let saved = state.menu_repo.update(id, &req).await?;
+    // 清空同样要过守卫，但只在**确实改变了别人权限**时。
+    //
+    // 此前 `.filter(|p| !p.is_empty())` 让清空整个绕过了检查，于是
+    // 持 `system:menu:update` 的角色可以把**别的角色**已持有按钮的码清掉，
+    // 绕过 `system:menu:grant` 完成一次跨角色撤权。
+    //
+    // 而如果这个按钮没授予任何角色，清空不改变任何人的权限，
+    // 属于"整理菜单结构"这类无害操作，不该被拦
+    // （既有测试 `rewriting_a_granted_menu_permission_to_an_unheld_code_is_denied`
+    // 的第一步就依赖这一点）。
+    if req.permission.as_deref().is_some_and(|p| p.is_empty()) {
+        let current = state.menu_repo.find_by_id(id).await?;
+        if let Some(code) = current.permission.as_deref().filter(|p| !p.is_empty()) {
+            if state.menu_repo.is_granted_to_any_role(id).await? {
+                perm.guard().ensure_covers(
+                    &[code.to_string()],
+                    &format!("清空已授权菜单的权限码「{code}」"),
+                )?;
+            }
+        }
+    }
+
+    let saved = state.menu_repo.update(id, &req, auth_user.user_id).await?;
     Ok(Json(ApiResponse::success(MenuNode::from(saved))))
+}
+
+/// POST /api/admin/menus/:id/restore-permission — 恢复被清空的权限码
+///
+/// 权限码被清空后全系统就没有任何角色再持有它，而 `update_menu` 的守卫
+/// 要求"改写权限码必须持有目标码"——于是**写回去会被自己的守卫拦死**。
+/// 本接口是那条死路唯一的出口。
+///
+/// ## 为什么只允许"本人恢复本人清掉的"是安全的
+///
+/// 清空一个**已授权**按钮的码要求调用者持有该码（见 `update_menu`），
+/// 因此"能清空"蕴含"清空前持有"。恢复只是把状态还原到清空之前，
+/// **净零提权**。若按钮本就未授予任何角色，清空放行、恢复也只是给
+/// "无人"一个码，同样净零。
+///
+/// 反过来，"把菜单授予别的角色"仍要过 `system:menu:grant` 与
+/// `assign_role_menus` 的既有判定，所以这里不构成新的越权原语。
+#[utoipa::path(
+    post,
+    path = "/api/admin/menus/{id}/restore-permission",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "菜单 ID")),
+    responses(
+        (status = 200, description = "恢复成功", body = ApiResponse<MenuNode>),
+        (status = 400, description = "没有可恢复的权限码，或不是本人清空的")
+    )
+)]
+pub async fn restore_menu_permission(
+    State(state): State<AppState>,
+    _perm: PermMenuUpdate,
+    auth_user: AuthenticatedUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
+    let menu = state.menu_repo.find_by_id(id).await?;
+    let Some(restorable) = menu.prev_permission.as_deref() else {
+        return Err(AppError::BadRequest(
+            "该菜单没有可恢复的权限码：它当前仍持有权限码，或从未被清空过".into(),
+        ));
+    };
+    if menu.prev_permission_cleared_by != Some(auth_user.user_id) {
+        return Err(AppError::BadRequest(format!(
+            "权限码「{restorable}」不是你清空的，只能由清空者本人恢复；\
+             如需接管，请新建按钮并声明该权限码"
+        )));
+    }
+    let restored = state.menu_repo.restore_permission(id).await?;
+    tracing::info!("管理员恢复菜单权限码: {} (码: {restorable})", restored.name);
+    Ok(Json(ApiResponse::success(MenuNode::from(restored))))
 }
 
 /// DELETE /api/admin/menus/:id — 删除菜单

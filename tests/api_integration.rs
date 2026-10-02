@@ -16,10 +16,17 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tower::ServiceExt;
 
-use axum_api::config::{Config, DatabaseConfig, RateLimitConfig, RedisConfig, SecurityConfig};
+use axum_api::config::{
+    AuditLogConfig, Config, DatabaseConfig, MetricsConfig, RateLimitConfig, RedisConfig,
+    SecurityConfig,
+};
+use axum_api::middleware::api_metrics::{EndpointMetric, MetricsCollector};
+use axum_api::repository::audit_log::AuditLogRepository;
 use axum_api::router::create_router;
+use axum_api::utils::redis::RedisClient;
 
 // ──────────────────────────────────────────────
 // 环境与脚手架
@@ -62,6 +69,19 @@ fn test_config(login_max_failures: u64) -> Config {
             max_size: 10,
             connect_timeout_seconds: 10,
         },
+        // 清理任务由 main 启动，测试不启动；但字段仍要给值
+        audit_log: AuditLogConfig {
+            retention_days: 90,
+            cleanup_interval_seconds: 3600,
+            cleanup_batch_size: 100,
+            cleanup_max_batches: 5,
+        },
+        metrics: MetricsConfig {
+            // 1 秒：测试里等一次 flush 很快
+            flush_interval_seconds: 1,
+            key_ttl_seconds: 600,
+            max_buffered_endpoints: 1000,
+        },
         migrate_on_startup: true,
     }
 }
@@ -71,8 +91,11 @@ fn test_config(login_max_failures: u64) -> Config {
 /// 连接管理器（Redis/DB）绑定创建它的 Tokio runtime，
 /// 而 `#[tokio::test]` 每个用例都会新建 runtime，因此不能跨用例共享路由。
 async fn app() -> Router {
+    // 后台任务（指标 flush、审计清理）由 main 启动，测试不启动它们，
+    // 否则会残留一批任务持续打共享测试库与 Redis
     create_router(test_config(1_000))
         .await
+        .map(|(router, _state)| router)
         .expect("构建路由失败")
 }
 
@@ -227,7 +250,7 @@ async fn logout_invalidates_only_the_current_token() {
 #[ignore = "需要真实 Postgres + Redis"]
 async fn repeated_login_failures_are_locked_out() {
     // 需要低阈值，单独构建路由，避免影响其他用例
-    let strict = create_router(test_config(3)).await.unwrap();
+    let (strict, _state) = create_router(test_config(3)).await.unwrap();
     let username = unique("lockout_probe");
 
     for _ in 0..3 {
@@ -2311,6 +2334,364 @@ async fn user_id_by_username(username: &str) -> uuid::Uuid {
         .expect("按用户名查 id 失败")
 }
 
+// ──────────────────────────────────────────────
+// 接口指标聚合（Redis）与审计日志保留
+// ──────────────────────────────────────────────
+
+/// 造一个独立的指标收集器，等价于"另一个副本"：各自持有本地缓冲，写同一份 Redis
+///
+/// flush_interval 设成 60s 且**不启动后台任务**，由用例显式调 `flush`，
+/// 这样断言不依赖时间，失败时也不会是"等得不够久"这种含糊原因。
+async fn replica_collector() -> MetricsCollector {
+    let redis = Arc::new(
+        RedisClient::new(&RedisConfig {
+            url: test_redis_url(),
+        })
+        .await
+        .expect("连接 Redis 失败"),
+    );
+    MetricsCollector::new(
+        redis,
+        MetricsConfig {
+            flush_interval_seconds: 60,
+            key_ttl_seconds: 600,
+            max_buffered_endpoints: 100,
+        },
+    )
+}
+
+fn find_metric<'a>(snapshot: &'a [EndpointMetric], path: &str) -> Option<&'a EndpointMetric> {
+    snapshot.iter().find(|m| m.path == path)
+}
+
+/// 指标必须按**路由模板**归并，而不是按含真实 ID 的原始路径
+///
+/// 旧实现记 `req.uri().path()`，于是每个资源 ID 都是独立一条：
+/// 基数无界，且每条 `call_count` 恒为 1，监控页看不出这个接口的真实 QPS。
+#[tokio::test]
+#[ignore]
+async fn metrics_group_paths_by_route_template_not_by_resource_id() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    // 共享 Redis，先清干净再看
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/monitor/metrics/reset",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重置指标失败: {body}");
+
+    let admin_id = user_id_by_username("admin").await;
+    let stranger_id = uuid::Uuid::new_v4();
+
+    // 同一个路由模板，两个不同的资源 ID
+    for id in [admin_id, stranger_id] {
+        let (status, body) = send(
+            &app,
+            request(
+                "GET",
+                &format!("/api/admin/users/{id}/roles"),
+                Some(&token),
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            status == StatusCode::OK || status == StatusCode::NOT_FOUND,
+            "请求应命中路由（404 表示用户不存在，指标同样应被记录）: {status} {body}"
+        );
+    }
+
+    // 走真实接口读取：中间件记 → 本地缓冲 → snapshot 合并 → JSON，全程串起来
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/monitor/api-metrics", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "读取指标失败: {body}");
+    // 直接断言线上 JSON，而不是反序列化成同一个结构体：
+    // 后者会把"字段名写错"这种问题一起糊过去
+    let snapshot = body["data"]["metrics"]
+        .as_array()
+        .expect("响应应含 metrics 数组")
+        .clone();
+
+    assert_eq!(
+        snapshot
+            .iter()
+            .find(|m| m["path"] == "/api/admin/users/{user_id}/roles")
+            .and_then(|m| m["call_count"].as_u64()),
+        Some(2),
+        "两次调用应归并到同一个路由模板，实际快照: {snapshot:#?}"
+    );
+
+    // method 必须干净：Redis 键带 `metrics:ep:` 前缀，
+    // 拆键时忘了剥前缀就会漏成 "metrics:ep:GET"
+    assert_eq!(
+        snapshot
+            .iter()
+            .find(|m| m["path"] == "/api/admin/users/{user_id}/roles")
+            .and_then(|m| m["method"].as_str()),
+        Some("GET"),
+        "method 不应带上 Redis 键前缀: {snapshot:#?}"
+    );
+
+    // 更强的断言：不能有任何一条按真实 ID 建的记录
+    let by_raw_id: Vec<_> = snapshot
+        .iter()
+        .filter(|m| {
+            m["path"]
+                .as_str()
+                .is_some_and(|p| p.contains(&admin_id.to_string()))
+        })
+        .collect();
+    assert!(
+        by_raw_id.is_empty(),
+        "指标里不应出现含真实 ID 的路径（否则基数无界）: {by_raw_id:#?}"
+    );
+}
+
+/// 多个副本的指标必须聚合到同一份计数上
+///
+/// 这是"多副本不准"的回归：旧实现每个进程一份 HashMap，
+/// 监控页上的 QPS 只是本副本的份额。
+#[tokio::test]
+#[ignore]
+async fn metrics_from_several_replicas_aggregate_into_one_view() {
+    let probe = replica_collector().await;
+    probe.reset().await;
+
+    let replica_a = replica_collector().await;
+    let replica_b = replica_collector().await;
+
+    for _ in 0..3 {
+        replica_a.record("GET", "/api/admin/monitor/system", 10, false);
+    }
+    replica_a.record("GET", "/api/admin/monitor/system", 30, true);
+    for _ in 0..2 {
+        replica_b.record("GET", "/api/admin/monitor/system", 20, false);
+    }
+
+    replica_a.flush().await;
+    replica_b.flush().await;
+
+    let metric = find_metric(&probe.snapshot().await, "/api/admin/monitor/system")
+        .expect("聚合后应能看到该端点")
+        .clone();
+
+    assert_eq!(metric.call_count, 6, "两个副本的调用数应相加");
+    assert_eq!(metric.error_count, 1, "错误数也应跨副本累加");
+    assert_eq!(metric.total_duration_ms, 3 * 10 + 30 + 2 * 20);
+    assert_eq!(metric.avg_duration_ms, 100 / 6);
+    assert_eq!(metric.min_duration_ms, 10);
+    assert_eq!(metric.max_duration_ms, 30);
+    assert_eq!(metric.method, "GET", "method 不应带上 Redis 键前缀");
+    assert_eq!(metric.path, "/api/admin/monitor/system");
+
+    probe.reset().await;
+}
+
+/// `reset` 必须是**跨副本**的
+///
+/// 旧实现只清本进程的 HashMap，别的副本照旧累加，
+/// 于是管理员点完"重置"，监控页的数字立刻又涨回来。
+#[tokio::test]
+#[ignore]
+async fn reset_clears_metrics_for_every_replica() {
+    let probe = replica_collector().await;
+    probe.reset().await;
+
+    let replica_a = replica_collector().await;
+    let replica_b = replica_collector().await;
+
+    // 两个副本都先落 Redis：此刻探针看到的是"两个副本的合计"
+    replica_a.record("GET", "/api/admin/users", 5, false);
+    replica_a.flush().await;
+    replica_b.record("GET", "/api/admin/roles", 5, false);
+    replica_b.flush().await;
+
+    assert_eq!(probe.snapshot().await.len(), 2, "前置条件：两个端点都在");
+
+    // 由 B 发起重置，模拟"任意副本收到重置请求"：
+    // 删的是 Redis 里的键，A 已落库的那份也必须一起没
+    replica_b.reset().await;
+
+    let after = probe.snapshot().await;
+    assert!(
+        after.is_empty(),
+        "重置应清掉所有副本的指标（含 Redis 中已落库的），实际仍有: {after:#?}"
+    );
+}
+
+/// 尚未 flush 的本地增量也必须立刻可见
+///
+/// 否则刚发生的调用要等最多一个 flush 间隔才出现在监控页上。
+///
+/// 注意只能由**记录它的那个实例**来观察：本地缓冲是实例私有的，
+/// 别的副本看不到（这正是 flush 要解决的问题）。
+#[tokio::test]
+#[ignore]
+async fn snapshot_includes_deltas_that_have_not_been_flushed_yet() {
+    let probe = replica_collector().await;
+    probe.reset().await;
+
+    let replica = replica_collector().await;
+    replica.record("GET", "/api/admin/dict/items", 12, false);
+    // 故意不 flush
+
+    let metric = find_metric(&replica.snapshot().await, "/api/admin/dict/items")
+        .expect("未 flush 的增量也应出现在快照里")
+        .clone();
+    assert_eq!(metric.call_count, 1);
+    assert_eq!(metric.total_duration_ms, 12);
+
+    // flush 之后同样的数据仍在（不是"读一次就消失"）
+    replica.flush().await;
+    let after = find_metric(&replica.snapshot().await, "/api/admin/dict/items")
+        .expect("flush 后应仍能从 Redis 读到")
+        .clone();
+    assert_eq!(after.call_count, 1, "flush 不应重复计数");
+    assert_eq!(after.total_duration_ms, 12);
+
+    probe.reset().await;
+}
+
+/// 同一端点"已落 Redis + 又有新调用在本地缓冲"时，只能出现**一行**且计数为两者之和
+///
+/// 这是个真实的合并陷阱：Redis 键带 `metrics:ep:` 前缀，
+/// 本地缓冲键不带。若两条直接塞进同一张 map 而不归一化键格式，
+/// 它们会变成两行独立记录——监控页上同一个接口出现两次，
+/// 每行的 call_count 都只是部分值。
+#[tokio::test]
+#[ignore]
+async fn one_endpoint_stays_one_row_when_it_is_partly_flushed_and_partly_pending() {
+    let probe = replica_collector().await;
+    probe.reset().await;
+
+    let replica = replica_collector().await;
+    // 先记录并 flush：此时计数在 Redis 里（键带前缀）
+    for _ in 0..2 {
+        replica.record("GET", "/api/admin/monitor/system", 10, false);
+    }
+    replica.flush().await;
+    // 再记录但不 flush：此时计数在本地缓冲里（键不带前缀）
+    replica.record("GET", "/api/admin/monitor/system", 40, false);
+
+    let rows: Vec<_> = replica
+        .snapshot()
+        .await
+        .into_iter()
+        .filter(|m| m.path == "/api/admin/monitor/system")
+        .collect();
+
+    assert_eq!(rows.len(), 1, "同一端点必须合并成一行，实际: {rows:#?}");
+    assert_eq!(rows[0].call_count, 3, "Redis 2 次 + 缓冲 1 次 = 3");
+    assert_eq!(rows[0].total_duration_ms, 2 * 10 + 40);
+
+    probe.reset().await;
+}
+
+/// 插一条指定时间的操作日志，返回其 id
+async fn insert_audit_log(created_at: chrono::DateTime<chrono::Utc>) -> uuid::Uuid {
+    sqlx::query_scalar::<_, uuid::Uuid>(
+        "INSERT INTO audit_logs (action, method, path, created_at) \
+         VALUES ('retention_test', 'GET', '/api/retention-test', $1) RETURNING id",
+    )
+    .bind(created_at)
+    .fetch_one(&pool().await)
+    .await
+    .expect("插入测试用操作日志失败")
+}
+
+async fn audit_log_exists(id: uuid::Uuid) -> bool {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM audit_logs WHERE id = $1)")
+        .bind(id)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询操作日志失败")
+}
+
+/// 保留策略只删过期行，不碰仍在保留期内的行
+#[tokio::test]
+#[ignore]
+async fn audit_log_retention_removes_only_expired_rows() {
+    let repo = AuditLogRepository::new(pool().await);
+    let now = chrono::Utc::now();
+    let cutoff = now - chrono::Duration::days(30);
+
+    let mut expired = Vec::new();
+    for _ in 0..3 {
+        expired.push(insert_audit_log(now - chrono::Duration::days(40)).await);
+    }
+    let mut kept = Vec::new();
+    for _ in 0..2 {
+        kept.push(insert_audit_log(now - chrono::Duration::days(10)).await);
+    }
+
+    let deleted = repo.delete_older_than(cutoff, 10, 5).await.unwrap();
+    assert_eq!(deleted, 3, "只应删掉 3 条过期日志");
+
+    for id in &expired {
+        assert!(!audit_log_exists(*id).await, "过期日志 {id} 应已被删除");
+    }
+    for id in &kept {
+        assert!(audit_log_exists(*id).await, "保留期内的日志 {id} 不该被删");
+    }
+
+    // 测试库长期存在，清掉自己造的样本
+    sqlx::query("DELETE FROM audit_logs WHERE id = ANY($1)")
+        .bind(&kept)
+        .execute(&pool().await)
+        .await
+        .unwrap();
+}
+
+/// 删除必须**分批**并受 `max_batches` 约束
+///
+/// 一次性 `DELETE` 大量行会长时间持锁并撑爆 WAL。
+/// 这里用 25 条过期日志、批大小 10、只允许 2 批，
+/// 精确验证"删 20 条、剩 5 条"，即批次与上限都真的生效。
+#[tokio::test]
+#[ignore]
+async fn audit_log_retention_deletes_in_bounded_batches() {
+    let repo = AuditLogRepository::new(pool().await);
+    let now = chrono::Utc::now();
+    let cutoff = now - chrono::Duration::days(1);
+
+    let mut ids = Vec::new();
+    for _ in 0..25 {
+        ids.push(insert_audit_log(now - chrono::Duration::days(5)).await);
+    }
+
+    let deleted = repo.delete_older_than(cutoff, 10, 2).await.unwrap();
+    assert_eq!(deleted, 20, "两批 × 每批 10 条，不应超出 max_batches");
+
+    let p = pool().await;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE id = ANY($1)")
+        .bind(&ids)
+        .fetch_one(&p)
+        .await
+        .unwrap();
+    assert_eq!(count, 5, "应正好剩 5 条待下一轮清理");
+
+    // 放开批次上限后应能删干净
+    let deleted = repo.delete_older_than(cutoff, 10, 5).await.unwrap();
+    assert_eq!(deleted, 5);
+    assert!(!audit_log_exists(ids[0]).await, "清理完后不应有残留");
+
+    sqlx::query("DELETE FROM audit_logs WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(&p)
+        .await
+        .unwrap();
+}
+
 /// 造一个**不是 admin**、只持有指定权限码的操作员，返回 (token, role_id, user_id)
 ///
 /// 这是 PR-3 的核心夹具。撤掉 `require_role("admin")` 之后，"能进管理区"
@@ -2801,6 +3182,550 @@ async fn rewriting_a_granted_menu_permission_to_an_unheld_code_is_denied() {
         !menu_still_exists(tmp_btn).await,
         "临时按钮应随父目录级联删除"
     );
+}
+
+// ──────────────────────────────────────────────
+// 权限码清空后的恢复路径（v0.7.0）
+// ──────────────────────────────────────────────
+
+/// 造一个"带专属权限码的按钮"，并把该按钮授予一个独立角色。
+///
+/// 授予**独立**角色而不是夹具自己的角色很关键：权限码来自"角色→菜单"，
+/// 把按钮授予夹具角色会让夹具自己持有那个码，
+/// 于是"不持有该码的操作员"这个前提就不成立了。
+///
+/// 返回值里的持有者令牌也不能图省事用 admin：种子的"只授权新建行"策略
+/// 意味着**新建的码不会自动进 admin**（否则管理员在菜单页撤销的授权
+/// 会被下次启动悄悄恢复）。所以 admin 恰恰是那个不持有新码的人。
+/// 要模拟"有权清空的人"，得造一个真的在该角色里的用户。
+///
+/// 顺序有讲究，且被授权下界卡着：**必须先建角色与用户、再授权按钮**。
+/// 反过来（先授权再建用户）会失败——`ensure_can_grant_roles` 要求
+/// "建号时赋予的角色，其码集 ⊆ 你的码集"，而 admin 恰恰不持有这个新码。
+async fn granted_temp_button(
+    app: &Router,
+    admin_tok: &str,
+    code_prefix: &str,
+) -> (uuid::Uuid, uuid::Uuid, String, String, uuid::Uuid) {
+    // ① 空角色 + 空用户：此刻它不含任何码，建号的下界才过得去
+    let holder_role_name = unique("tmp_holder_role");
+    let holder_role = create_role_via_api(app, admin_tok, &holder_role_name).await;
+    let username = unique("tmp_holder_user");
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "user1234",
+                "role": holder_role_name
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建持有者失败: {body}");
+    let holder_uid = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+    let holder_tok = login_token(app, &username, "user1234").await;
+
+    // ② 再建带专属码的按钮
+    let dir_name = unique("tmp_restore_dir");
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(admin_tok),
+            Some(json!({
+                "name": dir_name,
+                "type": "directory",
+                "path": format!("/{dir_name}"),
+                "sort_order": 99
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时目录失败: {body}");
+    let dir_id = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    let code = format!("{code_prefix}:priv:{}", &unique("p")[5..]);
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(admin_tok),
+            Some(json!({
+                "parent_id": dir_id,
+                "name": "待清空的按钮",
+                "type": "button",
+                "permission": code,
+                "sort_order": 99
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时按钮失败: {body}");
+    let btn_id = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    // ③ 最后授权：该角色不是 admin 自己的角色，`assign_role_menus` 的自授守卫不介入。
+    // 顺带给他 `system:menu:update`——清空/恢复本身就要这个码，
+    // 少了它下面测的是 403 "缺少权限码" 而不是清空守卫。
+    let menu_update_btn = menu_id_of(axum_api::model::permission::MENU_UPDATE).await;
+    let (status, body) =
+        assign_menus(app, admin_tok, holder_role, &[menu_update_btn, btn_id]).await;
+    assert_eq!(status, StatusCode::OK, "授予临时角色失败: {body}");
+
+    // 夹具自检：持有者必须真的经"角色→菜单"拿到这个码，否则下面全是空测
+    let (_, body) = send(
+        app,
+        request("GET", "/api/auth/permissions", Some(&holder_tok), None),
+    )
+    .await;
+    let held: Vec<String> = serde_json::from_value(body["data"].clone()).unwrap();
+    assert!(
+        held.contains(&code),
+        "夹具未生效：持有者应持有 {code}，实得 {held:?}"
+    );
+    assert!(
+        held.iter()
+            .any(|c| c == axum_api::model::permission::MENU_UPDATE),
+        "夹具未生效：持有者还应能改菜单，实得 {held:?}"
+    );
+
+    (dir_id, btn_id, code, holder_tok, holder_uid)
+}
+
+async fn permission_of(menu_id: uuid::Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT permission FROM menus WHERE id = $1")
+        .bind(menu_id)
+        .fetch_one(&pool().await)
+        .await
+        .expect("读取菜单 permission 失败")
+}
+
+async fn restore_slot(menu_id: uuid::Uuid) -> (Option<String>, Option<uuid::Uuid>) {
+    sqlx::query_as("SELECT prev_permission, prev_permission_cleared_by FROM menus WHERE id = $1")
+        .bind(menu_id)
+        .fetch_one(&pool().await)
+        .await
+        .expect("读取恢复槽位失败")
+}
+
+/// 核心闭环：清空 → 记录凭据 → **死路演示** → 恢复 → 凭据一次性作废
+///
+/// "死路演示"那一步是本 PR 存在的理由：清空后没有任何角色再持有该码，
+/// 于是 `update_menu` 的守卫会把**写回**也一并拦死。
+/// 修复前这里无路可走，只能去新建一个孤儿按钮。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn clearing_a_permission_code_can_be_restored_by_the_clearing_user() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (dir_id, btn_id, code, holder_tok, holder_uid) =
+        granted_temp_button(&app, &admin_tok, "tmp:restore").await;
+
+    // 前提：该码确实已授予某个角色（否则清空不改变任何人的权限，守卫不会介入）
+    assert!(grant_count_for_menu(btn_id).await > 0, "夹具应已授予该按钮");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{btn_id}"),
+            Some(&holder_tok),
+            Some(json!({ "permission": "" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "持有者清空自己持有的码应放行: {body}"
+    );
+    assert_eq!(permission_of(btn_id).await, None, "码应已从按钮上清空");
+
+    let (prev, cleared_by) = restore_slot(btn_id).await;
+    assert_eq!(prev.as_deref(), Some(code.as_str()), "应留下可恢复的码");
+    assert_eq!(cleared_by, Some(holder_uid), "应记下清空者");
+
+    // 死路演示：清空后没人再持有该码，update_menu 会把写回也拦死
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{btn_id}"),
+            Some(&holder_tok),
+            Some(json!({ "permission": code })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "这正是需要恢复接口的原因：写回被自己的守卫拦死: {body}"
+    );
+
+    // 恢复：只有清空者本人能调，且不要求当前持有该码
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/menus/{btn_id}/restore-permission"),
+            Some(&holder_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清空者本人应能恢复: {body}");
+    assert_eq!(
+        body["data"]["permission"],
+        json!(code),
+        "响应应带回恢复后的码"
+    );
+    assert_eq!(permission_of(btn_id).await.as_deref(), Some(code.as_str()));
+
+    // 凭据一次性作废：不能用同一个槽位反复"清空→恢复"
+    let (prev, cleared_by) = restore_slot(btn_id).await;
+    assert_eq!(prev, None, "恢复后凭据应作废");
+    assert_eq!(cleared_by, None, "恢复后不应再记着清空者");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/menus/{btn_id}/restore-permission"),
+            Some(&holder_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "凭据用过后不应能重复恢复: {body}"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{dir_id}"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
+    assert!(!menu_still_exists(btn_id).await, "临时按钮应已清干净");
+}
+
+/// 清空一个**别人正在用**的码 = 跨角色撤权，必须持有该码
+///
+/// 修复前 `.filter(|p| !p.is_empty())` 让清空整个绕过守卫，
+/// 持 `system:menu:update` 的角色可以把别的角色已持有的按钮的码清掉，
+/// 绕过 `system:menu:grant`。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn clearing_a_code_others_rely_on_requires_holding_it() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (dir_id, btn_id, code, _holder_tok, _holder_uid) =
+        granted_temp_button(&app, &admin_tok, "tmp:clear").await;
+
+    // 操作员只持 menu:update，不持那个一次性码
+    let (tok, _role_id, _uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "clear_denied",
+        &[permission::MENU_LIST, permission::MENU_UPDATE],
+    )
+    .await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{btn_id}"),
+            Some(&tok),
+            Some(json!({ "permission": "" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "清空别人依赖的码应被拒: {body}"
+    );
+    assert_eq!(
+        permission_of(btn_id).await.as_deref(),
+        Some(code.as_str()),
+        "被拒后码必须原样未被清空"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{dir_id}"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
+}
+
+/// 清空一个**没授予任何角色**的码不改变任何人的权限，应放行
+///
+/// 这是守卫的另一半：如果连这种无害操作也拦，"整理菜单结构"
+/// 就会全线报错。既有测试 `rewriting_a_granted_menu_permission_to_an_unheld_code_is_denied`
+/// 的第一步也依赖这一点。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn clearing_a_code_no_role_relies_on_is_allowed() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let dir_name = unique("tmp_harmless_dir");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&admin_tok),
+            Some(json!({
+                "name": dir_name,
+                "type": "directory",
+                "path": format!("/{dir_name}"),
+                "sort_order": 99
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时目录失败: {body}");
+    let dir_id = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    let code = format!("tmp:harmless:{}", &unique("p")[5..]);
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&admin_tok),
+            Some(json!({
+                "parent_id": dir_id,
+                "name": "无人用的按钮",
+                "type": "button",
+                "permission": code,
+                "sort_order": 99
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建临时按钮失败: {body}");
+    let btn_id = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        grant_count_for_menu(btn_id).await,
+        0,
+        "夹具前提：该按钮未授予任何角色"
+    );
+
+    let (tok, _role_id, _uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "clear_harmless",
+        &[permission::MENU_LIST, permission::MENU_UPDATE],
+    )
+    .await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{btn_id}"),
+            Some(&tok),
+            Some(json!({ "permission": "" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "清空无人依赖的码属整理菜单，应放行: {body}"
+    );
+    assert_eq!(permission_of(btn_id).await, None);
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{dir_id}"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
+}
+
+/// 恢复是"撤销我自己的误操作"，不是"接管别人的清空"
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn only_the_clearing_user_can_restore_a_permission_code() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (dir_id, btn_id, code, holder_tok, _holder_uid) =
+        granted_temp_button(&app, &admin_tok, "tmp:owner").await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{btn_id}"),
+            Some(&holder_tok),
+            Some(json!({ "permission": "" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清空应放行: {body}");
+
+    // 另一个同样持 menu:update 的操作员来恢复 —— 不是他清的
+    let (tok, _role_id, _uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "restore_other",
+        &[permission::MENU_LIST, permission::MENU_UPDATE],
+    )
+    .await;
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/menus/{btn_id}/restore-permission"),
+            Some(&tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "非清空者不应能恢复: {body}"
+    );
+    assert!(
+        body["message"].as_str().unwrap().contains(&code),
+        "403/400 文案应点名是哪个码: {body}"
+    );
+    assert_eq!(permission_of(btn_id).await, None, "被拒后码不应被写回");
+
+    // 清空者本人仍然能恢复
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/menus/{btn_id}/restore-permission"),
+            Some(&holder_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清空者本人应能恢复: {body}");
+    assert_eq!(permission_of(btn_id).await.as_deref(), Some(code.as_str()));
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{dir_id}"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
+}
+
+/// 菜单树要告诉前端"这个按钮的码可以恢复"，否则恢复入口无从发现
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_menu_tree_reports_a_restorable_permission_code() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (dir_id, btn_id, code, holder_tok, _holder_uid) =
+        granted_temp_button(&app, &admin_tok, "tmp:tree").await;
+
+    let find_node = |nodes: &Value, id: uuid::Uuid| -> Option<Value> {
+        fn walk(nodes: &Value, id: uuid::Uuid) -> Option<Value> {
+            nodes.as_array()?.iter().find_map(|n| {
+                let matched = n["id"].as_str() == Some(&id.to_string());
+                if matched {
+                    return Some(n.clone());
+                }
+                walk(&n["children"], id)
+            })
+        }
+        walk(nodes, id)
+    };
+
+    // 未清空时不该报可恢复
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/menus", Some(&admin_tok), None),
+    )
+    .await;
+    let node = find_node(&body["data"], btn_id).expect("菜单树里应有该按钮");
+    assert!(
+        node["restorable_permission"].is_null(),
+        "未清空时不该有可恢复码: {node}"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{btn_id}"),
+            Some(&holder_tok),
+            Some(json!({ "permission": "" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清空应放行: {body}");
+
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/menus", Some(&admin_tok), None),
+    )
+    .await;
+    let node = find_node(&body["data"], btn_id).expect("菜单树里应有该按钮");
+    assert_eq!(
+        node["restorable_permission"],
+        json!(code),
+        "清空后应报出可恢复的码: {node}"
+    );
+    // 刻意不暴露"谁清的"：界面只需知道能不能恢复，鉴权在服务端
+    assert!(
+        node.get("prev_permission_cleared_by").is_none(),
+        "不应把清空者暴露给前端: {node}"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/menus/{dir_id}"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
 }
 
 /// 正向对照：持有全部权限码的 admin 仍然能建出 admin 用户。

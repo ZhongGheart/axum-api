@@ -29,11 +29,23 @@
       </n-space>
       <p v-if="validationResult" style="margin-top:8px">{{ validationResult }}</p>
     </n-card>
+
+    <n-card title="4. 能力探测" class="demo-card">
+      <n-space align="center">
+        <n-button v-permission="PERM.TEST_ACCESS" :loading="probing" @click="probeAccess">
+          探测访问能力
+        </n-button>
+        <span v-if="probeResult" style="font-size:13px">{{ probeResult }}</span>
+      </n-space>
+      <p style="margin-top:8px;font-size:12px;opacity:0.7">
+        按钮可见却报 403，说明前端拿到的码与后端认的码对不上。
+      </p>
+    </n-card>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useMessage } from 'naive-ui'
 import type { DataTableColumn } from 'naive-ui'
 import http from '@/api/index'
@@ -91,6 +103,10 @@ async function fetchTest() {
   }
 }
 
+// 首屏就得有数据：此前 fetchTest 只挂在分页的 @update:page 上，
+// 进页面不触发，表格恒为空（要点一次页码才出数据）。
+onMounted(fetchTest)
+
 // ── 校验测试 ──────────────────────────────────────────────────
 
 const testUsername = ref('')
@@ -102,6 +118,24 @@ async function testValidation() {
     validationResult.value = '✅ 校验通过'
   } catch (e) {
     validationResult.value = `❌ ${(e as Error).message}`
+  }
+}
+
+// ── 能力探测 ──────────────────────────────────────────────────
+
+const probing = ref(false)
+const probeResult = ref('')
+
+async function probeAccess() {
+  probing.value = true
+  probeResult.value = ''
+  try {
+    const res = await http.get<string>('/admin/test')
+    probeResult.value = String(res)
+  } catch (e) {
+    probeResult.value = `❌ ${(e as Error).message}`
+  } finally {
+    probing.value = false
   }
 }
 </script>

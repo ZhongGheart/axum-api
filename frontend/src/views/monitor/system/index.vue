@@ -2,6 +2,9 @@
   <div class="monitor-page">
     <n-page-header title="系统监控" subtitle="服务器状态 / 数据库 / Redis">
       <template #extra>
+        <n-button v-permission="PERM.MONITOR_EXPORT" :loading="exporting" @click="handleExport">
+          导出 Excel
+        </n-button>
         <n-button :loading="loading" @click="fetchData">刷新</n-button>
       </template>
     </n-page-header>
@@ -69,10 +72,14 @@
 import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { monitorApi } from '@/api/monitor'
 import type { MonitorSystemInfo } from '@/api/monitor'
+import { PERM } from '@/constants/permission'
+import { useMessage } from 'naive-ui'
 import { useAppStore } from '@/stores/app'
 
 const appStore = useAppStore()
+const message = useMessage()
 const loading = ref(false)
+const exporting = ref(false)
 const data = ref<MonitorSystemInfo | null>(null)
 const errorMsg = ref('')
 let timer: ReturnType<typeof setInterval> | null = null
@@ -148,4 +155,26 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
 })
+
+// ── 导出 ────────────────────────────────────────────────────
+
+async function handleExport() {
+  exporting.value = true
+  try {
+    const response = await monitorApi.exportSystem()
+    // 响应拦截器对 blob 类型返回原始 AxiosResponse，需取 .data
+    const blob = (response as unknown as { data: Blob }).data
+    const url = window.URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = '系统监控.xlsx'
+    a.click()
+    window.URL.revokeObjectURL(url)
+    message.success('导出成功')
+  } catch {
+    message.error('导出失败')
+  } finally {
+    exporting.value = false
+  }
+}
 </script>

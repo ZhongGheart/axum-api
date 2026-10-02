@@ -1029,3 +1029,438 @@ v0.5.0 有追加语义的 `POST /api/admin/users/{user_id}/roles`，
  两个权限码后端已支持、种子已下发，但前端没有任何入口能用到它们
 4. **运维债**：审计日志保留策略；接口耗时跨副本聚合
  （现在是进程内统计，重启丢失，多副本下不准）
+
+---
+
+# v0.7.0 — 权限码清空后的恢复路径（计划第 2 项）
+
+## 当前目标
+
+按后续版本计划**顺序**执行。第 1 项（多角色用户）已在 v0.6.0 发布完成。
+本版做第 2 项：**`update_menu` 清空某按钮 permission 后，该码怎么找回来。**
+
+## 缺陷（已确认）
+
+`update_menu` 的守卫是**单向**的：
+
+```rust
+if let Some(new_permission) = req.permission.as_deref().filter(|p| !p.is_empty()) {
+    perm.guard().ensure_covers(&required, "把菜单的权限码改为该值")?;
+}
+```
+
+`.filter(|p| !p.is_empty())` 让**清空**绕过守卫。于是：
+
+1. 清空某按钮的 `permission` → 该码在全系统消失，**没有任何角色再持有它**
+2. 想写回去 → 守卫要求持有该码 → **没人持有** → 403
+
+**死锁**：唯一出路是 `create_menu` 造一个新按钮（该端点无守卫），
+但那会留下一个位置/父节点/名称都不对的孤儿菜单，原按钮的 `role_menus`
+授权还在、却不再对应任何码，管理员看不出原来那个码是什么。
+
+附带确认：`create_menu` 的 `_perm: PermMenuCreate` **完全没用到**，
+即"定义一个权限码"这件事没有任何授权下界。
+
+## 方案
+
+### 1. 清空也要过守卫，但只在"真的撤销了别人的权限"时
+
+- 该按钮**已被授予至少一个角色** → 清空就是从那些角色手里收回码
+  → 要求调用者**持有该码**（与"设置新码必须持有"对称）
+- 该按钮**未授予任何角色** → 清空不改变任何人的权限
+  → 放行（保持既有测试 `rewriting_a_granted_menu_permission_to_an_unheld_code_is_denied`
+  的第一步仍然成立，该测试**不得改动**）
+
+这样补上了真实缺口：此前持 `system:menu:update` 的角色可以
+把**别的角色**已持有按钮的码清掉，绕过 `system:menu:grant`。
+
+### 2. 清空时留痕 + 提供"撤销我自己的误操作"
+
+迁移 `009` 给 `menus` 加两列：
+
+- `prev_permission` — 清空前的码
+- `prev_permission_cleared_by` — 谁清的
+
+新增 `POST /api/admin/menus/:id/restore-permission`：
+
+- **只有清空者本人可调**（按 user id 比对）
+- 恢复 `prev_permission`，**不要求当前持有该码**
+
+### 为什么恢复不构成提权（这是本方案成立的关键）
+
+清空已授予角色的按钮要求"持有该码"，所以能清空 ⟹ 当时持有。
+恢复只是把状态还原到清空之前，**净零**。
+若菜单未授予任何角色则清空本就放行，恢复也只是给"无人"一个码，同样净零。
+
+而"把菜单授予别的角色"这条路仍要过 `system:menu:grant` +
+`assign_role_menus` 既有判定，因此恢复不构成新的越权原语。
+
+### 3. 前端
+
+菜单管理页在该按钮存在 `prev_permission` 时显示"恢复权限码"操作。
+
+## 本版不做（已记录，留给下一项）
+
+`create_menu` 无授权下界：持 `system:menu:create` 的角色可以
+声明一个后端认识的码（如 `system:user:delete`）再分发给别的角色。
+候选规则：**只允许声明"当前没有任何菜单在用"的码**，
+既保住"权限码即数据、admin 可自造码分发"的核心工作流，
+又堵住"声明既有语义码"这条提权路径。
+
+## 起始 git 状态
+
+- 分支 `v0.7.0`（从 master 切出）
+- HEAD = `d91dbbf0 docs(handoff): 记录 v0.6.0 发布结果与后续版本计划`
+- 上一版：v0.6.0 已发布（tag `v0.6.0` → merge commit `4d036487`）
+
+## PR-1 完成记录（实现 + 验证全绿，**尚未推送**）
+
+按用户指令：**本地跑门禁 + 提交，不推送**，等后续版本计划全部做完再统一推送。
+
+### 落地内容
+
+- 迁移 `009`：`menus` 加 `prev_permission` / `prev_permission_cleared_by`
+- `update_menu`：清空**已授权**按钮的码也要持有该码；未授权的照旧放行
+- `restore_menu_permission`：新端点 `POST /api/admin/menus/:id/restore-permission`，仅清空者本人
+- repo：`restore_permission` / `is_granted_to_any_role`；`MENU_COLUMNS` 常量收口 4 处列清单
+- `MenuNode`：新增 `restorable_permission`；**刻意不暴露** `cleared_by`
+- 前端：菜单树行显示"码已清空，可恢复 X"标签 + 恢复按钮
+
+### 门禁结果（全绿）
+
+- `cargo test --lib`：49
+- 集成测试：51 → **56**（+5）
+- 前端单测：84
+- `cargo fmt --check` / `clippy -D warnings`：clean
+- 前端 typecheck / lint / build：clean / 0 error
+
+新增 5 条：`clearing_a_permission_code_can_be_restored_by_the_clearing_user`、
+`clearing_a_code_others_rely_on_requires_holding_it`、
+`clearing_a_code_no_role_relies_on_is_allowed`、
+`only_the_clearing_user_can_restore_a_permission_code`、
+`the_menu_tree_reports_a_restorable_permission_code`
+
+空库重建后跑全量：56 全绿，`max_migration=9`，
+种子核验 `menu_total=42`（14 目录 + 28 按钮）/ `perm_codes=28` /
+`stale_prev_slot=0` / `admin_role=1` / `distinct_admin_users=1` / `tmp_leftover=0`。
+
+### 缺陷注入验证（两条都真实失败）
+
+1. 移除 `update_menu` 的清空守卫 →
+   `clearing_a_code_others_rely_on_requires_holding_it` **FAILED**，
+   实得 200（别人依赖的码被静默清掉），期望 403
+2. 移除 `restore_menu_permission` 的归属校验 →
+   `only_the_clearing_user_can_restore_a_permission_code` **FAILED**，
+   实得 200（非清空者成功接管），期望 400
+
+两处均已还原（`src/controller/menu.rs:181` / `:235`）。
+
+### 写测试时踩到的两个坑（都是真·授权下界，不是测试写错）
+
+1. **admin 不持有自建的码**。种子的"只授权新建行"策略刻意不把新码塞给
+   admin（否则管理员在菜单页撤销的授权会被下次启动悄悄恢复）。
+   所以"admin 造一个码再清空它"必然 403——admin 恰恰是不持有它的人。
+2. **建号顺序被授权下界卡死**。`ensure_can_grant_roles` 要求
+   "建号时赋予的角色，其码集 ⊆ 你的码集"。先授权再建号会失败，
+   因为 admin 不持有那个新码。必须**先建空角色与用户、再授权按钮**。
+
+夹具 `granted_temp_button` 因此自带两条自检断言（持有者必须真的经
+"角色→菜单"拿到该码、且必须持有 `system:menu:update`），
+否则夹具静默失效、测试会假绿。
+
+## PR-2 完成记录（计划第 3 项：补前端入口 + 真实浏览器回归，**尚未推送**）
+
+v0.5.0 的 handoff 里留了一句债：「没做浏览器回归，下一版动前端时补上」。
+本轮动了前端，因此补上——用**真实 Google Chrome 154** 跑完整登录→点击→下载链路。
+
+### 落地内容
+
+- `constants/permission.ts`：补 `PERM.MONITOR_EXPORT`、`PERM.TEST_ACCESS`
+- `api/monitor.ts`：补 `exportSystem()`（blob 响应）
+- 监控页 `monitor/system/index.vue`：页头加「导出 Excel」按钮 + `handleExport`
+- 后端能力页 `demo/backend.vue`：加第 4 张卡「能力探测」+ `probeAccess`
+- `__tests__/permissionCodes.spec.ts`：`BACKEND_ONLY_CODES` 清空为 `{}`
+
+`BACKEND_ONLY_CODES` 清空是这个测试的**意图兑现**：它一直是用来显式登记
+「后端有码但前端没入口」的豁免清单，清空意味着后端 28 个权限码
+**全部**在前端有对应入口，契约测试从此双向全覆盖。
+
+### 浏览器回归怎么做（环境无 Playwright）
+
+机器上没有 Playwright/puppeteer，也不想为此拉依赖。
+Node 22 自带全局 `WebSocket`，于是直接用 **CDP** 驱动**真实的 Google Chrome**
+（`--headless=new --remote-debugging-port=9222`），脚本在
+`/tmp/axum-e2e/`（一次性，不入库）。三个要点：
+
+1. **每次跑新建 browser context**：否则上次的 token 还在，
+   `/login` 会直接跳首页，脚本卡在"找不到登录框"
+2. **Chrome 必须起在 PTY 里**：普通后台 `&` 会随 shell 退出被回收，
+   表现为跑到一半 `ECONNREFUSED 9222`
+3. **`localStorage` 是 base64(encodeURIComponent(JSON))**：
+   `JSON.parse(localStorage.getItem('axum_token'))` 会报
+   `Unexpected token 'J'`，必须先 `decodeURIComponent(atob(...))`
+   再 `.value`
+
+### 回归结果：13/13 通过
+
+真实登录 admin → 监控页点「导出 Excel」→ 文件落盘且是合法 xlsx
+（`magic=PK`、`xl/worksheets/sheet1.xml` 存在、6467 字节）
+→ 后端能力页点「探测访问能力」→ 「管理员访问成功！用户: …, 角色: ["admin","user"]」
+→ 全程无 4xx/5xx、无控制台错误。
+
+截图在 `/tmp/axum-e2e/shots/`，已人工核对版式：
+导出按钮在页头与「刷新」并排不重叠，第 4 张卡文案不溢出。
+
+### 回归顺手挖出并修掉的一个真缺陷
+
+截图里第 2 张卡（通用分页查询）显示「无数据」，而同一时刻
+`GET /api/admin/users?page=1` 返回 `total=1, items=1`。
+
+根因：`demo/backend.vue` 的 `fetchTest` **只挂在分页的 `@update:page` 上**，
+从没在 `onMounted` 触发。进页面表格恒为空，
+要点一次页码才出数据。已加 `onMounted(fetchTest)`（一行）。
+
+这个 bug 与本次改动无关（是既有的），但它只有真人看截图才会发现——
+自动化断言若只查"接口返回 200"就会漏过去。
+回归脚本里已补成硬断言：表格行数必须等于 `items.length`。
+
+## 待办
+
+1. 计划第 4 项：运维债（审计日志保留策略、接口耗时跨副本聚合）
+2. 全部完成后统一推送 `v0.7.0`（当前 `ad09d294` + 第 3 项两个 commit 均未推送）
+
+# v0.7.0 计划第 4 项 — 运维债（审计日志保留、接口耗时跨副本聚合）
+
+## 动手前确认的两件事（其中一件推翻了原计划）
+
+### 1. 审计日志确实无界增长
+
+`audit_logs` 每个已认证请求插一行，`middleware::audit_log` 无任何清理，
+表结构也没有分区。`idx_audit_logs_created` 只加速查询，不限制增长。
+
+### 2. 指标路径未归一化——这是原计划的**前置阻塞项**
+
+`api_metrics_mw` 记的是 `req.uri().path()`，即**含真实 ID 的具体路径**。
+实测（admin token，打两个不同的 UUID）：
+
+```
+总条目: 13 | 含 UUID 路径条目: 2
+    GET /api/admin/users/11111111-1111-4111-8111-111111111111 calls= 1
+    GET /api/admin/users/22222222-2222-4222-8222-222222222222 calls= 1
+```
+
+每个资源 ID 一条独立记录，于是：
+
+- **基数无界**：HashMap 按 ID 无限增长
+- **监控页失去意义**：`/api/admin/users/{id}` 每个只出现一次、count=1，
+  管理员看不出这个接口真实的 QPS 与耗时分布
+
+原先"进程内"只是让这个缺陷表现为内存涨；**一旦改成 Redis 聚合，
+就变成每个 UUID 一个 Redis key**，从内存问题升级成共享 Redis 的内存问题。
+因此路径归一化必须与聚合一起做，且**先做**。
+
+## 方案
+
+### 4a. 路径归一化（前置）
+
+改用 axum 的 `MatchedPath` 扩展取**路由模板**（`/api/admin/users/{id}`），
+未匹配路由（404）回退到原始 URI 路径——否则 404 流量会全部塌成一个键。
+
+### 4b. 指标聚合落到 Redis
+
+`MetricsCollector` 改为「本地增量缓冲 + 定时 flush 到 Redis」：
+
+- 本地 `Mutex<HashMap>` 只做合并，不碰网络（请求路径上零 Redis 往返）
+- 后台任务每 `METRICS_FLUSH_INTERVAL_SECONDS`（默认 5s）把增量 `HINCRBY` 进 Redis
+- `snapshot()` 时把**尚未 flush 的本地增量**合并进 Redis 读数，
+  免得页面最多等 5 秒才看到刚发生的调用
+- Redis key `metrics:ep:{method} {path}`，HASH 存 `c/e/t/mx/mn`，TTL 兜底防泄漏
+- **max/min 用 Lua `EVAL` 原子更新**：读改写会有竞态，
+  两个副本同时上报时可能丢一次极值
+- **flush 失败不清空本地缓冲**，留到下一轮重试。Redis 短暂故障不丢指标；
+  缓冲超过上限则告警并丢弃，防止 Redis 长期不可用时无限涨
+- `reset()` 改为「清本地缓冲 + 删 Redis 全部键」，
+  即**跨副本重置**。此前只清本进程，别的副本照旧累加——这本身是个真 bug
+
+优雅关闭时做最后一次 flush，损失上界为 0（崩溃则 ≤ 一个 flush 间隔）。
+
+顺带修一个既有隐患：`min_duration_ms` 以 `0` 当"未设置"，
+但亚毫秒请求的耗时**真的就是 0**，会被后续更大的值覆盖。改用 `Option<u64>`。
+
+### 4c. 审计日志保留策略
+
+新增 `AuditLogConfig`（`AUDIT_LOG_RETENTION_DAYS` 默认 90 天，
+`AUDIT_LOG_CLEANUP_INTERVAL_SECONDS` 默认 3600，
+`AUDIT_LOG_CLEANUP_BATCH_SIZE` 默认 10000）。设为 0 即关闭自动清理。
+
+删除**分批**执行，每轮最多若干批、删空即止：
+
+```sql
+DELETE FROM audit_logs WHERE id IN (
+  SELECT id FROM audit_logs WHERE created_at < $1 ORDER BY created_at LIMIT $2
+);
+```
+
+一次性 `DELETE` 大量行会长时间持锁并膨胀 WAL；分批把锁持有时间切碎。
+借 `idx_audit_logs_created` 反向扫描最旧的一批。
+
+**删除必须留痕**：`tracing::info!` 记录截止时间点与删除行数。
+审计数据被静默删除是不可接受的——出事后没人知道日志是什么时候没的。
+
+## 后台任务归属
+
+后台任务由 `main.rs` 启动，**不放进 `create_router`**：
+测试反复构建应用，若在 `create_router` 里 spawn，
+每个测试进程都会残留一批清理任务去打共享测试库。
+进程生命周期归 `main` 管，应用构建只管组装。
+
+## 起始 git 状态
+
+- 分支 `v0.7.0`，HEAD = `0453e060`（计划第 3 项）
+- 工作区干净；`ad09d294` / `0453e060` 均**未推送**
+
+## 计划第 4 项完成记录（运维债，**尚未推送**）
+
+### 落地内容
+
+- `config`：`AuditLogConfig` + `MetricsConfig`（见下表环境变量）
+- `middleware/api_metrics.rs`：**整体重写**为「本地增量缓冲 + 定时 flush 到 Redis」
+- `service/audit_retention.rs`：新增审计日志保留后台任务
+- `repository/audit_log.rs`：`delete_older_than`（分批）
+- `router/mod.rs`：`create_router` 返回 `(Router, AppState)`，
+  collector 改用 Redis 构造；后台任务**不在这里 spawn**
+- `main.rs`：启动两个后台任务，优雅关闭时先停任务（触发最后一次 flush）
+
+### 新增环境变量
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `AUDIT_LOG_RETENTION_DAYS` | 90 | 审计日志保留天数，0 = 关闭自动清理 |
+| `AUDIT_LOG_CLEANUP_INTERVAL_SECONDS` | 3600 | 清理间隔 |
+| `AUDIT_LOG_CLEANUP_BATCH_SIZE` | 10000 | 单批删除行数 |
+| `AUDIT_LOG_CLEANUP_MAX_BATCHES` | 20 | 单轮最多批数 |
+| `METRICS_FLUSH_INTERVAL_SECONDS` | 5 | 指标 flush 间隔（崩溃最多丢这么久） |
+| `METRICS_KEY_TTL_SECONDS` | 604800 | Redis 指标键 TTL（7 天） |
+| `METRICS_MAX_BUFFERED_ENDPOINTS` | 10000 | 本地缓冲端点数上限（Redis 长期挂时的兜底） |
+
+### 门禁结果（全绿）
+
+- `cargo fmt --check` / `clippy -D warnings`：clean
+- `cargo test --lib`：49 → **55**（+6）
+- 集成测试：56 → **63**（+7）
+- 前端未改动（本项纯后端），故未重跑前端门禁
+
+新增 6 条单元测试（合并算术、0 值 min 语义、avg 不除零、拆键剥前缀）；
+新增 7 条集成测试（路径模板归并、跨副本聚合、跨副本重置、未 flush 增量可见、
+部分已落库仍为一行、审计只删过期、分批且受上限约束）。
+
+### 缺陷注入验证（两条都真实失败）
+
+1. 路径改回 `req.uri().path()` → 路径模板归并测试 FAILED：
+ 实得**两行、每行 call_count=1**（正是原缺陷），期望一行 call_count=2
+2. `reset()` 改回只清本地缓冲 → 跨副本重置测试 FAILED：实得残留数据
+
+### 注入过程中暴露的两个真 bug（都已修 + 补测试）
+
+这是本次最值得记的部分——**注入验证不只是"确认测试有效"，
+读失败输出时发现了实现本身的两个 bug**：
+
+1. **`method` 变成 `metrics:ep:GET`**。`split_key` 忘了剥 Redis 键前缀。
+   之前所有测试都只断言 `path`（剥不剥前缀 path 都对），所以一直没暴露；
+   是失败输出里那行 `"method": "metrics:ep:GET"` 让我发现的。
+   已修 + 补单测 + 在集成测试里显式断言 `method == "GET"`
+2. **同一端点裂成两行**。`snapshot()` 合并时，Redis 键带前缀、本地缓冲键不带，
+   两者塞进同一张 map 成为两条独立记录 → **重复计数**。
+ 已修（插入前统一 `normalize_key`）+ 补测试
+   `one_endpoint_stays_one_row_when_it_is_partly_flushed_and_partly_pending`。
+   这个测试也是先写出来才暴露的——没有它，这个 bug 会带着"看起来正常"的
+   分行数据进生产
+
+教训：**只断言部分字段的测试，会给未断言字段留出静默出错的空间**。
+ 拆键、前缀这类"看起来无所谓"的地方最容易漏。断言要覆盖到人眼会看的每一列。
+
+### 真实进程验证（不止单测）
+
+- 起真实二进制（`METRICS_FLUSH_INTERVAL_SECONDS=2`、`AUDIT_LOG_CLEANUP_INTERVAL_SECONDS=20`）：
+ 三个不同 UUID 的请求归并成一行 `calls=3`；Redis 键 TTL ≈ 604785s（7 天）；
+ HASH 字段为 `c/e/t/mx/mn`
+- 造 1200 条过期日志 → 20s 周期自动清空（分批 500），保留期内 108 条未受影响
+- 保留任务 `info` 日志确认留痕：
+ `已清理过期操作日志 截止时间=... 删除行数=9`
+- 优雅关闭：请求后立即 SIGTERM，指标仍落库，日志
+ `接口指标已全部写入 Redis`
+- 真实 Chrome 打开接口监控页：按模板聚合、`method` 干净、`{user_id}` 一行
+
+### 已知取舍（诚实记录，非缺陷）
+
+- Redis 被 flush 或未持久化时指标会丢。对监控数据可接受，
+ 换来跨副本准确 + 重启不丢（优雅关闭不丢，崩溃最多丢一个 flush 间隔）
+- 多副本各自跑清理任务，无选主。因删除分批、走同一条索引、幂等，
+  只是徒增锁竞争、不会错删，故未引入分布式锁
+
+## v0.7.0 当前状态
+
+- 计划 4 项已全部完成
+- 共 3 个 commit：
+
+  | commit | 内容 |
+  |---|---|
+  | `ad09d294` | 计划第 2 项：权限码清空后的恢复路径 |
+  | `0453e060` | 计划第 3 项：补齐两个权限码的前端入口 |
+  | `5d8610d8` | 计划第 4 项：指标跨副本聚合 + 审计日志保留 |
+
+- **已按用户指令统一推送**：`origin/v0.7.0`（用户原话："等全部工作完成或收到指令在统一推送"，
+  四项做完即触发）。推送前每一项都先本地跑完质量门禁再提交
+- CI 仅在 `master` push 与 PR 上触发，**单纯推分支不会起 CI**；
+  当前 `v0.7.0` 分支上**没有 CI 运行记录**，需开 PR 才会跑。
+  本地门禁已全绿（见各项完成记录），但**远端 CI 尚未验证**
+- 下一步（未做，需用户确认）：开 PR → 合并 → 打 tag `v0.7.0` → 发 Release → 删分支。
+  合并与打 tag 是有后果的操作，不自行执行
+
+## PR #6 已开 + 按 CI 原始命令复核（v0.7.0）
+
+- 开 PR：<https://github.com/ZhongGheart/axum-api/pull/6>（v0.7.0 → master）
+- **CI 由此首次真正跑起来**。此前 v0.7.0 分支上零 CI 记录
+
+### 关键补测：本地门禁此前并不等于 CI 门禁
+
+CI 的 clippy 与 test 都带 `--locked --all-targets --all-features`。
+上一轮本地跑的命令比这窄 —— 不含集成测试 target、也不含全 feature 组合。
+故按 CI 原始命令重跑了一遍：
+
+| 命令（CI 原始） | 结果 |
+|---|---|
+| cargo fmt --all --check | clean |
+| cargo clippy --locked --all-targets --all-features -- -D warnings | clean，无新警告 |
+| cargo test --locked --all-targets --all-features | 55 passed |
+| cargo test --locked --test api_integration -- --ignored --test-threads=1 | 60 passed |
+| pnpm lint（exit code 实测） | 0，脚本无 --max-warnings，历史 warning 不会红 CI |
+| pnpm typecheck / pnpm test / pnpm build | clean / 84 passed / exit 0 |
+
+集成测试口径澄清：CI 用 `--ignored`，只跑被标记的那 60 条。
+另 3 条普通测试被 filtered out。两者相加正好 63，与前文记录的 63 一致。
+所以不是少跑了 3 条，而是 63 条里有 60 条带 ignore 标记。
+
+### 本机无法覆盖的门禁
+
+- docker job 只能靠 CI。本机没有可用 Docker daemon，
+ 镜像构建与 compose 配置校验无法本地复现
+
+### CI 结果（run 36946178817，PR #6）
+
+三个 job 全绿：
+
+| job | 结果 | 耗时 |
+|---|---|---|
+| Rust (fmt / clippy / unit / integration) | success | 2m8s |
+| Frontend (lint / typecheck / test / build) | success | 39s |
+| Docker images and compose config | success | 2m10s |
+
+即 v0.7.0 的远端门禁首次得到验证。docker job 是本机唯一无法复现的一个。
+
+### 工具坑（写本文件时必读）
+
+- 工具坑：apply_patch 在上一行以全角逗号结尾时会吃掉下一行的新增前缀
+  - 现象：报 "invalid hunk at line N"，看起来像上下文没匹配上，实际是前缀被吃
+  - 规避：写本文件时让每行都不以全角逗号 `，` 收尾，改用句号或分号
+  - 同源坑：正文里出现连续两个 at 符号也会让解析器以为换了 hunk，报 End Patch 缺失
