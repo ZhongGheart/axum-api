@@ -65,7 +65,7 @@
 - 新增 `AppError::PermissionDenied(String)`，403 响应体带缺失权限码。
 - 迁移 `migrations/007_permission_codes_unique.sql`：`menus.permission` 部分唯一索引。
 - `seed_navigation` 拆分：菜单树"仅 menus 为空才写"，权限码**无条件幂等补齐**
-  （v0.3 升级库 menus 非空但无按钮行）。**只对新���建的权限码行授予 admin**
+  （v0.3 升级库 menus 非空但无按钮行）。**只对新建的权限码行授予 admin**
   ——否则每次启动补授权会把管理员被显式撤销的权限悄悄恢复。已实测：撤销后重启，撤销保持。
 - `get_items_by_code`（`/api/dict/{code}/items`）**刻意不设权限码**：普通页面的
   DictSelect 依赖它，加了会让非管理员的字典下拉全部失效。
@@ -1099,13 +1099,18 @@ if let Some(new_permission) = req.permission.as_deref().filter(|p| !p.is_empty()
 
 菜单管理页在该按钮存在 `prev_permission` 时显示"恢复权限码"操作。
 
-## 本版不做（已记录，留给下一项）
+## ~~本版不做（留给下一项）~~ —— 该判断已被实测推翻，勿照此施工
 
-`create_menu` 无授权下界：持 `system:menu:create` 的角色可以
-声明一个后端认识的码（如 `system:user:delete`）再分发给别的角色。
-候选规则：**只允许声明"当前没有任何菜单在用"的码**，
-既保住"权限码即数据、admin 可自造码分发"的核心工作流，
-又堵住"声明既有语义码"这条提权路径。
+原文（v0.7.0 写下）："`create_menu` 无授权下界：持 `system:menu:create` 的角色
+可以声明一个后端认识的码（如 `system:user:delete`）再分发给别的角色。
+候选规则：只允许声明"当前没有任何菜单在用"的码。"
+
+**v0.8.0 用探针实测后推翻**：那个洞早被迁移 `007` 的部分唯一索引
+`idx_menus_permission_unique` 在数据库层堵住了，本节提议的规则
+索引已经免费提供，无需再实现。当时真正没堵的是 `delete_menu`，
+已在 v0.8.0 第 1 项修掉。
+
+**留在这里而不是删掉，是为了防止后人照着这段错误前提去写代码或开新任务。**
 
 ## 起始 git 状态
 
@@ -1125,6 +1130,16 @@ if let Some(new_permission) = req.permission.as_deref().filter(|p| !p.is_empty()
 - repo：`restore_permission` / `is_granted_to_any_role`；`MENU_COLUMNS` 常量收口 4 处列清单
 - `MenuNode`：新增 `restorable_permission`；**刻意不暴露** `cleared_by`
 - 前端：菜单树行显示"码已清空，可恢复 X"标签 + 恢复按钮
+
+### 真实浏览器回归 13/13（`/tmp/axum-e2e/delguard.mjs`）
+
+集成测试证明不了"守卫没有误伤正常管理流程"，所以补了真实 Chrome 回归：
+无码页面菜单可正常新建+删除（放行）、被他人依赖的码删除被拒 403 且码没被剥掉、
+撤销授权后删除放行（恢复路径真实可用）、菜单页正常渲染、无 console error。
+
+**这次回归顺带挖出 `menus_type_check` 也报 500**（见上方"计划外补的一项"）——
+我的脚本传了 `type: "page"` 拿到 500 才注意到。教训：
+写浏览器回归脚本时用错枚举值，恰好暴露了产品缺陷。
 
 ### 门禁结果（全绿）
 
@@ -1506,3 +1521,160 @@ git push origin refs/tags/v0.7.0:refs/tags/v0.7.0
 
 另外 `docker` job 本机无法复现（无 Docker daemon），只在 CI 上验证过；
 它在 CI 上通过，所以分支的验证是完整的。
+
+---
+
+# v0.8.0 第 1 项 —— 菜单删除的授权下界（原计划前提被实测推翻）
+
+## 计划前提被实测推翻
+
+v0.7.0 留档的原计划是："`create_menu` 无授权下界，
+持 `system:menu:create` 的角色可以声明一个后端认识的码再分发给别的角色"，
+候选规则为"只允许声明当前没有任何菜单在用的码"。
+
+**实测结论：那个洞其实早就被堵上了，堵的方式和预期不同；
+而真正没被堵住的洞在 `delete_menu`。**
+
+## 实测证据（三条探针，跑完已丢弃，不留在仓库）
+
+### 探针 1：声明既有码会被数据库挡下
+
+用 admin 建一个 `permission = system:user:delete` 的按钮 →
+**500 Internal Server Error**，message 是"服务器内部错误"。
+
+挡住它的是迁移 `007` 的部分唯一索引：
+
+```
+CREATE UNIQUE INDEX idx_menus_permission_unique
+    ON menus (permission) WHERE permission IS NOT NULL AND permission <> '';
+```
+
+所以"声明一个既有码"在**数据库层**就被拒绝，不需要额外授权下界。
+原计划设想的规则已经被索引免费提供了。
+
+但代价是**入参错误被当成服务端故障**：该返回 400/409，实际返回 500。
+这会污染错误监控，也让管理员看不懂发生了什么。
+
+### 探针 2：create → delete → create 同一个码，三步全部 200
+
+delete 释放了唯一索引占位，于是同一个码可以被重新声明。
+**说明"唯一索引"这个下界可以被 delete 绕过**，它不是可靠的授权边界。
+
+### 探针 3（决定性）：删除已授予角色的按钮会把码从那个角色身上剥掉
+
+夹具：把一个临时码的按钮授予 carrier 角色；
+另建 deleter 角色，**只持 `menu:list` + `menu:delete`**（不持该码，也无 `menu:grant`）。
+
+```
+carrier holds before = ["probe:revoke:02f64"]
+deleter delete status = 200 OK
+carrier holds after  = []
+```
+
+**持 `system:menu:delete` 的角色，对别的角色完成了一次跨角色撤权，
+全程绕过 `system:menu:grant`。**
+
+## 真正的问题：v0.7.0 修的是同一个洞的一半
+
+| 入口 | v0.7.0 之后 | 后果 |
+|---|---|---|
+| `update_menu` 清空已授权按钮的码 | **要求持该码**（v0.7.0 新增守卫） | 安全 |
+| `delete_menu` 删掉已授权按钮 | **无任何检查** | 同样的跨角色撤权 |
+
+两条路径的**效果完全等价**（码从目标角色身上消失），
+但只堵了前者。`delete` 是锤子更大的那把：连按钮行本身都没了。
+
+自提权路径是闭合的：把码授予别的角色后，
+`ensure_can_grant_roles` 要求调用者已覆盖目标角色的码，
+所以把自己塞进那个角色会被拦下（已实测确认）。
+因此这条是跨角色**撤权**，不是自提权——但撤权本身已经足够严重。
+
+## 本项要做两件事
+
+### 1. `delete_menu` 授权下界（真正的安全修复）
+
+删除一个**携带权限码且已授予至少一个角色**的菜单时，要求持有该码。
+
+- 复用 v0.7.0 已有的 `is_granted_to_any_role`，语义与 update 的守卫完全对齐
+- 未授予任何角色的按钮照旧可删（与"清空无害"同理）
+- 目录/页面菜单不携带码，不受影响（沿用 v0.5.0 既定判断）
+- **副作用**：堵上探针 2 的 delete → recreate 绕行
+
+### 2. 声明已被占用的码返回 409 而不是 500
+
+把唯一索引冲突翻译成 `AppError::Conflict`。
+这是既有契约的补齐，不是新规则。
+
+## 起始 git 状态
+
+- 分支 `v0.8.0`（从 master 切出）
+- HEAD = `0715ece9 docs(handoff): 记录 v0.7.0 发布结果与 ref 歧义坑复发`
+- 上一版：v0.7.0 已发布（tag `v0.7.0` → merge commit `66f26595`）
+- `v0.7.0` 分支已删（远端与本地）
+
+---
+
+## v0.8.0 第 1 项完成记录（delete_menu 授权下界）
+
+### 落地内容
+
+- `MenuRepository::granted_codes_in_subtree(id)`：递归 CTE，取该菜单**整棵子树**里
+ 所有"已被授予至少一个角色"的权限码
+- `MenuRepository::is_permission_taken(code)`：权限码占用预查
+- `delete_menu` 装上授权下界，与 v0.7.0 的 update 守卫语义对齐
+- `create_menu` 加占用预查；`MenuRepository::create` 把唯一索引冲突映射成 `Conflict`
+- **计划外补的一项**：`menus_type_check`（`type` 非法值）原本也冒成 500。
+ 与权限码那条同源，现统一由 `map_write_violation` 翻译，覆盖 create/update 两条写路径。
+ 这是我在真实浏览器回归里撞出来的——脚本传了 `type: "page"` 拿到 500。
+ 不修的话等于把一个已知会误导管理员的 500 留在刚动过的函数里
+
+### 一个设计要点：守卫不能把菜单锁死
+
+`admin` 造出一个码后**并不持有**它，所以 admin 也不能直接删承载该码的菜单。
+这不是缺陷，是规则的必然推论。出路是**先撤销授权、再删除**
+（撤销需 `system:menu:grant`），菜单变成"没人依赖"后删除即放行。
+
+既有三条 v0.7.0 用例的**清理步骤**正是在这里拿到 403——那是正确行为。
+新增 `cleanup_temp_menu_dir` 走恢复路径清理，并把"没有锁死"变成了断言。
+
+刻意**没有**给 admin 开后门：handoff 里既定的设计决定第 3 条
+"admin 是数据上的超级用户，不是代码里的后门"仍然成立。
+
+### 测试：集成测试 63 → 68（新增 5 条）
+
+`deleting_a_granted_button_others_rely_on_requires_holding_it`、
+`deleting_a_directory_with_a_granted_button_below_is_denied`、
+`deleting_a_button_no_role_relies_on_is_allowed`、
+`declaring_an_already_used_permission_code_is_a_conflict`、
+`an_invalid_menu_type_is_a_bad_request`
+
+### 缺陷注入验证（四条，含一条鉴别性结果）
+
+| 注入 | 结果 |
+|---|---|
+| 移除 delete 守卫 | 两条删除用例同时变红 |
+| 子树查询去掉递归 | 目录级联那条变红，直接删按钮那条**仍绿** |
+| 移除占用预查 | 冲突用例**仍绿** |
+| 预查与索引映射都移除 | 冲突用例变红 |
+| 移除 `menus_type_check` 分支 | 类型用例变红 |
+
+第二条证明递归查询真正承重，且两条用例覆盖**不同的**攻击路径
+（删按钮 / 删父目录）。这是本轮最有价值的一次注入。
+
+第三条暴露**诚实的覆盖缺口**：占用预查与唯一索引映射两层都报冲突，
+测试只能区分"两层都没了"，即**预查本身没有被独立覆盖**。
+预查负责的是可操作的消息文案，正确性由索引映射那层兜底。
+记在这里以免后人误以为预查已被测试保护。
+
+### 门禁结果（全绿）
+
+- `cargo fmt --all --check` / `cargo clippy --locked --all-targets --all-features -D warnings`：clean
+- 单元测试 55（未变，本项无纯逻辑单元可拆）
+- 集成测试 63 → 68
+- 前端代码未改动，但版本号有动，故仍跑了前端门禁：lint / typecheck / vitest 84 全绿
+
+### 起始 git 状态
+
+- 分支 `v0.8.0`（从 master 切出）
+- HEAD = `0715ece9 docs(handoff): 记录 v0.7.0 发布结果与 ref 歧义坑复发`
+
