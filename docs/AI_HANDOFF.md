@@ -1414,8 +1414,8 @@ DELETE FROM audit_logs WHERE id IN (
 - CI 仅在 `master` push 与 PR 上触发，**单纯推分支不会起 CI**；
   当前 `v0.7.0` 分支上**没有 CI 运行记录**，需开 PR 才会跑。
   本地门禁已全绿（见各项完成记录），但**远端 CI 尚未验证**
-- 下一步（未做，需用户确认）：开 PR → 合并 → 打 tag `v0.7.0` → 发 Release → 删分支。
-  合并与打 tag 是有后果的操作，不自行执行
+- 下一步：已发布 v0.7.0（2026-10-02）。分支 `v0.7.0` 尚未删除，待用户确认后再删。
+  合并与打 tag 有后果，已按用户指令执行完毕。
 
 ## PR #6 已开 + 按 CI 原始命令复核（v0.7.0）
 
@@ -1464,3 +1464,45 @@ CI 的 clippy 与 test 都带 `--locked --all-targets --all-features`。
   - 现象：报 "invalid hunk at line N"，看起来像上下文没匹配上，实际是前缀被吃
   - 规避：写本文件时让每行都不以全角逗号 `，` 收尾，改用句号或分号
   - 同源坑：正文里出现连续两个 at 符号也会让解析器以为换了 hunk，报 End Patch 缺失
+
+---
+
+## ✅ v0.7.0 已发布（2026-10-02）
+
+https://github.com/ZhongGheart/axum-api/releases/tag/v0.7.0
+
+### 发布动作（全部已完成）
+
+| 步骤 | 结果 |
+|---|---|
+| PR #6 squash 合并进 `master` | `66f26595` |
+| tag `v0.7.0` 打在 merge commit 上 | `refs/tags/v0.7.0` → `66f26595` |
+| Release 已发布 | 非 draft、非 prerelease |
+| 删 `v0.7.0` 分支 | **未做**，待用户确认 |
+
+tag 打在 merge commit 而非分支 tip，与 v0.5.0 / v0.6.0 一致。
+`master` 原本停在 `d91dbbf0`（v0.6.0），现为 `66f26595`。
+
+### 本轮又踩了一次 ref 歧义坑
+
+`git push origin v0.7.0` 报 `refspec matches more than one`：
+本地分支 `v0.7.0` 与新 tag `v0.7.0` 同名，git 拒绝猜测。
+**必须写完整 refspec** 才推得上去：
+
+```
+git push origin refs/tags/v0.7.0:refs/tags/v0.7.0
+```
+
+这正是 v0.5.0 记过的坑（见 commit `cf8cbdde`）。当时只在文档里记了，
+没形成操作纪律，这次又踩了一次。**结论：打与分支同名的 tag 时，
+推送一律用完整 refspec，不用短名。**
+
+### 合并前补做的一件事
+
+合并前发现**本地门禁比 CI 窄**：CI 的 clippy / test 带
+`--locked --all-targets --all-features`，而之前本地跑的不带
+`--all-targets --all-features`（少了集成测试 target 与全 feature 组合）。
+按 CI 原始命令重跑一遍后全绿，才推的 PR。
+
+另外 `docker` job 本机无法复现（无 Docker daemon），只在 CI 上验证过；
+它在 CI 上通过，所以分支的验证是完整的。
