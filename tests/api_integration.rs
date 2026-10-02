@@ -145,6 +145,31 @@ async fn login_token(app: &Router, username: &str, password: &str) -> String {
         .to_string()
 }
 
+/// 清掉"首次登录强制改密"标记
+///
+/// 管理员建号时口令由管理员代选，产品要求该用户下次登录后自行改掉（v0.11.0）。
+/// 多数权限用例并不关心改密流程，只关心"这个账号能否调某个接口"，
+/// 因此这里**显式**清标记，让这些用例继续测它们本来要测的东西。
+///
+/// 为什么不塞进 `login_token`：那会让"登录"这个动作产生改库的副作用，
+/// 用例便不再知道自己依赖了这个前提——正是 v0.9.0 记过的
+/// "测试自己也会说谎"。强制改密本身由 v0.11.0 专项用例完整覆盖。
+async fn clear_must_change_password(username: &str) {
+    sqlx::query("UPDATE users SET must_change_password = FALSE WHERE username = $1")
+        .bind(username)
+        .execute(&pool().await)
+        .await
+        .expect("清除强制改密标记失败");
+}
+
+/// 建号 → 激活 → 拿到**可正常调用接口**的令牌
+///
+/// 绝大多数用例要的是这个，而不是"受限令牌"。
+async fn activated_token(app: &Router, username: &str, password: &str) -> String {
+    clear_must_change_password(username).await;
+    login_token(app, username, password).await
+}
+
 async fn admin_token(app: &Router) -> String {
     login_token(app, "admin", "admin123").await
 }
@@ -287,7 +312,7 @@ async fn non_admin_is_blocked_from_admin_api() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let token = login_token(&app, &username, "user1234").await;
+    let token = activated_token(&app, &username, "user1234").await;
 
     // 普通用户可读取字典（通用展示数据）
     let (dict_status, _) = send(
@@ -533,7 +558,7 @@ async fn current_user_menu_tree_follows_role_assignment() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let user = login_token(&app, &username, "user1234").await;
+    let user = activated_token(&app, &username, "user1234").await;
     let (status, body) = send(&app, request("GET", "/api/auth/menus", Some(&user), None)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let user_menus = collect_menu_names(&body["data"]);
@@ -668,7 +693,7 @@ async fn ordinary_user_has_no_permission_codes() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let token = login_token(&app, &username, "user1234").await;
+    let token = activated_token(&app, &username, "user1234").await;
     let (status, body) = send(
         &app,
         request("GET", "/api/auth/permissions", Some(&token), None),
@@ -1367,7 +1392,7 @@ async fn create_user_via_api(
     username: &str,
     role: &str,
 ) -> (StatusCode, Value) {
-    send(
+    let (status, body) = send(
         app,
         request(
             "POST",
@@ -1376,7 +1401,13 @@ async fn create_user_via_api(
             Some(user_payload(username, role)),
         ),
     )
-    .await
+    .await;
+    // 管理员建号会置"强制改密"，这里清掉以便后续用例正常调用接口。
+    // 见 clear_must_change_password 的说明
+    if status == StatusCode::OK {
+        clear_must_change_password(username).await;
+    }
+    (status, body)
 }
 
 async fn user_exists(username: &str) -> bool {
@@ -1887,6 +1918,8 @@ async fn create_user_with_roles(
         .as_str()
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
         .unwrap_or_else(|| panic!("响应里没有可解析的用户 id: {body}"));
+    // 管理员建号会置"强制改密"，这里清掉以便后续用例正常调用接口
+    clear_must_change_password(&username).await;
     (id, username)
 }
 
@@ -2753,7 +2786,9 @@ async fn operator_with_codes(
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
         .unwrap_or_else(|| panic!("创建用户响应里没有 id: {body}"));
 
-    let token = login_token(app, &username, "user1234").await;
+    // 管理员建号会置"强制改密"，这里清掉以便夹具返回的是可正常调用接口的令牌。
+    // 这些用例关心的是权限码授予，不是改密流程
+    let token = activated_token(app, &username, "user1234").await;
     let (_, mine) = send(
         app,
         request("GET", "/api/auth/permissions", Some(&token), None),
@@ -3246,7 +3281,7 @@ async fn granted_temp_button(
     .await;
     assert_eq!(status, StatusCode::OK, "创建持有者失败: {body}");
     let holder_uid = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
-    let holder_tok = login_token(app, &username, "user1234").await;
+    let holder_tok = activated_token(app, &username, "user1234").await;
 
     // ② 再建带专属码的按钮
     let dir_name = unique("tmp_restore_dir");
@@ -4303,7 +4338,7 @@ async fn appending_a_role_takes_effect_without_waiting_for_a_relogin() {
         .and_then(|s| uuid::Uuid::parse_str(s).ok())
         .unwrap_or_else(|| panic!("创建用户响应里没有 id: {body}"));
 
-    let stale_token = login_token(&app, &target_name, "user1234").await;
+    let stale_token = activated_token(&app, &target_name, "user1234").await;
     let (before, _) = send(
         &app,
         request("GET", "/api/admin/dict/types", Some(&stale_token), None),
@@ -4343,7 +4378,7 @@ async fn appending_a_role_takes_effect_without_waiting_for_a_relogin() {
         "追加角色后旧令牌应立刻失效（会话已吊销）: {body}"
     );
 
-    let fresh = login_token(&app, &target_name, "user1234").await;
+    let fresh = activated_token(&app, &target_name, "user1234").await;
     let (relogin, body) = send(
         &app,
         request("GET", "/api/admin/dict/types", Some(&fresh), None),
@@ -4411,7 +4446,7 @@ async fn re_applying_the_same_role_does_not_kill_the_target_session() {
     assert_eq!(status, StatusCode::OK, "首次追加失败: {body}");
 
     // 重新登录拿到一个"该角色已生效"的令牌
-    let live = login_token(&app, &target_name, "user1234").await;
+    let live = activated_token(&app, &target_name, "user1234").await;
     let (ok, body) = send(
         &app,
         request("GET", "/api/admin/dict/types", Some(&live), None),
@@ -4931,7 +4966,7 @@ async fn audit_logs_filter_by_username() {
     // "筛选=全量"和"筛选生效"观察上完全一样，测试就成了自证。
     let other = unique("auditother");
     let other_id = mkuser(&app, &token, &other).await;
-    let other_token = login_token(&app, &other, "user1234").await;
+    let other_token = activated_token(&app, &other, "user1234").await;
 
     // 普通用户打管理接口 → 403。审计中间件在认证之内，403 同样留痕。
     let (status, _) = send(
@@ -5526,5 +5561,837 @@ fn every_query_dto_rejects_unknown_fields() {
         offenders.is_empty(),
         "以下 query DTO 会静默丢弃未知字段:\n  {}",
         offenders.join("\n  ")
+    );
+}
+
+// ──────────────────────────────────────────────
+// v0.11.0：登录可审计 + 自助改密 + 口令策略
+// ──────────────────────────────────────────────
+
+/// 该用户在某 action 下的全部审计行
+fn rows_for(body: &Value, username: &str, action: &str) -> Vec<Value> {
+    body["data"]["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            r["username"].as_str() == Some(username) && r["action"].as_str() == Some(action)
+        })
+        .collect()
+}
+
+/// 登录成功落审计，且**带 client_ip**
+///
+/// 回归的是 v0.11.0 的起点：`/api/auth/login` 在 `public_routes` 里，
+/// 没有挂 `audit_log_middleware`，此前成功与失败都不进 `audit_logs`。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_successful_login_is_audited_with_its_client_ip() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let name = unique("loginsuccess");
+    mkuser(&app, &admin, &name).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": name, "password": "user1234" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "登录应成功: {body}");
+
+    let logs = wait_for_logs(
+        &app,
+        &admin,
+        &format!("action=AUTH_LOGIN_SUCCESS&username={name}"),
+        |b| !rows_for(b, &name, "AUTH_LOGIN_SUCCESS").is_empty(),
+    )
+    .await;
+
+    let rows = rows_for(&logs, &name, "AUTH_LOGIN_SUCCESS");
+    assert_eq!(rows.len(), 1, "一次登录应恰好一条成功审计: {rows:?}");
+    let row = &rows[0];
+    assert_eq!(row["method"].as_str(), Some("POST"));
+    assert_eq!(row["path"].as_str(), Some("/api/auth/login"));
+    assert_eq!(row["status_code"].as_u64(), Some(200));
+    // client_ip 是"谁从哪登录"的唯一来源，缺了这条追溯就断了一半
+    assert!(
+        !row["client_ip"].as_str().unwrap_or("").is_empty(),
+        "成功登录必须记下 client_ip: {row}"
+    );
+    assert_eq!(
+        row["user_id"].as_str(),
+        Some(user_id_by_username(&name).await.to_string().as_str()),
+        "成功登录应能关联到用户 id"
+    );
+}
+
+/// 口令错误的登录**也要落审计**，且记的是"尝试登录时提交的名字"
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_wrong_password_login_is_audited() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let name = unique("loginfail");
+    mkuser(&app, &admin, &name).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": name, "password": "definitely-not-it" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "口令错误应 401: {body}");
+
+    let logs = wait_for_logs(
+        &app,
+        &admin,
+        &format!("action=AUTH_LOGIN_FAILURE&username={name}"),
+        |b| !rows_for(b, &name, "AUTH_LOGIN_FAILURE").is_empty(),
+    )
+    .await;
+
+    let rows = rows_for(&logs, &name, "AUTH_LOGIN_FAILURE");
+    let row = &rows[0];
+    assert_eq!(row["status_code"].as_u64(), Some(401));
+    assert!(
+        row["result"].as_str().unwrap_or("").contains("口令"),
+        "应写明失败原因，实际 {:?}",
+        row["result"]
+    );
+    assert!(
+        !row["client_ip"].as_str().unwrap_or("").is_empty(),
+        "失败登录同样要记 client_ip（爆破溯源）: {row}"
+    );
+}
+
+/// 对**不存在的账号**登录也要留痕——那正是爆破的证据
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_login_for_an_unknown_account_is_audited_too() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let ghost = unique("ghostacct");
+
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": ghost, "password": "whatever123" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let logs = wait_for_logs(
+        &app,
+        &admin,
+        &format!("action=AUTH_LOGIN_FAILURE&username={ghost}"),
+        |b| !rows_for(b, &ghost, "AUTH_LOGIN_FAILURE").is_empty(),
+    )
+    .await;
+
+    let row = &rows_for(&logs, &ghost, "AUTH_LOGIN_FAILURE")[0];
+    assert!(
+        row["result"].as_str().unwrap_or("").contains("账号"),
+        "应写明账号不存在，实际 {:?}",
+        row["result"]
+    );
+    // 查无此人时 user_id 必须为空——不能把一个不存在的 id 写进去
+    assert!(row["user_id"].is_null(), "查无此人时不应有 user_id: {row}");
+}
+
+/// 审计筛选必须**双向收窄**，否则等于没筛
+///
+/// 只断言"目标行在里面"是自证：不过滤时全量也满足这个条件。
+/// 这里同时断言"别的用户的行不在里面"。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn login_audit_filters_narrow_in_both_directions() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let mine = unique("narrow_mine");
+    let other = unique("narrow_other");
+    mkuser(&app, &admin, &mine).await;
+    mkuser(&app, &admin, &other).await;
+
+    for name in [&mine, &other] {
+        send(
+            &app,
+            request(
+                "POST",
+                "/api/auth/login",
+                None,
+                Some(json!({ "username": name, "password": "user1234" })),
+            ),
+        )
+        .await;
+    }
+
+    let logs = wait_for_logs(
+        &app,
+        &admin,
+        &format!("action=AUTH_LOGIN_SUCCESS&username={mine}"),
+        |b| !rows_for(b, &mine, "AUTH_LOGIN_SUCCESS").is_empty(),
+    )
+    .await;
+
+    let mine_rows = rows_for(&logs, &mine, "AUTH_LOGIN_SUCCESS");
+    assert!(!mine_rows.is_empty(), "自己的成功日志应在结果里");
+    assert!(
+        rows_for(&logs, &other, "AUTH_LOGIN_SUCCESS").is_empty(),
+        "按 {mine} 筛选时不该带出 {other} 的日志: {logs}"
+    );
+}
+
+/// 注册落审计
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn registration_is_audited() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let name = unique("registered");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": name,
+                "email": format!("{name}@example.com"),
+                "password": "register1A",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "注册应成功: {body}");
+
+    let logs = wait_for_logs(
+        &app,
+        &admin,
+        &format!("action=AUTH_REGISTER&username={name}"),
+        |b| !rows_for(b, &name, "AUTH_REGISTER").is_empty(),
+    )
+    .await;
+
+    let row = &rows_for(&logs, &name, "AUTH_REGISTER")[0];
+    assert_eq!(row["path"].as_str(), Some("/api/auth/register"));
+    assert!(
+        !row["client_ip"].as_str().unwrap_or("").is_empty(),
+        "注册也要记 client_ip: {row}"
+    );
+}
+
+/// 审计 `username` 列只有 50 字符，超长用户名不能让登录变成 500
+///
+/// 这是"审计反过来变成拒绝服务入口"的回归：不截断的话
+/// 一个 200 字符的用户名会让 INSERT 报 `value too long`，
+/// 于是"口令错误"被升级成 500。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_overlong_username_on_login_does_not_break_the_audit_write() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let huge = "u".repeat(300);
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": huge, "password": "whatever123" })),
+        ),
+    )
+    .await;
+    // 关键：必须是业务错误 401，而不是审计写入失败导致的 500
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "超长用户名应得 401，实际 {status}: {body}"
+    );
+
+    // 审计确实落库了（被截断到 50）
+    let logs = wait_for_logs(&app, &admin, "action=AUTH_LOGIN_FAILURE", |b| {
+        b["data"]["items"]
+            .as_array()
+            .map(|items| {
+                items.iter().any(|r| {
+                    r["username"].as_str().map(|u| u.len()) == Some(50)
+                        && r["username"].as_str().map(|u| u.starts_with('u')) == Some(true)
+                })
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        logs["data"]["items"]
+            .as_array()
+            .is_some_and(|i| !i.is_empty()),
+        "超长用户名也应留下一条被截断的审计"
+    );
+}
+
+/// 管理员建号 → 登录拿到**受限令牌** → 业务接口被拦 → 改密 → 恢复正常
+///
+/// 这是 v0.11.0 的核心链路，一条测试走完。
+/// 特别之处：拦截发生在**后端中间件**，
+/// 不是靠前端跳转——只让前端跳改密页的话，令牌本身仍能调任何接口，
+/// 那等于把权限校验交给界面，与 v0.10.0 关掉的"界面替后端承诺"同类。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_admin_created_user_is_confined_to_changing_password() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let name = unique("mustchange");
+    mkuser(&app, &admin, &name).await;
+    // 夹具刚把标记清了，这里显式置回来，走真实的"管理员建号"语义
+    sqlx::query("UPDATE users SET must_change_password = TRUE WHERE username = $1")
+        .bind(&name)
+        .execute(&pool().await)
+        .await
+        .expect("置强制改密标记失败");
+
+    // ── 登录：拿到受限令牌，且响应明说自己是受限的
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": name, "password": "user1234" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "登录应成功: {body}");
+    assert_eq!(
+        body["data"]["must_change_password"].as_bool(),
+        Some(true),
+        "登录响应应明说这是受限令牌: {body}"
+    );
+    let restricted = body["data"]["token"]
+        .as_str()
+        .expect("缺少 token")
+        .to_string();
+
+    // ── 放行的：看自己、改密
+    //
+    // 注意这里**故意用错的旧口令**：请求要走到 handler 才会得到 400，
+    // 若被中间件拦下则是 403——两者可区分，才说明"放行"是真的。
+    // 不能在这里真的改密：那会吊销掉本令牌，后面所有断言都变成 401。
+    let (status, _) = send(
+        &app,
+        request("GET", "/api/auth/me", Some(&restricted), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "/api/auth/me 应放行，实际 {status}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/password",
+            Some(&restricted),
+            Some(json!({ "old_password": "wrong-on-purpose", "new_password": "ChangedPass1" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "改密接口应放行到 handler（因旧口令错而 400），实际 {status}: {body}"
+    );
+
+    // ── 拦住的：任何业务接口
+    for path in [
+        "/api/auth/permissions",
+        "/api/admin/users",
+        "/api/admin/monitor/system",
+    ] {
+        let (status, body) = send(&app, request("GET", path, Some(&restricted), None)).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "受限令牌不该能访问 {path}: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("修改初始密码"),
+            "403 提示要说清该做什么，实际 {:?}",
+            body["message"]
+        );
+    }
+
+    // ── 登出放行，且排在最后：它会注销令牌，放在前面后续断言就全失效了
+    let (status, _) = send(
+        &app,
+        request("POST", "/api/auth/logout", Some(&restricted), None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/api/auth/logout 应放行，实际 {status}"
+    );
+}
+
+/// 改密之后：旧令牌全部失效，重新登录拿到正常令牌
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn changing_password_revokes_every_existing_session() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let name = unique("pwchange");
+    mkuser(&app, &admin, &name).await;
+
+    // 两个设备各登录一次
+    let phone = activated_token(&app, &name, "user1234").await;
+    let laptop = activated_token(&app, &name, "user1234").await;
+    assert_ne!(phone, laptop, "两次登录应拿到不同令牌");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/password",
+            Some(&phone),
+            Some(json!({ "old_password": "user1234", "new_password": "FreshPass99" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "改密应成功: {body}");
+
+    // 改密的那一端也要重新登录——口令变了凭据就作废
+    for (label, tok) in [("发起改密的设备", &phone), ("另一个设备", &laptop)] {
+        let (status, _) = send(&app, request("GET", "/api/auth/me", Some(tok), None)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{label} 的旧令牌应在改密后失效，实际 {status}"
+        );
+    }
+
+    // 新口令可登录，旧口令不可
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": name, "password": "FreshPass99" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "新口令应能登录: {body}");
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": name, "password": "user1234" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "旧口令应失效");
+}
+
+/// 必须验旧口令：只验复杂度的话，令牌被劫持即可永久占据账号
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn changing_password_requires_the_current_password() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let name = unique("pwold");
+    mkuser(&app, &admin, &name).await;
+    let tok = activated_token(&app, &name, "user1234").await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/password",
+            Some(&tok),
+            Some(json!({ "old_password": "not-my-password", "new_password": "FreshPass99" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "旧口令错误应 400: {body}");
+
+    // 口令没被改掉
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": name, "password": "user1234" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "原口令应仍然有效");
+}
+
+/// 新旧口令相同必须拒绝：否则改密是空操作却回了"成功"
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn changing_password_rejects_reusing_the_current_one() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let name = unique("pwsame");
+    mkuser(&app, &admin, &name).await;
+    let tok = activated_token(&app, &name, "user1234").await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/password",
+            Some(&tok),
+            Some(json!({ "old_password": "user1234", "new_password": "user1234" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "相同口令应被拒: {body}");
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("相同"),
+        "提示要说清原因，实际 {:?}",
+        body["message"]
+    );
+}
+
+/// 自助改密**不能**顺带改自己的角色或启用状态
+///
+/// 判据落在"多传字段被指名拒绝"，而不是"传了也没生效"——
+/// 后者满足于调用方误以为成功，与 v0.10.0 关掉的假接口同类。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn changing_password_cannot_also_grant_itself_roles() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let name = unique("pwnope");
+    mkuser(&app, &admin, &name).await;
+    let tok = activated_token(&app, &name, "user1234").await;
+    let uid = user_id_by_username(&name).await;
+
+    for extra in [
+        json!({ "old_password": "user1234", "new_password": "FreshPass99", "roles": ["admin"] }),
+        json!({ "old_password": "user1234", "new_password": "FreshPass99", "is_active": true }),
+        json!({ "old_password": "user1234", "new_password": "FreshPass99", "user_id": uid }),
+    ] {
+        let (status, body) = send(
+            &app,
+            request("PUT", "/api/auth/password", Some(&tok), Some(extra.clone())),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "多传 {extra} 应被 400 拒绝: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unknown field"),
+            "应指名是哪个字段不认，实际 {:?}",
+            body["message"]
+        );
+    }
+
+    // 角色与状态都没被改动
+    assert_eq!(
+        role_names_in_db(uid).await,
+        vec!["user".to_string()],
+        "自助改密不得改动角色"
+    );
+    let active: bool = sqlx::query_scalar("SELECT is_active FROM users WHERE id = $1")
+        .bind(uid)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询 is_active 失败");
+    assert!(active, "自助改密不得改动启用状态");
+}
+
+/// 公开注册的用户**不受**强制改密约束
+///
+/// 回归 v0.11.0 的核心约束"不叠加第二次强制登出"：
+/// 用户自己设的口令不该被要求再改一次。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn self_registered_users_are_not_forced_to_change_password() {
+    let app = app().await;
+
+    let name = unique("selfreg");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": name,
+                "email": format!("{name}@example.com"),
+                "password": "selfreg123",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "注册应成功: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": name, "password": "selfreg123" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "登录应成功: {body}");
+    assert_eq!(
+        body["data"]["must_change_password"].as_bool(),
+        Some(false),
+        "自己设的口令不该被要求改掉: {body}"
+    );
+    let tok = body["data"]["token"].as_str().expect("缺少 token");
+
+    // 立刻就能正常用业务接口
+    let (status, _) = send(
+        &app,
+        request("GET", "/api/auth/permissions", Some(tok), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "自注册用户不该被拦在改密页");
+}
+
+/// 弱口令在"设置口令"时被拒
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn weak_passwords_are_rejected_when_being_set() {
+    let app = app().await;
+
+    // 12345678：长度够，但只有一个字符类
+    let name = unique("weakpw");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": name,
+                "email": format!("{name}@example.com"),
+                "password": "12345678",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "弱口令应被拒: {body}");
+    assert!(
+        body["message"].as_str().unwrap_or("").contains("复杂度"),
+        "提示应说明是复杂度问题，实际 {:?}",
+        body["message"]
+    );
+    assert!(!user_exists(&name).await, "被拒的注册不应留下半个账号");
+}
+
+/// 管理员重置口令后，该用户下次登录必须改密
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn resetting_a_password_arms_the_forced_change_flag() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let name = unique("resetpw");
+    let uid = mkuser(&app, &admin, &name).await;
+
+    // 先自助改一次，把标记清掉，验证"重置会重新置位"
+    let tok = activated_token(&app, &name, "user1234").await;
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/password",
+            Some(&tok),
+            Some(json!({ "old_password": "user1234", "new_password": "SelfChosen1" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "自助改密应成功: {body}");
+
+    // 管理员重置
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{uid}/reset-password"),
+            Some(&admin),
+            Some(json!({ "password": "AdminSet99" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重置应成功: {body}");
+
+    let flag: bool = sqlx::query_scalar("SELECT must_change_password FROM users WHERE id = $1")
+        .bind(uid)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询标记失败");
+    assert!(flag, "管理员重置后必须重新要求改密");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": name, "password": "AdminSet99" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重置后的口令应能登录: {body}");
+    assert_eq!(
+        body["data"]["must_change_password"].as_bool(),
+        Some(true),
+        "重置后的登录应拿到受限令牌: {body}"
+    );
+}
+
+/// 前后端口令策略**必须给出同一结论**
+///
+/// 规则在前端 `utils/password.ts` 与后端 `validation.rs` 各存一份：
+/// 前端那份只为即时反馈，后端才是裁决方。两份必然有漂移风险，
+/// 而漂移的后果很具体——界面说"符合要求"，点提交却被后端拒绝。
+///
+/// 做法是从前端源码里解析出 `PASSWORD_POLICY_CASES` 样例，
+/// 用 Rust 的 `validate_password` 跑同一批口令并比对结论。
+/// 样例清单本身也是代码里的单一条目，改一处即两侧同步。
+#[test]
+fn password_policy_agrees_with_the_frontend_copy() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("frontend/src/utils/password.ts"))
+        .expect("读取 frontend/src/utils/password.ts 失败");
+
+    // **只在数组体内解析**：文件顶部的文档注释里也写着 `{ pw: '...', ok: true }`
+    // 这样的示例，全文搜索会把它当成一条真实样例（`...` 当然过不了复杂度）。
+    let body_start = source
+        .find("export const PASSWORD_POLICY_CASES")
+        .expect("前端未导出 PASSWORD_POLICY_CASES");
+    let body = &source[body_start..];
+    let body_end = body
+        .find("\n]")
+        .expect("PASSWORD_POLICY_CASES 数组未正常闭合");
+    let body = &body[..body_end];
+
+    // 解析 `{ pw: '...', ok: true|false }`
+    let mut cases: Vec<(String, bool)> = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find("{ pw: '") {
+        let after = &rest[at + "{ pw: '".len()..];
+        let Some(end_quote) = after.find('\'') else {
+            break;
+        };
+        let pw = after[..end_quote].to_string();
+        let tail = &after[end_quote + 1..];
+        let Some(ok_at) = tail.find(", ok: ") else {
+            break;
+        };
+        let verdict = &tail[ok_at + ", ok: ".len()..];
+        let verdict_len = if verdict.starts_with("true") {
+            4
+        } else if verdict.starts_with("false") {
+            5
+        } else {
+            panic!("无法解析 ok 字段: {verdict}");
+        };
+        cases.push((pw, verdict.starts_with("true")));
+        rest = &tail[ok_at + ", ok: ".len() + verdict_len..];
+    }
+
+    assert!(
+        cases.len() >= 10,
+        "从前端解析到的口令样例过少（{} 条），样例表可能被改坏",
+        cases.len()
+    );
+
+    let mut mismatches: Vec<String> = Vec::new();
+    for (pw, expected_ok) in &cases {
+        let actual_ok = axum_api::utils::validation::validate_password(pw).is_ok();
+        if actual_ok != *expected_ok {
+            mismatches.push(format!(
+                "{pw:?}：前端期望 {expected_ok}，后端实际 {actual_ok}"
+            ));
+        }
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "前后端口令策略判定不一致：\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// 前后端的长度上下限必须一致
+///
+/// 上面那条比的是"给定口令的结论"，比不出**边界值**本身被改动的情况：
+/// 若两侧同时把下限从 8 抬到 10，样例结论可能仍全对。
+/// 因此单独锁住两个常量。
+#[test]
+fn password_length_bounds_match_the_frontend_copy() {
+    use axum_api::utils::validation::{PASSWORD_MAX_LEN, PASSWORD_MIN_LEN};
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("frontend/src/utils/password.ts"))
+        .expect("读取前端口令策略失败");
+
+    let parse = |name: &str| -> usize {
+        let marker = format!("export const {name} = ");
+        let at = source
+            .find(&marker)
+            .unwrap_or_else(|| panic!("前端未导出 {name}"));
+        let rest = &source[at + marker.len()..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        rest[..end]
+            .parse()
+            .unwrap_or_else(|e| panic!("{name} 不是数字: {e}"))
+    };
+
+    assert_eq!(
+        parse("PASSWORD_MIN_LEN"),
+        PASSWORD_MIN_LEN,
+        "前端 PASSWORD_MIN_LEN 与后端不一致"
+    );
+    assert_eq!(
+        parse("PASSWORD_MAX_LEN"),
+        PASSWORD_MAX_LEN,
+        "前端 PASSWORD_MAX_LEN 与后端不一致"
     );
 }

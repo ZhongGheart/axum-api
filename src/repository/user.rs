@@ -41,7 +41,7 @@ impl UserRepository {
     pub async fn find_by_id(&self, id: Uuid) -> Result<User, AppError> {
         sqlx::query_as::<_, User>(
             r#"
-            SELECT id, username, email, password_hash, is_active, created_at, updated_at
+            SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
             FROM users
             WHERE id = $1
             "#,
@@ -57,7 +57,7 @@ impl UserRepository {
     pub async fn find_by_username(&self, username: &str) -> Result<Option<User>, AppError> {
         sqlx::query_as::<_, User>(
             r#"
-            SELECT id, username, email, password_hash, is_active, created_at, updated_at
+            SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
             FROM users
             WHERE username = $1
             "#,
@@ -74,7 +74,7 @@ impl UserRepository {
     pub async fn find_by_username_or_email(&self, input: &str) -> Result<Option<User>, AppError> {
         sqlx::query_as::<_, User>(
             r#"
-            SELECT id, username, email, password_hash, is_active, created_at, updated_at
+            SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
             FROM users
             WHERE username = $1 OR email = $1
             "#,
@@ -89,7 +89,7 @@ impl UserRepository {
     pub async fn find_by_email(&self, email: &str) -> Result<Option<User>, AppError> {
         sqlx::query_as::<_, User>(
             r#"
-            SELECT id, username, email, password_hash, is_active, created_at, updated_at
+            SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
             FROM users
             WHERE email = $1
             "#,
@@ -125,7 +125,7 @@ impl UserRepository {
             None => {
                 sqlx::query_as::<_, User>(
                     r#"
-                    SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                    SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
                     FROM users
                     ORDER BY created_at DESC
                     LIMIT $1 OFFSET $2
@@ -140,7 +140,7 @@ impl UserRepository {
                 let pattern = format!("%{}%", crate::utils::validation::escape_like_pattern(k));
                 sqlx::query_as::<_, User>(
                     r#"
-                    SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                    SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
                     FROM users
                     WHERE username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\'
                     ORDER BY created_at DESC
@@ -193,7 +193,7 @@ impl UserRepository {
             UPDATE users
             SET username = $2, email = $3, is_active = $4
             WHERE id = $1
-            RETURNING id, username, email, password_hash, is_active, created_at, updated_at
+            RETURNING id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -281,24 +281,41 @@ impl UserRepository {
     /// # Returns
     ///
     /// 返回创建成功的用户记录。
+    /// 创建新用户
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - 新用户 UUID
+    /// * `username` - 用户名
+    /// * `email` - 电子邮箱
+    /// * `password_hash` - Argon2 哈希后的密码
+    /// * `must_change_password` - 是否要求首次登录后立即改密。
+    ///   **管理员建号应传 `true`**（口令是管理员定的，用户本人没参与）；
+    ///   公开注册应传 `false`（用户自己设的口令）
+    ///
+    /// # Returns
+    ///
+    /// 返回创建成功的用户记录。
     pub async fn create(
         &self,
         id: Uuid,
         username: &str,
         email: &str,
         password_hash: &str,
+        must_change_password: bool,
     ) -> Result<User, AppError> {
         sqlx::query_as::<_, User>(
             r#"
-            INSERT INTO users (id, username, email, password_hash, is_active)
-            VALUES ($1, $2, $3, $4, true)
-            RETURNING id, username, email, password_hash, is_active, created_at, updated_at
+            INSERT INTO users (id, username, email, password_hash, is_active, must_change_password)
+            VALUES ($1, $2, $3, $4, true, $5)
+            RETURNING id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
             "#,
         )
         .bind(id)
         .bind(username)
         .bind(email)
         .bind(password_hash)
+        .bind(must_change_password)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
@@ -315,5 +332,19 @@ impl UserRepository {
             }
             AppError::InternalServerError(format!("创建用户失败: {e}"))
         })
+    }
+
+    /// 置位"必须改密"标记
+    ///
+    /// 管理员重置口令后调用：重置意味着用户**本人没参与**这次口令选择，
+    /// 因此必须让其在下次登录后改掉。
+    pub async fn set_must_change_password(&self, id: Uuid, required: bool) -> Result<(), AppError> {
+        sqlx::query("UPDATE users SET must_change_password = $2 WHERE id = $1")
+            .bind(id)
+            .bind(required)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("更新强制改密标记失败: {e}")))?;
+        Ok(())
     }
 }

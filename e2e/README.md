@@ -78,6 +78,8 @@ node e2e/probe-write-guards.mjs
 | `permission-and-monitor.mjs` | 权限码入口与监控页导出（v0.7.0） |
 | `menu-delete-guard.mjs` | 菜单删除的授权下界，含子树级联（v0.8.0） |
 | `role-assignment-guard.mjs` | 角色追加的目标下界、会话吊销、幂等、404（v0.9.0） |
+| `v010-ui-truth.mjs` | 新增筛选控件与分页必须真的生效（v0.10.0） |
+| `v011-audit-and-password.mjs` | 登录审计在日志页看得见、受限令牌被界面拦住、界面表单改密（v0.11.0） |
 
 ## 加新套件
 

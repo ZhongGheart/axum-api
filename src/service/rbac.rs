@@ -125,7 +125,7 @@ impl RbacService {
         // 3. 创建默认超级管理员（如不存在）
         let admin_user = sqlx::query_as::<_, User>(
             r#"
-            SELECT id, username, email, password_hash, is_active, created_at, updated_at
+            SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
             FROM users
             WHERE username = 'admin'
             "#,

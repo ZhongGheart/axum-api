@@ -24,6 +24,11 @@ await s.start()
 const uniq = 'v09' + Math.random().toString(36).slice(2, 8)
 const PW = 'user1234'
 
+// 管理员建出来的账号带"强制改密"标记（v0.11.0），拿到的是受限令牌，
+// 打业务接口只会得到"请先修改初始密码"的 403。因此建号后要先让该用户
+// 自助改一次密，下面 PW2 就是改完之后在用的口令。
+const PW2 = 'user5678'
+
 /** 按权限码在菜单树里找出对应节点 id（授权接口吃的是 menu_id，不是权限码） */
 async function menuIdOf(code) {
   const tree = await s.api('GET', '/api/admin/menus')
@@ -117,7 +122,7 @@ s.resetBadResponses()
 
 // ──────────────────────────────────────────────
 s.log('\n[2] 洞 A：不得给权限高于自己的账号追加角色')
-const weakTok = await s.tokenFor(weakUser, PW)
+const weakTok = await s.activatedToken(weakUser, PW, PW2)
 const before = await rolesOf(strongId)
 s.check('目标账号当前只持强角色',
   before.length === 1 && before[0] === strong.name, JSON.stringify(before))
@@ -151,7 +156,7 @@ s.check('自我追加真的落库且未覆盖原角色',
 // ──────────────────────────────────────────────
 s.log('\n[4] 洞 B：追加角色后旧令牌必须立刻失效')
 // 先证明这个账号现在确实读不到字典——否则后面"200"说明不了任何事
-const lazyTok = await s.tokenFor(lazyUser, PW)
+const lazyTok = await s.activatedToken(lazyUser, PW, PW2)
 const pre = await s.apiAs(lazyTok, 'GET', '/api/admin/dict/types')
 s.check('授权前目标账号读字典 → 403', pre.status === 403, 'status=' + pre.status)
 
@@ -173,7 +178,7 @@ s.check('失效形态是 401 而不是 403（否则等于没吊销）',
 // 会话被误吊销）都会被当成"预期"，恰好是它要抓的那类回归。
 s.forgetDeliberateFailures()
 
-const freshTok = await s.tokenFor(lazyUser, PW)
+const freshTok = await s.tokenFor(lazyUser, PW2)
 const relogin = await s.apiAs(freshTok, 'GET', '/api/admin/dict/types')
 s.check('重新登录后新权限可用', relogin.status === 200,
   'status=' + relogin.status + ' ' + (relogin.body?.message || ''))

@@ -134,6 +134,22 @@ pub async fn auth_middleware(
         ));
     }
 
+    // 受限令牌（首次登录待改密）：只放行改密、登出与查看自身信息。
+    //
+    // **拦截必须放在这里，而不是前端跳转。** 只让前端跳改密页的话，
+    // 令牌本身仍然能调任何接口——那等于把权限校验交给界面，
+    // 与 v0.10.0 关掉的"界面替后端承诺"是同一类错误。
+    if claims.pwd_stale {
+        let path = req.uri().path();
+        let allowed = matches!(
+            path,
+            "/api/auth/password" | "/api/auth/logout" | "/api/auth/me"
+        );
+        if !allowed {
+            return Err(error_response(StatusCode::FORBIDDEN, "请先修改初始密码"));
+        }
+    }
+
     let authenticated_user = AuthenticatedUser {
         user_id: claims.sub,
         username: claims.username.clone(),

@@ -22,6 +22,13 @@ export interface LoginRequest {
 export interface LoginResponse {
   token: string
   token_type: string
+  /**
+   * 令牌是否为"受限令牌"（用户须先改初始密码）
+   *
+   * 真正的拦截在后端 auth_middleware；前端据此跳转只是体验，
+   * 不能当作安全边界。
+   */
+  must_change_password: boolean
 }
 
 /** 注册请求 */
@@ -39,7 +46,15 @@ export interface UserInfo {
   role: 'admin' | 'user'
   roles?: string[]
   is_active: boolean
+  /** 是否必须先改初始密码（v0.11.0） */
+  must_change_password: boolean
   created_at: string
+}
+
+/** 自助修改密码请求 */
+export interface ChangePasswordRequest {
+  old_password: string
+  new_password: string
 }
 
 /** 分页请求参数 */

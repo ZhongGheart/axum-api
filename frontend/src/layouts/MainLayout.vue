@@ -154,6 +154,11 @@ function onMenuSelect(key: string) {
 
 const userMenuOptions = [
   {
+    label: '个人中心',
+    key: 'profile',
+    icon: renderIcon(UserIcon),
+  },
+  {
     label: '退出登录',
     key: 'logout',
     icon: renderIcon(LogoutIcon),
@@ -161,6 +166,10 @@ const userMenuOptions = [
 ]
 
 async function onUserMenuSelect(key: string) {
+  if (key === 'profile') {
+    router.push('/profile')
+    return
+  }
   if (key === 'logout') {
     const confirmed = await showConfirm({ content: '确定要退出登录吗？' })
     if (confirmed) {

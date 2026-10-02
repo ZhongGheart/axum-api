@@ -293,7 +293,15 @@ pub async fn create_user(
     let user = state
         .auth_service
         .user_repo
-        .create(Uuid::new_v4(), &req.username, &req.email, &password_hash)
+        .create(
+            Uuid::new_v4(),
+            &req.username,
+            &req.email,
+            &password_hash,
+            // 管理员建号：口令由管理员设定，用户本人从未参与选择，
+            // 因此强制其首次登录后改掉（v0.11.0）
+            true,
+        )
         .await?;
 
     // 角色写入 user_roles（唯一数据源），事务内完成
@@ -605,6 +613,13 @@ pub async fn reset_user_password(
         .auth_service
         .user_repo
         .update_password_hash(id, &hashed)
+        .await?;
+
+    // 重置意味着用户**本人没参与**这次口令选择，必须让其改掉
+    state
+        .auth_service
+        .user_repo
+        .set_must_change_password(id, true)
         .await?;
 
     // 口令已变化：吊销该用户全部存量会话

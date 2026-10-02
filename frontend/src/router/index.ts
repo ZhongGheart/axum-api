@@ -9,6 +9,7 @@ import type { RouteRecordRaw } from 'vue-router'
 import { getToken } from '@/utils/storage'
 import { useMenuStore } from '@/stores/menu'
 import { usePermissionsStore } from '@/stores/permissions'
+import { useUserStore } from '@/stores/user'
 import { buildRoutesFromMenus } from './menuRoutes'
 
 /** 白名单路由（无需登录 + 无侧栏） */
@@ -61,7 +62,19 @@ const routes: RouteRecordRaw[] = [
     path: '/',
     name: 'Root',
     component: () => import('@/layouts/MainLayout.vue'),
-    children: [],
+    children: [
+      // 个人中心：静态注册，**不走后端菜单**
+      //
+      // 菜单是按角色授权的，而个人中心（改密）对**所有**登录用户都该存在。
+      // 塞进菜单表的话，角色没勾这一项的用户就会连改密入口都没有——
+      // 而"改不了密码"正是管理员重置口令想解决的问题。
+      {
+        path: 'profile',
+        name: 'Profile',
+        component: () => import('@/views/profile/index.vue'),
+        meta: { title: '个人中心' },
+      },
+    ],
   },
 ]
 
@@ -133,6 +146,20 @@ router.beforeEach(async (to, _from, next) => {
 
   // 未登录拦截
   if (!token) return next('/login')
+
+  // ── 受限令牌：强制改密前不放行任何业务页面 ──────────────────
+  //
+  // 后端已经拦住了（非 /profile 类接口一律 403），这里只是不让人
+  // 先进去再撞一屏报错。用户可以自由离开个人中心去登出。
+  //
+  // **必须在这里就 return，不能只是改写 to.path**：
+  // 受限令牌除了 /profile 什么都调不了，菜单与权限码必然 403。
+  // 继续往下走去加载它们，只会换来一屏"权限不足"提示——
+  // 既没有信息量，又把真正值得看的错误淹掉。
+  const userStore = useUserStore()
+  if (userStore.mustChangePassword) {
+    return to.path === '/profile' ? next() : next('/profile')
+  }
 
   // ── 加载菜单与权限码并注册动态路由 ─────────────────────────
   // 首次进入（含刷新）时业务路由尚未注册，必须先加载菜单再重新匹配当前地址，

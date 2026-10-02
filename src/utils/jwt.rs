@@ -40,6 +40,17 @@ pub struct Claims {
     /// 即升级后首次吊销会把存量令牌一并作废，这是安全的一侧。
     #[serde(default)]
     pub iat_ms: u64,
+    /// 令牌为"受限令牌"：用户必须先改密，令牌只能调用改密/登出/`/me`
+    ///
+    /// v0.11.0 新增。**为什么不改成"登录即拒绝、逼用户先改密"**：
+    /// 那会让用户拿不到令牌，也就无法调用改密接口——
+    /// 要么死锁，要么就得再开一条无认证的改密通道（那才是真正的洞）。
+    /// 签发受限令牌既不需要第二次输密码，也不丢弃用户已有会话。
+    ///
+    /// `serde(default)` 让升级前的存量令牌解析为 `false`（即不受限），
+    /// 方向与 `iat_ms` 一致地落在**不误伤**的一侧。
+    #[serde(default)]
+    pub pwd_stale: bool,
     /// 过期时间（Unix 时间戳，JWT 标准要求 u64）
     pub exp: u64,
 }
@@ -78,6 +89,7 @@ impl JwtUtil {
         role: &str,
         roles: &[String],
         expiration_seconds: u64,
+        pwd_stale: bool,
     ) -> Result<String, jsonwebtoken::errors::Error> {
         let now = chrono::Utc::now().timestamp() as u64;
         let claims = Claims {
@@ -88,6 +100,7 @@ impl JwtUtil {
             username: username.to_string(),
             iat: now,
             iat_ms: chrono::Utc::now().timestamp_millis() as u64,
+            pwd_stale,
             exp: now + expiration_seconds,
         };
 
@@ -133,7 +146,9 @@ mod tests {
         let jwt = JwtUtil::new("test_secret_key");
         let user_id = Uuid::new_v4();
         let roles = vec!["user".to_string(), "admin".to_string()];
-        let token = jwt.sign(user_id, "alice", "admin", &roles, 3600).unwrap();
+        let token = jwt
+            .sign(user_id, "alice", "admin", &roles, 3600, false)
+            .unwrap();
         let claims = jwt.verify(&token).unwrap();
         assert_eq!(claims.sub, user_id);
         assert_eq!(claims.role, "admin");
@@ -146,8 +161,12 @@ mod tests {
     fn test_each_token_has_unique_jti() {
         let jwt = JwtUtil::new("test_secret_key");
         let user_id = Uuid::new_v4();
-        let a = jwt.sign(user_id, "alice", "user", &[], 3600).unwrap();
-        let b = jwt.sign(user_id, "alice", "user", &[], 3600).unwrap();
+        let a = jwt
+            .sign(user_id, "alice", "user", &[], 3600, false)
+            .unwrap();
+        let b = jwt
+            .sign(user_id, "alice", "user", &[], 3600, false)
+            .unwrap();
         assert_ne!(
             jwt.verify(&a).unwrap().jti,
             jwt.verify(&b).unwrap().jti,

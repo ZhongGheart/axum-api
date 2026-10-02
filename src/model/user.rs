@@ -54,6 +54,11 @@ pub struct User {
     pub password_hash: String,
     /// 是否激活
     pub is_active: bool,
+    /// 是否必须先改密才能正常使用系统
+    ///
+    /// v0.11.0 新增。管理员建号/重置口令时置 `true`，
+    /// 用户自助改密后清零。**存量用户一律 `false`**。
+    pub must_change_password: bool,
     /// 创建时间
     pub created_at: DateTime<Utc>,
     /// 更新时间
@@ -87,6 +92,26 @@ pub struct LoginResponse {
     pub token: String,
     /// 令牌类型
     pub token_type: String,
+    /// 令牌是否为"受限令牌"（用户须先改密）
+    ///
+    /// v0.11.0 新增。前端据此跳转到强制改密页，
+    /// **但真正的拦截在后端 `auth_middleware`**——
+    /// 只靠前端跳转就等于把权限校验交给界面，
+    /// 与 v0.10.0 关掉的"界面替后端承诺"是同一类错误。
+    pub must_change_password: bool,
+}
+
+/// 自助修改密码请求体
+///
+/// `deny_unknown_fields`：本端点只能改口令。多传一个 `is_active` 或 `roles`
+/// 绝不能被静默忽略——那会让调用方以为"改了"，实际什么都没发生。
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChangePasswordRequest {
+    /// 当前口令
+    pub old_password: String,
+    /// 新口令（需满足复杂度策略）
+    pub new_password: String,
 }
 
 /// 当前用户信息（对外暴露，不含密码）
@@ -104,6 +129,8 @@ pub struct UserInfo {
     pub roles: Vec<String>,
     /// 是否激活
     pub is_active: bool,
+    /// 是否必须先改密（前端据此强制跳转改密页）
+    pub must_change_password: bool,
     /// 创建时间
     pub created_at: DateTime<Utc>,
 }
@@ -120,6 +147,7 @@ impl UserInfo {
             role: Role::primary_from(&roles),
             roles,
             is_active: user.is_active,
+            must_change_password: user.must_change_password,
             created_at: user.created_at,
         }
     }

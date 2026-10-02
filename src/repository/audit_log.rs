@@ -1,6 +1,15 @@
 //! 操作日志数据访问层
 //!
-//! 只提供读取能力：写入由 `middleware::audit_log` 异步完成。
+//! 读取 + 写入。
+//!
+//! **两条写入路径的语义不同，不要混用**：
+//! - `middleware::audit_log`：`tokio::spawn` 异步写、不阻塞响应、失败只告警。
+//!   用于常规受保护路由——丢一条日志不该让用户的业务请求失败
+//! - [`AuditLogRepository::record`]：**同步 `await`**、失败即返回 `Err`。
+//!   用于登录/注册这类**安全关键**路径：审计写不进去就必须让请求失败，
+//!   否则"审计"又变成一个失败时无声的能力
+
+use uuid::Uuid;
 
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -8,6 +17,69 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use crate::error::AppError;
 use crate::model::AuditLog;
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
+
+/// 一条待写入的审计记录
+///
+/// 与 [`AuditLog`]（读出行）分开：写入侧的身份字段绝大多数可空，
+/// 尤其是 `user_id`/`username`——**登录失败时可能根本没有对应用户**。
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    /// 已认证用户 ID；未认证场景（如登录失败）为 `None`
+    pub user_id: Option<Uuid>,
+    /// 用户名；登录失败时记**尝试登录的名字**，而不是查无此人
+    pub username: Option<String>,
+    /// 动作标识
+    pub action: String,
+    /// HTTP 方法
+    pub method: String,
+    /// 请求路径
+    pub path: String,
+    /// 查询串
+    pub params: Option<String>,
+    /// 结果说明（登录审计用它写失败原因）
+    pub result: Option<String>,
+    /// HTTP 状态码
+    pub status_code: Option<i32>,
+    /// 客户端 IP
+    pub client_ip: Option<String>,
+    /// 耗时（毫秒）
+    pub duration_ms: Option<i32>,
+}
+
+impl AuditEntry {
+    /// 登录 / 注册审计的构造入口
+    ///
+    /// `action` 用**语义值**（`AUTH_LOGIN_SUCCESS` 等）而不是 `{METHOD} {path}`：
+    /// 登录成功与失败的方法、路径**完全相同**，只有 action 与身份有区分度，
+    /// 用方法+路径就无法回答"有没有人在爆破"。
+    pub fn auth(action: &str, method: &str, path: &str, status_code: i32, ip: &str) -> Self {
+        Self {
+            user_id: None,
+            username: None,
+            action: action.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            params: None,
+            result: None,
+            status_code: Some(status_code),
+            client_ip: Some(ip.to_string()),
+            duration_ms: None,
+        }
+    }
+
+    /// 附上身份信息
+    pub fn with_identity(mut self, user_id: Option<Uuid>, username: Option<String>) -> Self {
+        self.user_id = user_id;
+        self.username = username;
+        self
+    }
+
+    /// 附上结果说明
+    pub fn with_result(mut self, result: impl Into<String>) -> Self {
+        self.result = Some(result.into());
+        self
+    }
+}
 
 /// 操作日志仓储
 #[derive(Debug, Clone)]
@@ -88,6 +160,41 @@ impl AuditLogRepository {
     /// 创建新的 AuditLogRepository 实例
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// 同步写入一条审计记录
+    ///
+    /// 与中间件的 `tokio::spawn` 路径相反：**写不进去就返回 `Err`**。
+    /// 登录/注册是安全关键路径，审计静默丢失等于没审计。
+    ///
+    /// **为什么这里必须截断而不能靠数据库报错**：`username` 是登录时的
+    /// **用户输入**，列宽只有 `VARCHAR(50)`。不截断的话，一个 200 字符的
+    /// 用户名会让 INSERT 报 `value too long`，于是"口令错误"被升级成 500 ——
+    /// 审计反而成了拒绝服务的入口。失败信息也必须能落库，不能反过来打挂登录。
+    pub async fn record(&self, entry: &AuditEntry) -> Result<(), AppError> {
+        let clip = |v: &str, max: usize| -> String { v.chars().take(max).collect::<String>() };
+
+        sqlx::query(
+            r#"
+            INSERT INTO audit_logs
+                (user_id, username, action, method, path, params, result, status_code, client_ip, duration_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            "#,
+        )
+        .bind(entry.user_id)
+        .bind(entry.username.as_deref().map(|u| clip(u, 50)))
+        .bind(clip(&entry.action, 100))
+        .bind(clip(&entry.method, 10))
+        .bind(clip(&entry.path, 500))
+        .bind(entry.params.as_deref())
+        .bind(entry.result.as_deref())
+        .bind(entry.status_code)
+        .bind(entry.client_ip.as_deref().map(|ip| clip(ip, 50)))
+        .bind(entry.duration_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("写入审计日志失败: {e}")))?;
+        Ok(())
     }
 
     /// 分页查询操作日志（可按条件筛选）

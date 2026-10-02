@@ -8,8 +8,11 @@ use serde::Serialize;
 use crate::error::AppError;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::client_ip::ClientIp;
-use crate::model::{ApiResponse, LoginRequest, LoginResponse, RegisterRequest, UserInfo};
+use crate::model::{
+    ApiResponse, ChangePasswordRequest, LoginRequest, LoginResponse, RegisterRequest, UserInfo,
+};
 use crate::router::AppState;
+use crate::utils::json_extractor::ApiJson;
 
 /// POST /api/auth/register — 用户注册
 #[utoipa::path(
@@ -25,9 +28,10 @@ use crate::router::AppState;
 )]
 pub async fn register(
     State(state): State<AppState>,
+    client_ip: ClientIp,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
-    let user_info = state.auth_service.register(req).await?;
+    let user_info = state.auth_service.register(req, &client_ip.0).await?;
     Ok(Json(ApiResponse::success(user_info)))
 }
 
@@ -102,6 +106,35 @@ pub async fn logout(
         )
         .await?;
     Ok(Json(ApiResponse::success("登出成功")))
+}
+
+/// PUT /api/auth/password — 自助修改口令
+#[utoipa::path(
+    put,
+    path = "/api/auth/password",
+    tag = "认证",
+    security(("bearer_auth" = [])),
+    request_body = ChangePasswordRequest,
+    responses(
+        (status = 200, description = "改密成功，该用户全部会话已失效（需重新登录）", body = ApiResponse<String>),
+        (status = 400, description = "当前密码不正确，或新密码不满足复杂度策略"),
+    )
+)]
+pub async fn change_password(
+    State(state): State<AppState>,
+    auth_user: AuthenticatedUser,
+    ApiJson(req): ApiJson<ChangePasswordRequest>,
+) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    state
+        .auth_service
+        .change_password(
+            &state.redis_client,
+            auth_user.user_id,
+            &req.old_password,
+            &req.new_password,
+        )
+        .await?;
+    Ok(Json(ApiResponse::success("密码修改成功，请重新登录")))
 }
 
 /// 健康检查响应体

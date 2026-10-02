@@ -6,6 +6,7 @@
 
 import http from './index'
 import type {
+  ChangePasswordRequest,
   LoginRequest,
   LoginResponse,
   RegisterRequest,
@@ -36,5 +37,14 @@ export const authApi = {
   /** GET /api/auth/permissions — 当前用户的权限码（与后端 PermissionGuard 同源） */
   myPermissions() {
     return http.get<string[]>('/auth/permissions')
+  },
+
+  /**
+   * PUT /api/auth/password — 自助修改密码
+   *
+   * 改密成功后该用户**全部会话失效**（含本端），需重新登录。
+   */
+  changePassword(data: ChangePasswordRequest) {
+    return http.put<null>('/auth/password', data)
   },
 }

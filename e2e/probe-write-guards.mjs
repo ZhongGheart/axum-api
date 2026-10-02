@@ -33,6 +33,11 @@ const API = process.env.E2E_API || 'http://127.0.0.1:8080'
 const ARTIFACTS = process.env.E2E_ARTIFACTS || join(process.cwd(), 'e2e', '.artifacts')
 const PW = 'probe1234'
 
+// 管理员建出来的账号带"强制改密"标记（v0.11.0），登录拿到的是受限令牌：
+// 除改密/登出/me 外一律 403。探针要验的是**权限边界**，不是"这个账号还没改密"，
+// 因此建号后要先让该用户自助改一次密，下面 PW2 是改完之后在用的口令。
+const PW2 = 'probe5678'
+
 /**
  * 写入口登记表。
  *
@@ -423,7 +428,7 @@ for (const [entry, def] of entries) {
     const opUser = await mkUser(name() + '_op', [opRole.name])
     let tok
     try {
-      tok = await s.tokenFor(opUser.username, PW)
+      tok = await s.activatedToken(opUser.username, PW, PW2)
     } catch (e) {
       s.check(entry + ' 操作员可登录', false, String(e.message || e))
       continue

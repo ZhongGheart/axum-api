@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::{
     middleware,
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use tower_http::cors::CorsLayer;
@@ -89,6 +89,7 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         config.jwt_expiration_seconds,
         config.security.login_max_failures,
         config.security.login_failure_window_seconds,
+        audit_log_repo.clone(),
     );
     let rbac_service = RbacService::new(pool.clone());
 
@@ -138,6 +139,10 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
     let protected_routes = Router::new()
         .route("/api/auth/me", get(auth::me))
         .route("/api/auth/logout", post(auth::logout))
+        // 自助改密。挂在受保护路由内，且**刻意不放进 audit_log_middleware
+        // 之外的位置**：改密要落审计（走中间件），同时它是"受限令牌"
+        // 唯一被放行的写接口
+        .route("/api/auth/password", put(auth::change_password))
         // 当前用户的导航菜单：前端据此动态生成路由与侧栏
         .route("/api/auth/menus", get(crate::controller::menu::my_menus))
         // 当前用户的权限码：前端 v-permission 据此判定按钮级权限

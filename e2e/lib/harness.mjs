@@ -183,17 +183,46 @@ export class Session {
     )
   }
 
-  /** 真登录一次，之后所有请求都带这个真实会话的令牌 */
+  /**
+   * 真登录一次，之后所有请求都带这个真实会话的令牌
+   *
+   * `expectPath` 是登录成功后**预期**落地的路径。受限令牌（管理员建号、
+   * 待改密）会被路由守卫弹去 `/profile` 而不是首页——写死等 `"/"` 时，
+   * 那种账号会在登录表单上一直等到超时，而真正的缺陷还没开始验证。
+   *
+   * 换身份前会**先登出当前会话**：路由守卫里带着令牌访问 `/login`
+   * 会被弹回首页，于是第二次调用 `login()` 时连登录表单都等不到。
+   */
   async login(user = process.env.E2E_USER || 'admin',
-               pass = process.env.E2E_PASS || 'admin123') {
+               pass = process.env.E2E_PASS || 'admin123',
+               expectPath = '/') {
+    // 登出走真实接口，让后端有机会记录/吊销，而不是只擦 localStorage。
+    // 首次调用时页面还停在 about:blank，读 localStorage 会抛 SecurityError，
+    // 那等价于"还没登录"，不该让整个套件挂在这里
+    let existing = null
+    try {
+      existing = await this.currentToken()
+    } catch {
+      /* 还没落到应用页面上，按未登录处理 */
+    }
+    if (existing) {
+      await this.apiAs(existing, 'POST', '/api/auth/logout').catch(() => {})
+    }
+    // 必须先导航到应用上才能碰 localStorage（about:blank 会拒绝访问）。
+    // 而登出只吊销了后端会话，本地令牌还在——不清掉的话，
+    // 路由守卫会带着旧令牌把 /login 弹回首页，登录表单永远等不到
+    await this.goto('/login', 300)
+    await this.evalJs('localStorage.clear(); return true')
     await this.goto('/login')
     await waitFor(() => this.evalJs('return !!document.querySelector("input")'),
       { label: '登录表单' })
     await this.setInput('请输入用户名', user)
     await this.setInput('请输入密码', pass)
     await this.clickByText('登 录')
-    await waitFor(() => this.evalJs('return location.pathname === "/"'),
-      { timeout: 20000, label: '登录后跳转首页' })
+    await waitFor(
+      () => this.evalJs('return location.pathname === ' + JSON.stringify(expectPath)),
+      { timeout: 20000, label: '登录后跳转到 ' + expectPath },
+    )
     await sleep(900)
     return user
   }
@@ -256,6 +285,33 @@ export class Session {
       + '   + res.status + " " + JSON.stringify(j && j.message || "")) }'
       + ' return j.data.token'
     )
+  }
+
+  /**
+   * 拿一份**可正常调用业务接口**的令牌（管理员建号 → 用户自助改密 → 再登录）
+   *
+   * v0.11.0 起，管理员建号会置 `must_change_password`，登录拿到的是**受限令牌**：
+   * 后端只放行改密 / 登出 / `/me`，其余一律 403。于是"建号后直接拿令牌打接口"
+   * 这条路径整体失效——拿到的 403 说的是"请先改密"，不是被测的那个权限边界，
+   * 套件就会在跟产品无关的地方红一片。
+   *
+   * 这里走**真实产品流程**（自助改密）而不是直连数据库改标记：
+   * 既不依赖测试库实现，也顺带把"管理员建号 → 用户改密 → 拿到正常会话"
+   * 这条真实路径跑了一遍。改密会吊销该用户全部会话，所以最后必须重新登录。
+   */
+  async activatedToken(username, initialPassword, finalPassword) {
+    const stale = await this.tokenFor(username, initialPassword)
+    const changed = await this.apiAs(stale, 'PUT', '/api/auth/password', {
+      old_password: initialPassword,
+      new_password: finalPassword,
+    })
+    if (changed.status !== 200) {
+      throw new Error(
+        username + ' 激活失败（自助改密未成功）: ' + changed.status + ' '
+        + JSON.stringify(changed.body?.message || ''),
+      )
+    }
+    return this.tokenFor(username, finalPassword)
   }
 
   /** 清空 4xx/5xx 记录，用来把"预期内的 403"与意外错误区分开 */

@@ -2851,3 +2851,156 @@ v0.10.0 修的三个 bug 都不是复杂逻辑错误，**是"加了参数但没�
 另有前端侧的坑：**GET 缓存命中时返回伪造 response**（`headers` 只有
 `{'x-cache': 'HIT'}`），会吞掉 `x-export-truncated`。二进制响应已排除出缓存。
 
+
+---
+
+# v0.11.0 — 登录可审计 + 自助改密 + 口令策略
+
+## 当前目标
+
+补上"安全追溯的基本盘"。前三版修的都是授权与数据一致性，这一版修的是
+**出事之后能不能查**：`/api/auth/login` 与 `/api/auth/register` 在 `public_routes` 里，
+**没有挂 `audit_log_middleware`**，因此登录成功、登录失败、注册全部**不进 `audit_logs`**。
+失败只进 Redis 计数器，而计数器**带 TTL 会过期**——事后追不出"谁在何时从哪尝试登录"。
+
+同时给用户一条不依赖管理员的改密路径：现在改密只能靠管理员 `reset-password`，
+用户被管理员重置才知道自己该改密码。
+
+## 当前计划
+
+| 步骤 | 内容 | 状态 |
+|---|---|---|
+| 0 | 记录目标、关键决定与起始 git 状态 | ✅ 已完成 |
+| 1 | 登录/注册落审计（成功 + 失败 + client_ip） | ✅ 已完成 |
+| 2 | 自助改密端点 + 改密后吊销存量会话 | ✅ 已完成 |
+| 3 | 口令策略：复杂度下限 | ✅ 已完成 |
+| 4 | 首次登录强制改密（受限令牌，不叠加第二次强制登出） | ✅ 已完成 |
+| 5 | 前端个人中心 + 强制改密页接线 | ✅ 已完成 |
+| 6 | 契约测试 / 集成测试 / e2e / 缺陷注入 | ✅ 已完成 |
+| 7 | 质量门禁 | ✅ 全绿 |
+| 8 | 文档：CHANGELOG / README / 版本号 | ✅ 已完成（0.10.0 → 0.11.0） |
+| 9 | 提交（**不推送**） / tag / Release | 提交 ✅；tag 与 Release 待用户指令 |
+
+### 门禁结论（本轮实跑）
+
+| 项 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | ✅（本轮补跑，发现上一会话遗留的未格式化差异） |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | ✅ |
+| `cargo test --locked --lib` | ✅ 61 passed |
+| `cargo test --locked --test api_integration -- --ignored --test-threads=1` | ✅ **102 passed**（fresh DB） |
+| 前端 typecheck / lint / test / build | ✅ 93 passed；lint 仅剩 `env.d.ts` 既有 warning |
+| `node e2e/run.mjs` | ✅ **5/5 套件**（新增 v011，28 条断言） |
+| `node e2e/probe-write-guards.mjs` | ✅ **41/41** |
+
+### 缺陷注入（三条全部承重）
+
+| 注入 | 转红的测试 |
+|---|---|
+| 摘除 `auth_middleware` 的 `pwd_stale` 闸门 | `an_admin_created_user_is_confined_to_changing_password` |
+| `AuthService::audit` 变成空操作 | 5 条审计用例 |
+| 摘掉 `ChangePasswordRequest` 的 `deny_unknown_fields` | `changing_password_cannot_also_grant_itself_roles` |
+
+### 本轮修掉的三个真实缺陷（都不是测试写错）
+
+1. **改密后前端仍调 `/auth/logout`**，必然 401。
+   改密成功时后端已吊销全部会话，那次往返注定失败，
+   外加控制台一条 `Failed to load resource`。拆出 `clearLocalSession()`（不发请求）。
+2. **受限用户进个人中心刷 4 个「权限不足」**。
+   路由守卫明知菜单必然 403 仍去加载菜单与权限码。改为在守卫里直接 return。
+3. **`password.ts` 用 `[^\x00-\x7F]` 触发 eslint `no-control-regex`**。
+   换成语义完全一致的 `[^\p{ASCII}]`（已用 node 逐样例比对等价）。
+
+### ⚠️ 本轮踩到的坑：集成测试必须带 `--test-threads=1`
+
+漏掉它时并行跑出 2–3 条红（`role_list_pages_over_the_same_set_as_one_big_page` 等），
+根因是**共享测试库**下别的用例在两次读之间插/删角色，
+断言比较的是两次不一致的快照。加上 `--test-threads=1` 后 102/102 全绿。
+README 与本文件早已写明这条规矩，是本轮自己漏了——**不是新缺陷**。
+
+### ⚠️ e2e 侧同样需要"激活"夹具（上一会话只改了集成测试侧）
+
+v0.11.0 让管理员建号带上"强制改密"，于是"建号后直接拿令牌打接口"整条路径失效。
+集成测试侧上一会话已加 `activated_token`，**e2e 侧漏了**，
+表现为 `role-assignment-guard` 与探针在一堆与被测无关的地方红。
+现在 harness 加了 `s.activatedToken(user, 初始口令, 新口令)`：
+走**真实产品流程**（自助改密 → 重新登录）拿正常令牌，
+不直连数据库改标记，也不依赖测试库实现。
+
+### 顺手量到的基线（非 v0.11.0 引入，仅备查）
+
+e2e 期间后端日志报 `UPDATE users SET password_hash` 耗时 3.5s，
+干净环境复测并不复现：
+
+| 操作 | 耗时（**debug 构建**） |
+|---|---|
+| 登录（1 次 Argon2 校验） | 0.83s |
+| 改密（校验 + 哈希 + UPDATE + 吊销） | 1.65s |
+
+3.5s 那次是 e2e 连跑时的锁争用，不是基线缺陷。
+口令哈希用的是 `Argon2::default()`（OWASP 推荐档：19 MiB / t=2 / p=1），
+**没有改动**——调它属于安全参数取舍，不该顺手改。
+上面 0.8s 是未优化的 debug 构建开销，release 下会明显更低。
+若日后要优化登录延迟，先量 release 构建的基线，别拿 debug 数字下结论。
+
+### 另一个构造性 flaky：固定 sleep
+
+v011 改密后用固定 `sleep(2500)` 等跳转。单跑够用，全量跑时机器更满就不够——
+截图里按钮还在转圈就断言了。已改为 `waitFor(location.pathname === '/login')`。
+**固定 sleep 等状态是 e2e 里最常见的假红来源**，新套件一律用 `waitFor`。
+
+## 起始 git 状态
+
+- 分支 `master`，与 `origin/master` 同步
+- HEAD = `a0ac25ce feat(v0.10.0): 停止说谎……`
+- 工作区：仅本文档改动
+- 版本号（起始）：Rust / frontend 均 `0.10.0`
+- 版本号（收尾）：Rust / frontend 均 `0.11.0`；`v0.9.0` 已发布，`v0.10.0` 与 `v0.11.0` 均**已提交未推送**
+
+## 关键决定（动手前先定，避免中途反复）
+
+1. **登录审计不能靠挂中间件**。`audit_log_middleware` 注册在认证中间件之内，
+   依赖 `AuthenticatedUser` 扩展；而登录请求**本来就没有已认证用户**，
+   失败时更没有。所以登录/注册审计必须在 handler / service 里**显式写入**。
+   反过来说，中间件那条路径对登录是**结构性不适用**，不是"忘了挂"。
+
+2. **登录审计的 `action` 用语义值，不用 `"{METHOD} {path}"`**。
+   登录失败要和登录成功能被区分（否则事后无法回答"有没有人在爆破"），
+   因此约定 `AUTH_LOGIN_SUCCESS` / `AUTH_LOGIN_FAILURE` / `AUTH_REGISTER`，
+   并在 `result` 列写明失败原因（账号不存在 / 口令不符 / 账号停用 / 已锁定）。
+   注意这**偏离**了中间件的 `{METHOD} {path}` 格式，是有意的——
+   登录的"方法+路径"三行都一样，只有结果与身份有区分度。
+
+3. **登录审计必须同步 `await` 写入，不能 `tokio::spawn`**。
+   中间件那样做是为了不拖慢响应；登录是低频且**安全关键**路径，
+   写失败必须让 `login` 报错而不是静默丢失——否则"审计"又变成一个
+   "失败时无声"的能力。代价是登录多一次 INSERT 往返，接受。
+
+4. **口令策略只在"设置口令时"生效，登录时不校验**。
+   否则把复杂度下限一抬，**存量弱口令用户当场被锁在门外**。
+   长度下限 6 → 8，且要求至少 2 类字符（大写/小写/数字/符号）。
+   选的门槛必须让 `admin123` 通过——它是 README 与 e2e 的默认账号，
+   卡住它等于卡住整个测试套件和首次部署。
+
+5. **首次强制改密用"受限令牌"，不叠加第二次强制登出**。
+   handoff 明确警告过：`iat_ms` 升级已经让存量令牌作废过一次。
+   再来一次"登录即踢下线"是第二次同类冲击。做法：
+   `users.must_change_password` 落库；登录时若为真，令牌带 `pwd_stale` claim，
+   `auth_middleware` **只放行改密/登出/`/me`**，其余一律 403 并提示改密。
+   用户改完密拿到正常令牌，全程不丢工作、也不需要重新输密码。
+
+6. **`must_change_password` 的默认值必须是 `FALSE`**。
+   迁移给存量用户补列时默认 false，**存量用户完全不受影响**——
+   这是"不叠加第二次强制登出"的关键。只有管理员**新建/重置**的用户才置 true。
+
+7. **自助改密必须验旧口令，且新口令不能与旧口令相同**。
+   只验新口令复杂度是不够的：拿到一个劫持来的令牌就能把密码永久改掉。
+   "新口令与旧口令相同"也要拒绝，否则改密是空操作却给了"已改密"的假象。
+
+8. **前端路由由后端菜单驱动，个人中心不能走菜单**。
+   `buildRoutesFromMenus` 只注册 `menus.permission` 里有的页面；
+   个人中心是**所有登录用户**都该有的页面，不该塞进按角色授权的菜单表
+   （那会让"角色没勾这个菜单"的用户直接没有个人中心）。
+   做法：在 `router/index.ts` 的 `MainLayout` children 里**静态注册**，
+   与 `/login` `/register` 同样的白名单式处理。
+
