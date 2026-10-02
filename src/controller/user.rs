@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
@@ -24,10 +25,21 @@ use crate::router::AppState;
 use crate::utils::validation;
 
 /// 用户列表查询参数
+///
+/// `deny_unknown_fields` 是本版的核心决定之一：前端多传一个字段，
+/// 此前会被 `serde` **静默丢弃**——筛选栏摆在那儿、参数也确实发出去了，
+/// 后端却当它不存在，于是界面表现为"搜索没反应"。
+/// 现在多传直接 400 并指名那个字段，让错误**响着发生**。
+///
+/// 注意：`deny_unknown_fields` 与 `serde(flatten)` 不兼容，
+/// 所以本结构体显式列出全部字段，不能靠 flatten 复用 `PaginationParams`。
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UserListParams {
     pub page: Option<i64>,
     pub page_size: Option<i64>,
+    /// 关键字，同时匹配用户名与邮箱；空串等同不过滤
+    pub keyword: Option<String>,
 }
 
 /// 创建/更新用户请求
@@ -173,14 +185,17 @@ fn same_role_set(a: &[String], b: &[String]) -> bool {
     params(
         ("page" = Option<i64>, Query, description = "页码（从 1 开始）"),
         ("page_size" = Option<i64>, Query, description = "每页条数（1-200）"),
+        ("keyword" = Option<String>, Query, description = "关键字，同时匹配用户名与邮箱"),
     ),
     responses((status = 200, description = "用户列表（含角色）", body = ApiResponse<UserListResponse>))
 )]
 pub async fn list_users(
     State(state): State<AppState>,
     _perm: PermUserList,
-    Query(params): Query<UserListParams>,
+    params: Result<Query<UserListParams>, QueryRejection>,
 ) -> Result<Json<ApiResponse<UserListResponse>>, AppError> {
+    // 显式接住拒绝，错误才走统一响应格式（见 `From<QueryRejection>`）
+    let Query(params) = params?;
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(10);
     validation::validate_page(page, page_size)?;
@@ -188,7 +203,7 @@ pub async fn list_users(
     let (users, total) = state
         .auth_service
         .user_repo
-        .list_all(page, page_size)
+        .list_filtered(page, page_size, params.keyword.as_deref())
         .await?;
 
     let ids: Vec<Uuid> = users.iter().map(|u| u.id).collect();

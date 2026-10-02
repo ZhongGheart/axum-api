@@ -1,6 +1,7 @@
 //! 菜单管理控制器
 
 use axum::{
+    extract::rejection::QueryRejection,
     extract::{Path, Query, State},
     Json,
 };
@@ -29,8 +30,10 @@ use crate::utils::validation;
 pub async fn list_menus(
     State(state): State<AppState>,
     _perm: PermMenuList,
-    Query(params): Query<MenuQuery>,
+    params: Result<Query<MenuQuery>, QueryRejection>,
 ) -> Result<Json<ApiResponse<Vec<MenuNode>>>, AppError> {
+    // 显式接住拒绝，错误才走统一响应格式（见 `From<QueryRejection>`）
+    let Query(params) = params?;
     let repo = &state.menu_repo;
     let tree = if let Some(role_id) = params.role_id {
         validation::validate_uuid(&role_id.to_string())?;
@@ -43,6 +46,7 @@ pub async fn list_menus(
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MenuQuery {
     pub role_id: Option<String>,
 }

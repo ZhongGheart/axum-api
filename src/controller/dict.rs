@@ -129,13 +129,16 @@ pub async fn get_items_by_code(
 pub async fn list_items(
     State(state): State<AppState>,
     _perm: PermDictList,
-    axum::extract::Query(params): axum::extract::Query<DictItemQuery>,
+    params: Result<axum::extract::Query<DictItemQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<ApiResponse<Vec<DictItem>>>, AppError> {
+    // 显式接住拒绝，错误才走统一响应格式（见 `From<QueryRejection>`）
+    let axum::extract::Query(params) = params?;
     let items = state.dict_repo.list_items(params.dict_type_id).await?;
     Ok(Json(ApiResponse::success(items)))
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DictItemQuery {
     pub dict_type_id: Uuid,
 }

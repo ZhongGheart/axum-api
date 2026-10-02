@@ -101,26 +101,81 @@ impl UserRepository {
     }
 
     /// 查询所有用户（分页）
-    pub async fn list_all(&self, page: i64, page_size: i64) -> Result<(Vec<User>, i64), AppError> {
+    /// 用户列表（可按关键字过滤）
+    ///
+    /// `keyword` 为 `None` 时行为与原先的 `list_all` 完全一致——不拼任何
+    /// `WHERE` 片段，而不是拼一个恒真的条件：后者会让"有没有过滤"这件事
+    /// 从 SQL 文本上就看不出来，读代码的人得反推。
+    ///
+    /// 关键字同时匹配 `username` 与 `email`。**匹配前必须转义**（见
+    /// [`crate::utils::validation::escape_like_pattern`]），否则搜 `100%`
+    /// 会因 `%` 是通配符而返回全表——一个"筛选"比不筛选还糟。
+    pub async fn list_filtered(
+        &self,
+        page: i64,
+        page_size: i64,
+        keyword: Option<&str>,
+    ) -> Result<(Vec<User>, i64), AppError> {
         let offset = (page - 1) * page_size;
-        let users = sqlx::query_as::<_, User>(
-            r#"
-            SELECT id, username, email, password_hash, is_active, created_at, updated_at
-            FROM users
-            ORDER BY created_at DESC
-            LIMIT $1 OFFSET $2
-            "#,
-        )
-        .bind(page_size)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
+        // 空字符串/纯空白视为"不过滤"：搜索框清空后前端会发空串，
+        // 若当成关键字就会筛出零条，看起来像"搜不到人"
+        let keyword = keyword.map(str::trim).filter(|k| !k.is_empty());
+
+        let users = match keyword {
+            None => {
+                sqlx::query_as::<_, User>(
+                    r#"
+                    SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                    FROM users
+                    ORDER BY created_at DESC
+                    LIMIT $1 OFFSET $2
+                    "#,
+                )
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+            Some(k) => {
+                let pattern = format!("%{}%", crate::utils::validation::escape_like_pattern(k));
+                sqlx::query_as::<_, User>(
+                    r#"
+                    SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                    FROM users
+                    WHERE username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\'
+                    ORDER BY created_at DESC
+                    LIMIT $2 OFFSET $3
+                    "#,
+                )
+                .bind(&pattern)
+                .bind(page_size)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
         .map_err(|e| AppError::InternalServerError(format!("查询用户列表失败: {e}")))?;
 
-        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| AppError::InternalServerError(format!("查询用户总数失败: {e}")))?;
+        // 计数必须用**同一个** WHERE，否则会出现"列表 3 条但 total 500"
+        // 的分页错乱——那比筛选失效更容易让人误判数据规模
+        let total: (i64,) = match keyword {
+            None => {
+                sqlx::query_as("SELECT COUNT(*) FROM users")
+                    .fetch_one(&self.pool)
+                    .await
+            }
+            Some(k) => {
+                let pattern = format!("%{}%", crate::utils::validation::escape_like_pattern(k));
+                sqlx::query_as(
+                    r#"SELECT COUNT(*) FROM users
+                       WHERE username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\'"#,
+                )
+                .bind(&pattern)
+                .fetch_one(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| AppError::InternalServerError(format!("查询用户总数失败: {e}")))?;
 
         Ok((users, total.0))
     }

@@ -25,6 +25,14 @@
       class="role-table"
     />
 
+    <n-pagination
+      v-model:page="page"
+      :page-count="pageCount"
+      :page-size="pageSize"
+      class="role-pager"
+      @update:page="fetchRoles"
+    />
+
     <!-- 新建/编辑角色 -->
     <n-modal
       v-model:show="showModal"
@@ -107,6 +115,9 @@ import PermissionButton from '@/components/common/PermissionButton.vue'
 const loading = ref(false)
 const submitting = ref(false)
 const roleList = ref<RoleItem[]>([])
+const page = ref(1)
+const pageSize = ref(10)
+const pageCount = ref(1)
 
 const showModal = ref(false)
 const isEditing = ref(false)
@@ -207,8 +218,9 @@ const columns: DataTableColumn[] = [
 async function fetchRoles() {
   loading.value = true
   try {
-    const res = await roleApi.list()
-    roleList.value = res as unknown as RoleItem[]
+    const res = await roleApi.list({ page: page.value, page_size: pageSize.value })
+    roleList.value = res.items
+    pageCount.value = res.total_pages
   } catch {
     // handled by interceptor
   } finally {
@@ -320,6 +332,8 @@ async function handleDelete(role: RoleItem) {
   try {
     await roleApi.delete(role.id)
     showSuccess('角色已删除')
+    // 删掉当页最后一条时留在空页上会让人以为角色没删掉，回退一页
+    if (roleList.value.length === 1 && page.value > 1) page.value -= 1
     fetchRoles()
   } catch {
     // handled by interceptor
@@ -334,6 +348,12 @@ onMounted(() => {
 <style scoped>
 .role-table {
   margin-top: 16px;
+}
+
+.role-pager {
+  margin-top: 12px;
+  display: flex;
+  justify-content: flex-end;
 }
 
 .grant-hint {

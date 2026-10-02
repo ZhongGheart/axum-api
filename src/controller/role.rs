@@ -2,7 +2,10 @@
 //!
 //! 提供角色列表查询、为用户分配/移除角色等接口。
 
-use axum::{extract::State, Json};
+use axum::{
+    extract::{Query, State},
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -13,6 +16,7 @@ use crate::middleware::permission::{
 };
 use crate::model::{normalize_role_name, ApiResponse, BUILTIN_ROLES};
 use crate::router::AppState;
+use crate::utils::pagination::PaginatedResponse;
 
 /// `roles.name` 的唯一约束名（`name VARCHAR(50) NOT NULL UNIQUE`）
 const ROLES_NAME_KEY: &str = "roles_name_key";
@@ -25,6 +29,16 @@ pub struct RoleItem {
     pub description: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub user_count: i64,
+}
+
+/// GET /api/admin/roles 的查询参数
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[serde(deny_unknown_fields)]
+pub struct RoleListParams {
+    /// 页码（从 1 开始）
+    pub page: Option<i64>,
+    /// 每页条数（1-200）
+    pub page_size: Option<i64>,
 }
 
 /// 分配角色请求
@@ -41,19 +55,31 @@ pub struct AssignRoleRequest {
     pub role_name: String,
 }
 
-/// GET /api/admin/roles — 角色列表（含用户数）
+/// GET /api/admin/roles — 角色列表（含用户数，分页）
 #[utoipa::path(
     get,
     path = "/api/admin/roles",
     tag = "角色管理",
     security(("bearer_auth" = [])),
-    responses((status = 200, description = "角色列表（含关联用户数）", body = ApiResponse<Vec<RoleItem>>))
+    params(RoleListParams),
+    responses((status = 200, description = "角色列表（含关联用户数）", body = ApiResponse<PaginatedResponse<RoleItem>>))
 )]
 pub async fn list_roles(
     State(state): State<AppState>,
     _perm: PermRoleList,
-) -> Result<Json<ApiResponse<Vec<RoleItem>>>, AppError> {
-    let rows = state.auth_service.role_repo.list_all().await?;
+    params: Result<Query<RoleListParams>, axum::extract::rejection::QueryRejection>,
+) -> Result<Json<ApiResponse<PaginatedResponse<RoleItem>>>, AppError> {
+    // 显式接住拒绝，错误才走统一响应格式（见 `From<QueryRejection>`）
+    let Query(params) = params?;
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(10);
+    crate::utils::validation::validate_page(page, page_size)?;
+
+    let (rows, total) = state
+        .auth_service
+        .role_repo
+        .list_paginated(page, page_size)
+        .await?;
     let items: Vec<RoleItem> = rows
         .into_iter()
         .map(|(role, user_count)| RoleItem {
@@ -64,7 +90,10 @@ pub async fn list_roles(
             user_count,
         })
         .collect();
-    Ok(Json(ApiResponse::success(items)))
+
+    Ok(Json(ApiResponse::success(PaginatedResponse::new(
+        items, total, page, page_size,
+    ))))
 }
 
 /// GET /api/admin/users/:id/roles — 获取用户已分配的角色

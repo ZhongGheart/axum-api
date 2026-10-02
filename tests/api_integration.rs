@@ -1749,12 +1749,18 @@ async fn updating_a_role_returns_the_real_row() {
         "该角色有 1 个用户，回读不该编造 user_count=0: {updated}"
     );
 
-    // created_at 必须是数据库里的原值，而不是"刚刚"
-    let (status, list) = send(&app, request("GET", "/api/admin/roles", Some(&token), None)).await;
+    // created_at 必须是数据库里的原值，而不是"刚刚"。
+    // 必须显式要 page_size=200：列表默认每页 10 条，而排序是 created_at ASC，
+    // 刚建的角色排在末尾，只取首页会找不到它——那是分页语义，不是 bug。
+    let (status, list) = send(
+        &app,
+        request("GET", "/api/admin/roles?page_size=200", Some(&token), None),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{list}");
-    let from_list = list["data"]
+    let from_list = list["data"]["items"]
         .as_array()
-        .expect("data 应为数组")
+        .expect("data.items 应为数组（v0.10.0 起角色列表是分页对象）")
         .iter()
         .find(|r| r["id"].as_str() == Some(&role_id.to_string()))
         .expect("角色列表里应找得到刚更新的角色");
@@ -4589,4 +4595,936 @@ async fn deleting_a_role_that_carries_no_permission_is_allowed() {
     let (status, body) = delete_role(&app, &tok, empty_id).await;
     assert_eq!(status, StatusCode::OK, "无码角色不应被天花板拦下: {body}");
     assert!(!role_still_exists(empty_id).await, "角色应已被删除");
+}
+
+// ──────────────────────────────────────────────
+// v0.10.0：把"假筛选"变成真筛选
+//
+// 判据一律落在**返回条数**上，不是"参数发出去了"。
+// 这一族问题的特点是**从不报错**：参数被前端老老实实发出去，
+// 后端安静地当它不存在，界面表现为"搜索没反应"。
+// ──────────────────────────────────────────────
+
+/// 建一个用户名可控的账号并清理
+async fn mkuser(app: &Router, token: &str, username: &str) -> uuid::Uuid {
+    let (status, body) = create_user_via_api(app, token, username, "user").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "创建测试用户 {username} 失败: {body}"
+    );
+    body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("响应里没有可解析的用户 id: {body}"))
+}
+
+async fn query_users(app: &Router, token: &str, query: &str) -> (StatusCode, Value) {
+    send(
+        app,
+        request(
+            "GET",
+            &format!("/api/admin/users?{query}"),
+            Some(token),
+            None,
+        ),
+    )
+    .await
+}
+
+/// 用户列表按关键字过滤：命中用户名，且每一行都真的含这个关键字
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn user_list_filters_by_username() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let needle = unique("kwuser");
+    let uid = mkuser(&app, &token, &needle).await;
+
+    let (status, body) = query_users(&app, &token, &format!("keyword={needle}")).await;
+    assert_eq!(status, StatusCode::OK, "按关键字查询失败: {body}");
+
+    let items = body["data"]["items"].as_array().expect("items 应为数组");
+    assert!(
+        !items.is_empty(),
+        "命中关键字却返回空列表: keyword={needle}"
+    );
+    for item in items {
+        let name = item["username"].as_str().unwrap_or_default();
+        let email = item["email"].as_str().unwrap_or_default();
+        assert!(
+            name.contains(&needle) || email.contains(&needle),
+            "返回了不匹配的行: {name} / {email}"
+        );
+    }
+    // total 必须同步收敛，否则分页错乱（列表 1 条但 total 500）
+    assert_eq!(
+        body["data"]["total"].as_i64(),
+        Some(items.len() as i64),
+        "total 与 items 长度不一致: {body}"
+    );
+
+    delete_user_via_api(&app, &token, uid).await;
+}
+
+/// 关键字也匹配邮箱——搜索框的语义是"找人"，人可能只记得邮箱
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn user_list_filters_by_email() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let uid = mkuser(&app, &token, &unique("kwe")).await;
+    let needle = unique("mailonly");
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{uid}"),
+            Some(&token),
+            Some(json!({
+                "username": format!("kwe_{}", &needle[..8]),
+                "email": format!("{needle}@example.com"),
+                "roles": ["user"],
+                "is_active": true,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "改邮箱失败: {body}");
+
+    // 关键字只出现在邮箱里，用户名里没有
+    let (status, body) = query_users(&app, &token, &format!("keyword={needle}")).await;
+    assert_eq!(status, StatusCode::OK, "按邮箱关键字查询失败: {body}");
+    let items = body["data"]["items"].as_array().expect("items 应为数组");
+    assert_eq!(items.len(), 1, "按邮箱关键字应恰好命中 1 条: {body}");
+    assert!(
+        items[0]["email"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&needle),
+        "命中的应是那个邮箱: {body}"
+    );
+
+    delete_user_via_api(&app, &token, uid).await;
+}
+
+/// LIKE 通配符必须被转义：搜 `100%` 若命中全表，这个筛选比不筛选更糟
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn user_list_treats_percent_as_literal_text() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (_, all) = query_users(&app, &token, "page_size=200").await;
+    let everyone = all["data"]["total"].as_i64().unwrap_or(0);
+    assert!(everyone > 0, "测试前提：库里应有账号");
+
+    // 先造一个邮箱里真的含 `%` 的账号，否则"返回 0 条"也能骗过断言。
+    // 注意：用户名走 `validate_username`，不允许 `%`，所以只能用邮箱——
+    // 而这恰好说明转义必须在**两边**都做，不能只防用户名那列。
+    let name = unique("pct");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&token),
+            Some(json!({
+                "username": name,
+                "email": format!("{name}%40x@example.com"),
+                "password": "user1234",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "造含 % 的邮箱失败: {body}");
+    let uid = body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("响应里没有可解析的用户 id: {body}"));
+
+    // 只搜一个纯 `%`（URL 编码 %25）
+    let (status, body) = query_users(&app, &token, "keyword=%25&page_size=200").await;
+    assert_eq!(status, StatusCode::OK, "查询失败: {body}");
+    let items = body["data"]["items"].as_array().expect("items 应为数组");
+
+    // 断言**性质**而不是"恰好 1 条"：每一条返回结果都必须真的含字面 `%`。
+    // 若 `%` 被当成通配符，这里会混进大量不含 `%` 的账号而立刻被抓到。
+    //
+    // 为什么不写成 `total == 1`：测试库是长期存在的共享库，任何一次
+    // **失败的运行**都会因 panic 跳过清理而留下脏数据，之后 `total == 1`
+    // 就永远红了——一个只会因环境脏而失败的断言，比没有断言更坏。
+    assert!(
+        !items.is_empty(),
+        "刚造的那个含 `%` 的账号应能被搜到: {body}"
+    );
+    for item in items {
+        let name = item["username"].as_str().unwrap_or_default();
+        let email = item["email"].as_str().unwrap_or_default();
+        assert!(
+            name.contains('%') || email.contains('%'),
+            "搜 `%` 返回了不含字面 `%` 的行: {name} / {email}——通配符未转义"
+        );
+    }
+    assert!(
+        (items.len() as i64) < everyone,
+        "搜单个 `%` 竟返回 {}/{} 条",
+        items.len(),
+        everyone
+    );
+
+    delete_user_via_api(&app, &token, uid).await;
+}
+
+/// 下划线同样是 LIKE 通配符：`zz_` 未转义会连 `zzX` 一起命中
+///
+/// 造两个账号：`zz_<token>` 与 `zzX<token>`。搜 `zz_<token>`，
+/// 转义正确时只命中前者（1 条），未转义时两个都中（2 条）。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn user_list_treats_underscore_as_literal_text() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let token_part = unique("u")[3..].to_string();
+    let with_us = format!("zz_{token_part}");
+    let with_any = format!("zzX{token_part}");
+    let uid_us = mkuser(&app, &token, &with_us).await;
+    let uid_any = mkuser(&app, &token, &with_any).await;
+
+    let (status, body) = query_users(&app, &token, &format!("keyword={with_us}")).await;
+    assert_eq!(status, StatusCode::OK, "查询失败: {body}");
+    assert_eq!(
+        body["data"]["total"].as_i64(),
+        Some(1),
+        "搜 {with_us} 应只命中 {with_us}，不该顺带命中 {with_any}——`_` 被当成了通配符"
+    );
+
+    delete_user_via_api(&app, &token, uid_us).await;
+    delete_user_via_api(&app, &token, uid_any).await;
+}
+
+/// 空关键字等同不过滤：搜索框清空后前端会发空串，
+/// 若当成关键字就会筛出零条，看起来像"搜不到人"
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_empty_keyword_means_no_filtering() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (_, base) = query_users(&app, &token, "page_size=200").await;
+    let (_, blank) = query_users(&app, &token, "keyword=&page_size=200").await;
+    assert_eq!(
+        base["data"]["total"], blank["data"]["total"],
+        "空关键字与不过滤的 total 应一致"
+    );
+
+    let (_, ws) = query_users(&app, &token, "keyword=%20%20&page_size=200").await;
+    assert_eq!(
+        base["data"]["total"], ws["data"]["total"],
+        "纯空白关键字应等同不过滤"
+    );
+}
+
+/// 查不到时返回空列表而不是全部——反向判据，防止"过滤条件写反了"
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_keyword_that_matches_nobody_returns_an_empty_list() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (status, body) = query_users(&app, &token, "keyword=zzz_no_such_user_zzz").await;
+    assert_eq!(status, StatusCode::OK, "查询失败: {body}");
+    assert_eq!(
+        body["data"]["total"].as_i64(),
+        Some(0),
+        "不存在的关键字应返回 0 条: {body}"
+    );
+    assert!(
+        body["data"]["items"].as_array().unwrap().is_empty(),
+        "0 条时 items 应为空数组"
+    );
+}
+
+/// 核心契约：未知查询参数必须 400，而不是被静默丢弃
+///
+/// 这是本版真正要防的复发路径：只要 `serde` 还默认忽略未知字段，
+/// 将来新增任何筛选条件都会再次悄无声息地失效。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_unknown_user_list_filter_is_rejected_loudly() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (status, body) = query_users(&app, &token, "departmnt=rd").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "拼错的筛选条件应报 400 而不是被静默忽略: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("departmnt"),
+        "报错信息应指名那个字段: {body}"
+    );
+}
+
+// ──────────────────────────────────────────────
+// v0.10.0：审计日志筛选 + 导出截断明示
+// ──────────────────────────────────────────────
+
+async fn query_logs(app: &Router, token: &str, query: &str) -> (StatusCode, Value) {
+    send(
+        app,
+        request(
+            "GET",
+            &format!("/api/admin/audit-logs?{query}"),
+            Some(token),
+            None,
+        ),
+    )
+    .await
+}
+
+/// 轮询直到"目标日志出现"为止
+///
+/// 审计中间件是 `tokio::spawn` 异步落库的（见 `middleware::audit_log`），
+/// 所以"刚发完写请求就查"存在竞态：查询完全可能跑在 INSERT 之前。
+/// 这里沿用 `admin_requests_are_written_to_audit_log` 的重试写法，
+/// 不让这些测试靠运气通过。
+///
+/// `want` 必须指向**本次测试自己造的那条日志**（例如含特定 role_id 的 action），
+/// 不能只判 `items` 非空——查询自身的 GET 也会被记一条日志，
+/// 用"非空"当判据会自证成功。
+async fn wait_for_logs(
+    app: &Router,
+    token: &str,
+    query: &str,
+    want: impl Fn(&Value) -> bool,
+) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..20 {
+        let (status, body) = query_logs(app, token, query).await;
+        assert_eq!(status, StatusCode::OK, "查询失败: {body}");
+        if want(&body) {
+            return body;
+        }
+        last = body;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("等待审计日志超时（约 2s）: query={query}, last={last}");
+}
+
+/// 用真实写操作造出可辨认的日志，再按 username 筛出来
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn audit_logs_filter_by_username() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    // 关键在于造一条**别的用户**的日志。全库日志都出自 admin 时，
+    // "筛选=全量"和"筛选生效"观察上完全一样，测试就成了自证。
+    let other = unique("auditother");
+    let other_id = mkuser(&app, &token, &other).await;
+    let other_token = login_token(&app, &other, "user1234").await;
+
+    // 普通用户打管理接口 → 403。审计中间件在认证之内，403 同样留痕。
+    let (status, _) = send(
+        &app,
+        request("GET", "/api/admin/users", Some(&other_token), None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "普通用户本该被权限守卫拦下；变了说明造日志的前提不成立"
+    );
+
+    let body = wait_for_logs(
+        &app,
+        &token,
+        &format!("username={other}&page_size=50"),
+        |body| {
+            !body["data"]["items"]
+                .as_array()
+                .is_none_or(|items| items.is_empty())
+        },
+    )
+    .await;
+    let items = body["data"]["items"].as_array().expect("items 应为数组");
+    assert!(!items.is_empty(), "按该用户名筛应能查到它自己的日志");
+    for item in items {
+        assert_eq!(
+            item["username"].as_str(),
+            Some(other.as_str()),
+            "按 username={other} 筛选却返回了别人的日志: {item}"
+        );
+    }
+
+    // 反向判据：同一条日志在 username=admin 下必须不出现
+    let (_, admin_view) = query_logs(&app, &token, "username=admin&page_size=200").await;
+    let leaked = admin_view["data"]["items"]
+        .as_array()
+        .expect("items 应为数组")
+        .iter()
+        .any(|it| it["username"].as_str() == Some(other.as_str()));
+    assert!(
+        !leaked,
+        "username=admin 的结果里混进了 {other} 的日志，说明 username 筛选没生效"
+    );
+
+    delete_user_via_api(&app, &token, other_id).await;
+}
+
+/// 按状态码精确筛选：只查 404 应不含 200 的记录
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn audit_logs_filter_by_status_code() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    // 404：删除一个不存在的用户。
+    // 注意不能用 `GET /api/admin/users/{id}`——那条路由只注册了 PUT/DELETE，
+    // GET 会得到 405 Method Not Allowed，测的就不是状态码筛选了。
+    let (status, _) = send(
+        &app,
+        request(
+            "DELETE",
+            "/api/admin/users/00000000-0000-4000-8000-000000000009",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "造 404 日志失败，后续断言会失去意义"
+    );
+
+    let body = wait_for_logs(&app, &token, "status_code=404&page_size=50", |body| {
+        !body["data"]["items"]
+            .as_array()
+            .is_none_or(|items| items.is_empty())
+    })
+    .await;
+    let items = body["data"]["items"].as_array().expect("items 应为数组");
+    for item in items {
+        assert_eq!(
+            item["status_code"].as_i64(),
+            Some(404),
+            "按 status_code=404 筛选却返回了其它状态码的日志: {item}"
+        );
+    }
+}
+
+/// 按 action 模糊筛选：只含某段路径的日志才该命中
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn audit_logs_filter_by_action() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let role_name = unique("actf");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/roles/{role_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "造日志失败: {body}");
+
+    // role_id 是本次测试独有的，用它当筛选值：
+    // 一旦筛选被丢弃，页面上必然混进不相关的行，逐行断言即可拆穿。
+    let needle = role_id.to_string();
+    let body = wait_for_logs(
+        &app,
+        &token,
+        &format!("action={needle}&page_size=50"),
+        |body| {
+            body["data"]["items"].as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|it| it["action"].as_str().is_some_and(|a| a.contains(&needle)))
+            })
+        },
+    )
+    .await;
+    let items = body["data"]["items"].as_array().expect("items 应为数组");
+    for item in items {
+        let action = item["action"].as_str().unwrap_or_default();
+        assert!(
+            action.contains(&needle),
+            "按 action={needle} 筛选却返回了不相关的行: {action}"
+        );
+    }
+}
+
+/// 筛不到时返回空列表而不是全部——反向判据
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_audit_filter_that_matches_nothing_returns_an_empty_list() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (status, body) = query_logs(&app, &token, "username=zzz_nobody_zzz").await;
+    assert_eq!(status, StatusCode::OK, "查询失败: {body}");
+    assert_eq!(body["data"]["total"].as_i64(), Some(0), "{body}");
+    assert!(
+        body["data"]["items"].as_array().unwrap().is_empty(),
+        "筛不到时应返回空数组: {body}"
+    );
+}
+
+/// 核心契约：审计日志的未知参数同样必须 400
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_unknown_audit_log_filter_is_rejected_loudly() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (status, body) = query_logs(&app, &token, "user_name=admin").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "拼错的筛选条件应报 400: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("user_name"),
+        "报错应指名那个字段: {body}"
+    );
+    // 统一响应格式：必须是 JSON 且带 code/message/data
+    assert_eq!(
+        body["code"].as_i64(),
+        Some(400),
+        "应遵守统一响应格式: {body}"
+    );
+    assert!(body.get("message").is_some(), "应含 message: {body}");
+}
+
+/// 导出的筛选条件必须真的生效，且截断状态随响应头返回
+///
+/// 原实现硬编码 `LIMIT 10000` 且不告知任何人。这里断言两件事：
+/// 1. 导出带筛选时，条数与筛选结果一致（不是全量）
+/// 2. 响应头里有 `x-export-row-count` / `x-export-truncated` / `x-export-max-rows`
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn audit_export_honors_filters_and_reports_truncation() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let role_name = unique("expf");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/roles/{role_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "造日志失败: {body}");
+
+    // 带筛选导出
+    let response = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            "/api/admin/logs/audit/export?username=zzz_nobody_zzz",
+            Some(&token),
+            None,
+        ))
+        .await
+        .expect("导出请求失败");
+    assert_eq!(response.status(), StatusCode::OK, "导出应成功");
+
+    // 截断状态必须机器可读
+    let row_count = response
+        .headers()
+        .get("x-export-row-count")
+        .and_then(|v| v.to_str().ok())
+        .expect("应回传 x-export-row-count");
+    assert_eq!(
+        row_count, "0",
+        "筛选到 0 条时导出行数应为 0（说明筛选真的生效，而非仍导出全量）"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-export-truncated")
+            .and_then(|v| v.to_str().ok()),
+        Some("false"),
+        "未触顶时 truncated 应为 false"
+    );
+    assert!(
+        response.headers().get("x-export-max-rows").is_some(),
+        "应回传上限，前端据此告知用户"
+    );
+}
+
+// ──────────────────────────────────────────────
+// v0.10.0：角色列表分页（破坏性 API 变更）
+//
+// 断言写成"性质"而不是"条数"：库里有多少角色取决于前面用例留下了什么，
+// 写死 `total == 5` 会被脏数据永久打红。
+// ──────────────────────────────────────────────
+
+/// 角色列表返回分页对象，逐页取回与一次取全量**完全一致**
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn role_list_pages_over_the_same_set_as_one_big_page() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let mut created = vec![];
+    for _ in 0..3 {
+        created.push(create_role_via_api(&app, &token, &unique("pgrole")).await);
+    }
+
+    let (status, whole) = send(
+        &app,
+        request("GET", "/api/admin/roles?page_size=200", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{whole}");
+
+    // 形状：分页对象，不是裸数组（v0.10.0 的破坏性变更）
+    assert!(
+        !whole["data"].is_array(),
+        "角色列表不应再返回裸数组: {whole}"
+    );
+    let all_ids: Vec<String> = whole["data"]["items"]
+        .as_array()
+        .expect("data.items 应为数组")
+        .iter()
+        .map(|r| r["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        whole["data"]["total"].as_i64(),
+        Some(all_ids.len() as i64),
+        "total 必须与 items 长度一致，否则分页会错乱: {whole}"
+    );
+    assert!(whole["data"]["total_pages"].as_i64().unwrap_or(0) >= 1);
+
+    // 逐页取回，集合必须与一次取全量一致：既不重也不漏
+    let mut paged: Vec<String> = vec![];
+    let mut page = 1;
+    loop {
+        let (status, body) = send(
+            &app,
+            request(
+                "GET",
+                &format!("/api/admin/roles?page={page}&page_size=2"),
+                Some(&token),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let items = body["data"]["items"]
+            .as_array()
+            .expect("data.items 应为数组");
+        if items.is_empty() {
+            break;
+        }
+        for r in items {
+            paged.push(r["id"].as_str().unwrap_or_default().to_string());
+        }
+        page += 1;
+        assert!(page < 200, "翻页没有收敛，可能陷入死循环");
+    }
+
+    let mut sorted_paged = paged.clone();
+    sorted_paged.sort();
+    sorted_paged.dedup();
+    assert_eq!(
+        sorted_paged.len(),
+        paged.len(),
+        "翻页取回了重复的角色，说明分页缺稳定排序: {paged:?}"
+    );
+
+    let mut sorted_all = all_ids.clone();
+    sorted_all.sort();
+    assert_eq!(
+        sorted_paged, sorted_all,
+        "逐页取回的角色集合与一次取全量不一致"
+    );
+
+    for id in created {
+        assert!(
+            all_ids.contains(&id.to_string()),
+            "刚建的角色 {id} 不该从列表里消失"
+        );
+        let _ = delete_role(&app, &token, id).await;
+    }
+}
+
+/// 角色列表的未知参数同样必须 400，不能静默忽略
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_unknown_role_list_filter_is_rejected_loudly() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/roles?pageSize=10", Some(&token), None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "驼峰拼错的分页参数应报 400: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pageSize"),
+        "报错应指名那个字段: {body}"
+    );
+}
+
+// ──────────────────────────────────────────────
+// v0.10.0：契约测试——前端 query 参数 vs 后端 DTO 字段
+//
+// 这一族问题的特点是**从不报错**：筛选栏摆着、参数也确实发出去了，
+// 后端不认识就静默丢弃，界面表现为"搜索没反应"。
+// 端到端测试抓不到它（请求确实成功、只是筛不出东西），
+// 只能靠"把两边的字段名拿来对照"这种静态契约。
+// ──────────────────────────────────────────────
+
+/// 取出 `pub struct <name> { … }` 的字段名
+fn rust_struct_fields(source: &str, name: &str) -> Vec<String> {
+    let marker = format!("pub struct {name} {{");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("在源文件里找不到 `pub struct {name}`"))
+        + marker.len();
+    let body = &source[start..];
+    let end = body
+        .find("\n}")
+        .unwrap_or_else(|| panic!("`pub struct {name}` 的结构体没有正确闭合"));
+
+    body[..end]
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub "))
+        .filter_map(|rest| rest.split(':').next())
+        .map(|field| field.trim().to_string())
+        .filter(|field| !field.is_empty())
+        .collect()
+}
+
+/// 取出一段 TS 类型文本里的字段名
+///
+/// 同时支持 `export interface X { a?: number }` 与内联的
+/// `list(params: { a?: number; b?: string })`——两种写法前端都真实在用。
+fn ts_field_names(region: &str) -> Vec<String> {
+    region
+        .split([';', '\n', ','])
+        .filter_map(|fragment| {
+            let fragment = fragment.trim();
+            let head: String = fragment
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let rest = fragment[head.len()..].trim_start();
+            // 只接受 `name:` 与 `name?:` 两种字段形态，顺带滤掉注释残片
+            if let Some(after_question) = rest.strip_prefix('?') {
+                after_question.trim_start().starts_with(':').then_some(head)
+            } else {
+                rest.starts_with(':').then_some(head)
+            }
+        })
+        .filter(|field| !field.is_empty())
+        .collect()
+}
+
+/// 取出 `export interface <name> { … }` 的字段名
+fn ts_interface_fields(source: &str, name: &str) -> Vec<String> {
+    let marker = format!("export interface {name} {{");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("在前端源文件里找不到 `export interface {name}`"))
+        + marker.len();
+    let rest = &source[start..];
+    let end = rest
+        .find('}')
+        .unwrap_or_else(|| panic!("`export interface {name}` 没有正确闭合"));
+    ts_field_names(&rest[..end])
+}
+
+/// 取出内联对象类型的字段名（如 `list(params: { page?: number })`）
+fn ts_inline_fields(source: &str, marker: &str) -> Vec<String> {
+    let start = source
+        .find(marker)
+        .unwrap_or_else(|| panic!("在前端源文件里找不到 `{marker}`"))
+        + marker.len();
+    let rest = &source[start..];
+    let end = rest
+        .find('}')
+        .unwrap_or_else(|| panic!("`{marker}` 后的内联类型没有正确闭合"));
+    ts_field_names(&rest[..end])
+}
+
+/// 前端发出的 query 字段必须与后端 DTO 的字段**逐字对齐**
+#[test]
+fn frontend_query_params_match_backend_dto_fields() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // (前端文件, 前端参数写法, 后端文件, 后端 DTO)
+    let pairs: &[(&str, &str, &str, &str)] = &[
+        (
+            "frontend/src/api/user.ts",
+            "list(params: {",
+            "src/controller/user.rs",
+            "UserListParams",
+        ),
+        (
+            "frontend/src/api/role.ts",
+            "list(params: {",
+            "src/controller/role.rs",
+            "RoleListParams",
+        ),
+        (
+            "frontend/src/api/audit.ts",
+            "export interface AuditLogListParams {",
+            "src/controller/demo.rs",
+            "AuditLogQuery",
+        ),
+        (
+            "frontend/src/api/menu.ts",
+            "{ params: {",
+            "src/controller/menu.rs",
+            "MenuQuery",
+        ),
+        (
+            "frontend/src/api/dict.ts",
+            "{ params: {",
+            "src/controller/dict.rs",
+            "DictItemQuery",
+        ),
+    ];
+
+    let mut problems: Vec<String> = vec![];
+
+    for (fe_file, fe_marker, be_file, be_struct) in pairs {
+        let fe_source = std::fs::read_to_string(root.join(fe_file))
+            .unwrap_or_else(|e| panic!("读取 {fe_file} 失败: {e}"));
+        let be_source = std::fs::read_to_string(root.join(be_file))
+            .unwrap_or_else(|e| panic!("读取 {be_file} 失败: {e}"));
+
+        let fe_fields = if let Some(name) = fe_marker
+            .strip_prefix("export interface ")
+            .and_then(|rest| rest.strip_suffix(" {"))
+        {
+            ts_interface_fields(&fe_source, name)
+        } else {
+            ts_inline_fields(&fe_source, fe_marker)
+        };
+        let be_fields = rust_struct_fields(&be_source, be_struct);
+
+        // 危险方向：前端发了后端不认识的字段——会被静默丢弃或 400
+        let unknown_to_backend: Vec<&String> = fe_fields
+            .iter()
+            .filter(|f| !be_fields.contains(f))
+            .collect();
+        if !unknown_to_backend.is_empty() {
+            problems.push(format!(
+                "{fe_file} 发出后端 {be_struct} 不认识的字段: {unknown_to_backend:?}（会静默失效或 400）"
+            ));
+        }
+
+        // 另一个方向：后端有、前端从不发的字段——筛选入口可能还没接上
+        let never_sent: Vec<&String> = be_fields
+            .iter()
+            .filter(|f| !fe_fields.contains(f))
+            .collect();
+        if !never_sent.is_empty() {
+            problems.push(format!(
+                "{be_file} 的 {be_struct} 有前端从未发送的字段: {never_sent:?}（筛选入口可能没接上）"
+            ));
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "前后端 query 字段对不齐:\n  {}",
+        problems.join("\n  ")
+    );
+}
+
+/// 后端每个 query DTO 都必须 `deny_unknown_fields`
+///
+/// 这条不靠人列清单：新增 `*Query` / `*Params` 结构体时自动纳入检查。
+/// 忘了加就会退回"静默丢弃"，而那正是本版要消灭的行为。
+#[test]
+fn every_query_dto_rejects_unknown_fields() {
+    let controller_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/controller");
+
+    let mut offenders: Vec<String> = vec![];
+    let mut checked = 0usize;
+
+    for entry in std::fs::read_dir(&controller_dir).expect("读取 src/controller 失败") {
+        let path = entry.expect("目录项读取失败").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("读取 controller 源文件失败");
+        let file = path.file_name().unwrap().to_string_lossy().to_string();
+
+        let mut cursor = 0usize;
+        while let Some(start) = source[cursor..].find("pub struct ") {
+            let abs_start = cursor + start;
+            let after = &source[abs_start + "pub struct ".len()..];
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            cursor = abs_start + "pub struct ".len() + name.len();
+
+            if !(name.ends_with("Query") || name.ends_with("Params")) {
+                continue;
+            }
+            checked += 1;
+
+            // 属性写在结构体上一行，取紧邻的非空行即可
+            let attr = source[..abs_start]
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            if attr != "#[serde(deny_unknown_fields)]" {
+                offenders.push(format!(
+                    "{file}::{name} 缺少 #[serde(deny_unknown_fields)]（紧邻的上一行是 `{attr}`）"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        checked >= 5,
+        "应至少校验 5 个 query DTO，实际 {checked}——是扫描逻辑失效了"
+    );
+    assert!(
+        offenders.is_empty(),
+        "以下 query DTO 会静默丢弃未知字段:\n  {}",
+        offenders.join("\n  ")
+    );
 }

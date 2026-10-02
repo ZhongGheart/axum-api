@@ -37,14 +37,15 @@
 | RBAC | ✅ | 角色唯一数据源为 `user_roles` 表；admin 路由再按**权限码**逐接口鉴权 |
 | 登录防护 | ✅ | 账号 + 客户端 IP 双维度失败计数，超阈值锁定；客户端 IP 默认取 TCP 真实来源 |
 | 限流 | ✅ | 基于 Redis 的固定窗口限流（IP 维度） |
-| 操作日志 | ✅ | 受保护路由写入 `audit_logs`（仅方法/路径/查询串，不记录请求体） |
+| 操作日志 | ✅ | 受保护路由写入 `audit_logs`（仅方法/路径/查询串，不记录请求体）；支持按用户名/操作/状态码/时间范围**真筛选**；导出支持同一套条件，且**截断状态随响应头明示** |
 | 数据字典 | ✅ | Redis 缓存 + 写操作真实失效；读取接口对**任意已登录用户**开放 |
 | 菜单管理 | ✅ | 菜单是导航的唯一来源：`/api/auth/menus` 决定侧栏与前端动态路由 |
 | 权限码 | ✅ | 28 个 `<模块>:<资源>:<动作>` 权限码存于 `menus.permission`（按钮型菜单），后端强制鉴权 + 前端按码判定；清空后可由清空者本人恢复 |
-| 角色与授权 | ✅ | 角色增删改 + 菜单/权限码授权树；授权**要么完整成功、要么整体回滚**；内置角色不可删除、不可改名；自定义角色可直接分配给用户 |
-| 用户管理 | ✅ | 增删改查、批量删除、状态切换、重置密码；**多角色分配**；含"最后一个管理员"保护 |
+| 角色与授权 | ✅ | 角色增删改（**分页**）+ 菜单/权限码授权树；授权**要么完整成功、要么整体回滚**；内置角色不可删除、不可改名；自定义角色可直接分配给用户 |
+| 用户管理 | ✅ | 增删改查（分页 + `keyword` 真搜索）、批量删除、状态切换、重置密码；**多角色分配**；含"最后一个管理员"保护 |
 | 系统监控 | ✅ | CPU/内存/磁盘、DB/Redis 状态、接口耗时统计（进程内，重启丢失） |
-| Excel 导出 | ✅ | 用户列表、操作日志、系统信息 |
+| Excel 导出 | ✅ | 用户列表、操作日志、系统信息；导出走与列表同一套筛选条件，超上限时**明示截断**而非静默砍数据 |
+| 未知参数处理 | ✅ | 所有 query DTO 一律 `deny_unknown_fields`：拼错的参数直接 400 并指名字段，**不再静默丢弃**（v0.10.0 起） |
 | OpenAPI 文档 | ✅ | utoipa 从 handler 注解与 DTO 派生生成；双向覆盖测试保证文档与路由同步 |
 | 接口级权限码 | ⚠️ | 仅 admin 路由细化到权限码；非 admin 角色仍被 `require_role("admin")` 整体挡住 |
 
@@ -200,20 +201,21 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 
 | Method | Path | 说明 |
 |--------|------|------|
-| GET/POST | `/api/admin/users` | 用户列表 / 新建用户 |
+| GET/POST | `/api/admin/users?page=&page_size=&keyword=` | 用户列表（分页 + 关键字搜用户名/邮箱） / 新建用户 |
 | PUT/DELETE | `/api/admin/users/{id}` | 更新 / 删除用户 |
 | POST | `/api/admin/users/batch-delete` | 批量删除（含最后管理员保护） |
 | PUT | `/api/admin/users/{id}/status` | 启用 / 停用（停用即吊销会话） |
 | POST | `/api/admin/users/{id}/reset-password` | 重置密码（并吊销会话） |
 | GET/POST | `/api/admin/users/{id}/roles` | 查询 / 追加用户角色 |
-| GET/POST | `/api/admin/roles`、`PUT/DELETE /api/admin/roles/{id}` | 角色管理（内置角色不可删除/改名；仍被用户占用的角色拒绝删除；角色名自动归一化，撞名 409） |
+| GET/POST | `/api/admin/roles?page=&page_size=`、`PUT/DELETE /api/admin/roles/{id}` | 角色管理（**列表已分页**；内置角色不可删除/改名；仍被用户占用的角色拒绝删除；角色名自动归一化，撞名 409） |
 | GET/POST | `/api/admin/menus`、`PUT/DELETE /api/admin/menus/{id}` | 菜单管理（改动即时影响前端导航） |
 | PUT | `/api/admin/roles/{id}/menus` | 角色-菜单关联（**全量覆盖**；任一 ID 非法即整体 400） |
 | GET | `/api/admin/menus?role_id={id}` | 某角色已授权的菜单树（授权弹窗的默认勾选值） |
 | GET/POST | `/api/admin/dict/types`、`PUT/DELETE /api/admin/dict/types/{id}` | 字典类型管理 |
 | GET/POST | `/api/admin/dict/items`、`PUT/DELETE /api/admin/dict/items/{id}` | 字典项管理 |
 | POST | `/api/admin/dict/refresh` | 刷新字典缓存 |
-| GET | `/api/admin/audit-logs`、`/api/admin/logs/audit/export` | 操作日志查询 / 导出 |
+| GET | `/api/admin/audit-logs?page=&username=&action=&status_code=&start_time=&end_time=` | 操作日志查询（分页 + 真筛选） |
+| GET | `/api/admin/logs/audit/export`（同上筛选参数） | 操作日志导出；响应头带 `x-export-row-count` / `x-export-truncated` / `x-export-max-rows` |
 | GET | `/api/admin/export/users` | 导出用户列表 |
 | GET | `/api/admin/monitor/system`、`/api/admin/monitor/api-metrics`、`/api/admin/monitor/alerts` | 系统与接口监控 |
 | GET | `/api/openapi.json`、`/api/swagger-ui/index.html` | OpenAPI 规范与 Swagger UI |
@@ -371,6 +373,37 @@ node e2e/probe-write-guards.mjs # 授权探针：写入口清单从 OpenAPI 自�
 - **令牌新增毫秒级 `iat_ms`**。升级前签发的旧令牌没有该字段，解析为 0，
   一定小于任何吊销时间点——方向是**失效**而非放行。也就是说**首次吊销会把存量令牌
  一并作废**，存量用户需要重新登录一次。这是安全的一侧，不是 bug
+
+## 从 v0.9 升级到 v0.10
+
+无新增迁移，**存量库直接重启即可**。但有三处行为变化需要注意：
+
+- **`GET /api/admin/roles` 的返回值变了（破坏性）**。从裸数组改为分页对象：
+
+  ```diff
+  - { "code": 200, "data": [ { "id": "…", "name": "admin" } ] }
+  + { "code": 200, "data": { "items": [ … ], "total": 34, "page": 1, "page_size": 10, "total_pages": 4 } }
+  ```
+
+  取数改成 `res.data.items`。注意排序是 `created_at ASC`（最早的角色在前），
+  **按名字查某个角色时不能只看第一页**——本仓库的授权探针最初就踩了这个坑，
+  把"角色还在"误判成"被越权删了"，那样的假红比不测更糟
+
+- **多传 query 参数会开始报 400**。所有 `/api/admin/*` 的 query DTO 现在
+  `deny_unknown_fields`，拼错的字段名直接 400 并在 message 里指名。
+  这对原先依赖"多传参数被静默忽略"的客户端是**行为变更**——但那正是
+  本版要消灭的失效方式：`keyword` 当初就是这样悄无声息失效的。
+  若你只是想在筛选栏上加条件，请同步改后端 DTO（前端字段名必须与 DTO 逐字对齐，
+  有契约测试守着）
+
+- **日志导出会带上截断状态**。`/api/admin/logs/audit/export` 的响应头新增
+  `x-export-row-count` / `x-export-truncated` / `x-export-max-rows`。
+  上限 10000 行**保留**（日志表无限增长，没有上限迟早 OOM），
+  变的是它不再静默：触顶时 `x-export-truncated: true`
+
+另有一处**界面变化**：组件示例页的上传控件已移除。它原先写死
+`:action="'/api/upload'"`，而该端点在路由表里不存在。`BaseUpload` 组件本身
+仍保留在 `frontend/src/components/common/BaseUpload.vue`，等后端真有了上传端点再接回。
 
 ## License
 

@@ -9,8 +9,13 @@ import type { UserInfo } from './types/response'
 
 /** 用户管理接口 */
 export const userApi = {
-  /** GET /api/admin/users?page=1&page_size=10 */
-  list(params: { page?: number; page_size?: number }) {
+  /**
+   * GET /api/admin/users?page=1&page_size=10&keyword=...
+   *
+   * `keyword` 同时匹配用户名与邮箱；后端对未知参数返回 400 而非静默忽略，
+   * 所以这里多传一个字段会被立刻发现，而不是让筛选"看起来没反应"。
+   */
+  list(params: { page?: number; page_size?: number; keyword?: string }) {
     return http.get<{
       items: UserInfo[]
       total: number

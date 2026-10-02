@@ -99,6 +99,22 @@ impl IntoResponse for AppError {
 }
 
 /// 将 rust_xlsxwriter 错误转换为 AppError
+/// 把 `Query` 提取器的拒绝翻译成统一响应格式
+///
+/// **为什么需要它**：`Query<T>` 解析失败时，axum 默认回一个 `text/plain`
+/// 的 400，**绕过 `AppError`**。而本项目对外承诺统一响应格式
+/// `{ code, message, data }`——前端拦截器正是按 `message` 取文案。
+/// 于是同一个 400，有的走统一格式有的不走，客户端得两种都处理。
+///
+/// 消息里保留了 serde 的原文，因此会**指名是哪个字段不认**
+/// （如 `unknown field \`departmnt\`, expected one of \`page\`, ...`），
+/// 这正是让"筛选参数写错"从静默失效变成响着失败的关键。
+impl From<axum::extract::rejection::QueryRejection> for AppError {
+    fn from(rejection: axum::extract::rejection::QueryRejection) -> Self {
+        AppError::BadRequest(format!("查询参数不合法: {rejection}"))
+    }
+}
+
 impl From<rust_xlsxwriter::XlsxError> for AppError {
     fn from(e: rust_xlsxwriter::XlsxError) -> Self {
         AppError::InternalServerError(format!("Excel 错误: {e}"))

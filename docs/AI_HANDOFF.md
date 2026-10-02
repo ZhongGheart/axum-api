@@ -2610,3 +2610,244 @@ v0.7.0 那轮记的"删分支：未做，待用户确认"后来实际已处理�
    v0.7.0→v0.9.0 三个安全洞全是这个问题；本轮三处"说谎"是它的 UI 版本
 3. **静默失败比报错更危险**：筛选被丢弃、导出被截断、控件指向 404——
    三者都不会报错，所以都不会被发现。**新增能力时优先让它"响着失败"**
+
+---
+
+# v0.10.0 — 停止说谎：三处假接口变真 + 日志可查
+
+## 当前目标
+
+把"界面提供了控件、后端却没有对应能力、且失败时无声"这一族缺口关掉。
+与前三版同源（"授权的两面只装了一面"的 UI 版本），但危害不同：
+安全洞是**放行了不该放行的**，假接口是**让人以为能力存在而其实没有**。
+
+**这一版的真正重点不是把三个筛选做出来，是让"未知参数"不再静默丢弃**——
+只要 `serde` 继续默认忽略未知字段，将来新增任何筛选条件都会再次悄无声息失效，
+前两项修完也会复发。
+
+## 当前计划
+
+| 步骤 | 内容 | 状态 |
+|---|---|---|
+| 0 | 记录目标与起始 git 状态 | ✅ 已完成 |
+| 1 | 用户列表真筛选（keyword → username/email） | ✅ 已完成 |
+| 2 | 审计日志真筛选 + **未知参数不再静默丢弃** | ✅ 已完成 |
+| 3 | 日志导出支持筛选 + 去掉静默 `LIMIT 10000` 或明示截断 | ✅ 已完成（含前端接线） |
+| 4 | `BaseUpload` 接真后端**或**从演示页摘掉 | ✅ 已摘掉 |
+| 5 | 角色列表分页 | ✅ 已完成（破坏性变更） |
+| 6 | 契约测试：前端 query 参数集合 vs 后端 DTO 字段 | ✅ 已完成 |
+| 7 | 集成测试 + 缺陷注入验证 | ✅ 已完成 |
+| 8 | 质量门禁（含 e2e + 授权探针） | ✅ 全绿 |
+| 9 | 文档：CHANGELOG / README / 版本号 | ✅ 已完成 |
+| 10 | 提交（**不推送**） / tag / Release | 提交 ✅；tag 与 Release 待用户指令 |
+
+## 起始 git 状态
+
+- 分支 `master`，与 `origin/master` 同步（0 提交待推）
+- HEAD = `b4cb627a docs(handoff): 记录 v0.9.0 后的功能缺口复查`
+- 工作区：仅本文档改动
+- 版本号：Rust / frontend 均 `0.9.0`；tag `v0.9.0` 已发布
+
+## 关键决定（动手前先定，避免中途反复）
+
+1. **未知参数的处理方式待验证后定**。候选：`deny_unknown_fields`（严格但会
+   打断兼容性）vs 显式校验并报 400 vs 保持忽略但**加契约测试**。
+   倾向"显式校验 + 契约测试双保险"，但要先确认前端有没有在传后端不认的参数
+2. **导出的 `LIMIT 10000` 不静默保留**。要么支持筛选 + 大导出走异步，
+   要么保留上限但**在响应里明示**"已截断"。静默砍数据比报错更糟
+3. **`BaseUpload` 倾向摘掉而非接后端**。文件上传要牵出对象存储、病毒扫描、
+   鉴权与配额，是独立议题；为一个演示页引入它不划算。但摘掉前要先确认
+   `BaseUpload` 组件本身是否还有别的用处（目前只有演示页在用）
+4. **筛选判据落在返回条数上**，不是"参数发出去了"。每条都要能证明过滤真的生效
+
+---
+
+## 步骤 1–3 完成记录（2026-10-02）
+
+### 步骤 1：用户列表真筛选 ✅
+
+- `keyword` 匹配 username/email，LIKE 前过 `escape_like_pattern`（`%`/`_` 当字面量）
+- `UserListParams` 加 `deny_unknown_fields`
+- 顺手修掉一个真问题：`Query<T>` 解析失败时 axum 默认回 `text/plain` 400，
+  **绕过统一响应格式**。新增 `From<QueryRejection> for AppError`，
+  user/demo/menu 三个 handler 改用 `Result<Query<T>, QueryRejection>`。
+  handler 参数顺序保持 `State → 权限守卫 → Query`，不破坏"权限先于校验"的约定
+
+### 步骤 2/3：审计日志筛选 + 导出截断明示 ✅
+
+- `AuditLogQuery` 9 字段显式列全 + `deny_unknown_fields`
+- `push_filters` 用 `QueryBuilder` 动态拼接。**不用** `$1 IS NULL OR ...` 恒真写法——
+  那种写法优化器化不成索引扫描
+- 导出 `fetch_for_export` 多取 1 行判截断，返回 `(rows, truncated)`，
+  响应头 `x-export-row-count` / `x-export-truncated` / `x-export-max-rows`
+
+### 测试过程中发现的两个坑（都不是实现错，是测试错）
+
+1. **`GET /api/admin/users/{id}` 不存在**——该路由只注册了 PUT/DELETE，
+   拿它造 404 日志实际拿到 405。改用 `DELETE` 不存在的用户 id（`find_by_id` 报 404）
+2. **审计中间件是 `tokio::spawn` 异步落库**，"发完写请求就查"有竞态。
+   沿用 `admin_requests_are_written_to_audit_log` 的轮询写法，
+   新增 `wait_for_logs` helper。判据必须指向**本次测试自己造的那条日志**——
+   用"items 非空"当判据会自证成功（查询自身的 GET 也会被记一条）
+
+### 缺陷注入（两处，均已还原复验）
+
+| 注入 | 预期 | 结果 |
+|---|---|---|
+| `push_filters` 直接 return | 筛选测试红 | ✅ 4 条全红 |
+| 导出 handler 提前 return（不设响应头） | 导出测试红 | ✅ 红在"应回传 x-export-row-count" |
+
+注入第一版时 `_by_action` / `_by_username` 仍是绿的——判据只验"目标行在里面"，
+不筛选时全量也满足。已改为**双向收窄证明**：造一条**别的用户**的日志，
+断言按该用户筛得到、按 admin 筛不到；`action` 用本次测试独有的 role_id 当筛选值。
+
+---
+
+## 下一步
+
+1. 步骤 8：全量门禁（fmt / clippy / 单元 / 集成 / e2e 3 套件 / 授权探针 / 前端四项）
+2. 步骤 9：CHANGELOG + README + 版本号 `0.9.0 → 0.10.0`
+   （**必须写明角色列表的破坏性变更**）
+3. 步骤 10：提交（**不推送**，等用户指令）
+
+---
+
+## 步骤 4–6 完成记录（2026-10-02）
+
+### 步骤 4：`BaseUpload` 从演示页摘掉 ✅
+
+- `frontend/src/views/demo/index.vue` 移除上传卡片，组件本身保留（`components/common/BaseUpload.vue`）
+- 原代码写死 `:action="'/api/upload'"`，**该端点在 `src/router/mod.rs` 里根本不存在**
+- 摘掉而非接后端：文件上传要牵出对象存储、病毒扫描、内容类型校验与配额，是独立议题
+
+### 步骤 5：角色列表分页 ✅（**破坏性 API 变更**）
+
+- `role_repo::list_all()` → `list_paginated(page, page_size)`，返回 `(当页, 总数)`
+- `GET /api/admin/roles` 返回值 `Vec<RoleItem>` → `PaginatedResponse<RoleItem>`
+- **`ORDER BY r.created_at ASC, r.id ASC`**：加了 `r.id` 作并列时的 tiebreaker。
+  只按 `created_at` 排序会在时间戳相同时让翻页出现重复/漏行
+- 连带修两处会被打破的消费方：`tests/api_integration.rs`、`e2e/probe-write-guards.mjs`
+
+**分页引入的新坑（已堵）**：用户表单的角色下拉走同一个接口，
+默认 `page_size=10` 会**只显示前 10 个角色**——用户看不到自己实际持有的角色，
+保存时可能把权限改掉。加 `roleApi.listAll()` 按 200/页 翻页取全，
+且总数对不上时抛错而非静默截断。配套 3 条单测。
+
+### 步骤 6：契约测试 ✅
+
+两条纯静态测试（不需要 DB，`cargo test` 直接跑）：
+
+1. `frontend_query_params_match_backend_dto_fields`
+   —— 5 组前后端字段对照（user / role / audit / menu / dict），**双向**报：
+   前端发了后端不认识的字段（危险方向），以及后端有、前端从不发的字段（入口没接上）
+2. `every_query_dto_rejects_unknown_fields`
+   —— 扫描 `src/controller/*.rs` 里所有 `*Query` / `*Params` 结构体，
+   要求紧邻上一行是 `#[serde(deny_unknown_fields)]`。**不靠人列清单**，
+   新增 DTO 自动纳入检查
+
+顺带补齐：`MenuQuery`、`DictItemQuery` 此前**没有** `deny_unknown_fields`，
+且 dict 的 `list_items` 还在走绕过统一响应格式的旧写法，都已修。
+
+### 步骤 4–6 的缺陷注入（均已还原复验）
+
+| 注入 | 结果 |
+|---|---|
+| `push_filters` 直接 return | ✅ 4 条筛选测试全红 |
+| 导出 handler 提前 return（不设响应头） | ✅ 红在"应回传 x-export-row-count" |
+| 角色 handler 忽略 `page`（写死 1） | ✅ `role_list_pages_over_the_same_set…` 红 |
+| 前端 `menu.ts` 多发 `parentId` | ✅ 报"发出后端 MenuQuery 不认识的字段" |
+| 摘掉 `RoleListParams` 的 `deny_unknown_fields` | ✅ 报"紧邻的上一行是 `#[derive(…)]`" |
+
+### 踩到的第三个坑：测试自己也会说谎
+
+`updating_a_role_returns_the_real_row` 在步骤 5 之后变红——它请求
+`GET /api/admin/roles` 不带分页参数，默认 `page_size=10`，
+而排序是 `created_at ASC`，前面用例留下的角色已把新建的挤到第 2 页之后。
+**不是分页的 bug，是测试假设了"列表=全量"**。已显式改成 `page_size=200`。
+
+这和 v0.9.0 那次「失败的运行 panic 跳过清理留下脏数据」同源：
+测试库长期存在，任何依赖"库里现在恰好有多少数据"的断言都会随执行顺序漂移。
+**断言要写性质，不写全局计数。**
+
+---
+
+## 步骤 7–9 完成记录（2026-10-02）
+
+### 步骤 7：集成测试 + 缺陷注入验证 ✅
+
+新增测试覆盖四条筛选路径（用户 keyword、审计五条件、导出复用同一套条件、角色分页），
+并为每条配了**缺陷注入**：把实现改坏，确认对应测试变红，再还原复验。
+
+| 注入 | 结果 |
+|---|---|
+| `push_filters` 直接 return | ✅ 4 条筛选测试全红 |
+| 导出 handler 提前 return（不设响应头） | ✅ 红在"应回传 x-export-row-count" |
+| 角色 handler 忽略 `page`（写死 1） | ✅ 分页测试红 |
+| 前端 `menu.ts` 多发 `parentId` | ✅ 契约测试报"发出后端 MenuQuery 不认识的字段" |
+| 摘掉 `RoleListParams` 的 `deny_unknown_fields` | ✅ 报"紧邻的上一行是 `#[derive(…)]`" |
+
+### 步骤 8：全量门禁 ✅
+
+| 门禁 | 结果 |
+|---|---|
+| `cargo fmt --check` | ✅ |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | ✅ |
+| 单元测试 | ✅ 58 passed |
+| 集成测试 | ✅ 88 passed（`--ignored`）+ 5 passed（非 ignored） |
+| e2e | ✅ 4/4 套件（新增 `v010-ui-truth.mjs`，13 条断言） |
+| 授权探针 | ✅ 41/41 |
+| 前端 lint / typecheck / test / build | ✅（1 条 `env.d.ts` 既有 warning） |
+
+行为探针确认后端连的是测试库（`roles total=34`），不是误连开发库。
+
+### 步骤 9：文档与版本号 ✅
+
+- 版本号三处同步到 `0.10.0`：`Cargo.toml` / `Cargo.lock` / `frontend/package.json`
+- `CHANGELOG.md` 新增 0.10.0 段落；`README.md` 同步筛选能力与分页 breaking change
+- 三份中文文档写入后 `grep -c $'\ufffd'` 均为 0，无乱码
+
+### 步骤 10：提交 ✅（**未推送**）
+
+- 本次提交即步骤 10 的"合并到 master"；**tag 与 Release 等用户指令再打**
+- 用户指令：本地跑门禁 + 提交，**全部工作完成或收到指令后统一推送**
+
+---
+
+## 本版跨版本沉淀：为什么"契约测试"比"修 bug"更值钱
+
+v0.10.0 修的三个 bug 都不是复杂逻辑错误，**是"加了参数但没接到后端"**。
+这类 bug 修完还会复发，所以真正的产出是那条契约测试：
+
+- 前端发了后端不认识的字段 → 立即报（危险方向：拼错参数静默失效）
+- 后端有字段前端从不发 → 立即报（入口没接上：筛选条件形同虚设）
+- 新增 DTO 未加 `deny_unknown_fields` → 立即报（不靠人列清单）
+
+前两条管**当下**，第三条管**将来**。只要 `serde` 默认忽略未知字段的默认行为还在，
+契约测试就是唯一能挡住复发的东西。
+
+### 与 `deny_unknown_fields` 相关的设计约束
+
+**`deny_unknown_fields` 与 `serde(flatten)` 不兼容**。因此查询结构体
+**必须显式列全字段**，不能靠 flatten 收敛公共参数（如分页）。
+这是有意接受的代价：显式列举让"这个接口到底认哪些参数"变成可 grep 的事实。
+
+**`push_filters` 用 `QueryBuilder` 动态拼接**，不是 `$1 IS NULL OR $2 IS NULL`。
+后者语义上等价，但会把计划固定成无法走索引的形态，数据量上来后是隐性退化。
+
+**断言写性质，不写全局计数**。测试库长期存在，任何"库里现在恰好有 N 条"的断言
+都会随执行顺序漂移。角色列表分页后暴露的 `updating_a_role_returns_the_real_row`
+就是这么变红的——不是分页有 bug，是测试假设了"列表=全量"。
+
+### 三个只有真跑起来才会遇到的坑
+
+1. **审计中间件是 `tokio::spawn` 异步落库**。"发完写请求立刻查"有竞态，
+   必须轮询等待，且判据要指向**本次测试自己造的那条日志**，
+   否则会命中别的测试留下的历史数据而假绿
+2. **`GET /api/admin/users/{id}` 根本不存在**（只有 PUT/DELETE）。
+   拿它造 404 实际拿到的是 405，测试会因错误的原因变绿
+3. **审计的 `action` 字段是 `"{METHOD} {path}"`**，不是裸路径。
+   按裸路径断言会永远匹配不上
+
+另有前端侧的坑：**GET 缓存命中时返回伪造 response**（`headers` 只有
+`{'x-cache': 'HIT'}`），会吞掉 `x-export-truncated`。二进制响应已排除出缓存。
+

@@ -87,7 +87,7 @@ import SearchForm from '@/components/common/SearchForm.vue'
 import PermissionButton from '@/components/common/PermissionButton.vue'
 import { PERM } from '@/constants/permission'
 import { ADMIN_ROLE_NAME } from '@/constants/builtin'
-import { roleApi, type RoleItem } from '@/api/role'
+import { roleApi } from '@/api/role'
 import type { RoleListItem, RoleSelectOption } from '@/utils/role'
 import {
   buildRoleSelectOptions,
@@ -106,6 +106,8 @@ const userList = ref<Record<string, unknown>[]>([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(10)
+/** 搜索关键字：同时匹配用户名与邮箱 */
+const keyword = ref('')
 const formRef = ref<FormInst | null>(null)
 
 const roleOptions = ref<RoleSelectOption[]>([])
@@ -122,8 +124,8 @@ const rolesUnavailable = ref<string | null>(null)
 async function ensureRolesLoaded() {
   if (availableRoles.value.length > 0 || rolesUnavailable.value) return
   try {
-    // 响应拦截器已拆出 data.data，但类型上仍是 AxiosResponse——沿用仓库既有写法
-    availableRoles.value = (await roleApi.list()) as unknown as RoleItem[]
+    // 必须取全量：下拉框只显示第一页的话，用户看不到自己实际持有的角色
+    availableRoles.value = await roleApi.listAll()
   } catch {
     rolesUnavailable.value = '无法读取角色列表，请检查是否具备角色查看权限'
   }
@@ -222,7 +224,11 @@ const columns: DataTableColumn[] = [
 async function fetchUsers() {
   loading.value = true
   try {
-    const res = await userApi.list({ page: page.value, page_size: pageSize.value })
+    const res = await userApi.list({
+      page: page.value,
+      page_size: pageSize.value,
+      keyword: keyword.value || undefined,
+    })
     const data = res as unknown as {
       items: UserInfo[]
       total: number
@@ -244,13 +250,14 @@ function onPageSizeChange(size: number) {
   fetchUsers()
 }
 
-function onSearch(_keyword: string) {
+function onSearch(value: string) {
+  keyword.value = value
   page.value = 1
-  // 搜索逻辑由具体业务实现
   fetchUsers()
 }
 
 function onSearchClear() {
+  keyword.value = ''
   page.value = 1
   fetchUsers()
 }

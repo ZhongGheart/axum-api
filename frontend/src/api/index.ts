@@ -57,8 +57,14 @@ http.interceptors.request.use(
     // 记录请求开始时间（用于性能监控）
     config.headers.set('X-Request-Start', String(performance.now()))
 
+    // 二进制响应不参与缓存：缓存命中时返回的是**伪造的 response**，
+    // 里面只有 `headers: {'x-cache': 'HIT'}`。导出的截断状态正是走响应头
+    // 告诉前端的（`x-export-truncated`），一旦被缓存吞掉，
+    // 界面就会在数据被截断时照样报"导出成功"——又变回无声失败。
+    const isBinary = config.responseType === 'blob' || config.responseType === 'arraybuffer'
+
     // GET 请求尝试读取缓存（通过 cancelToken 机制短路）
-    if (ENABLE_CACHE && config.method === 'get') {
+    if (ENABLE_CACHE && config.method === 'get' && !isBinary) {
       const cached = requestCache.get<unknown>('GET', config.url || '', config.params as Record<string, unknown>)
       if (cached !== null) {
         // 模拟响应，跳过实际请求

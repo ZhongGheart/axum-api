@@ -32,9 +32,9 @@ beforeEach(() => {
 })
 
 describe('roleApi 路由与请求体', () => {
-  it('list 打 GET /admin/roles', () => {
-    roleApi.list()
-    expect(get).toHaveBeenCalledWith('/admin/roles')
+  it('list 打 GET /admin/roles 并带分页参数', () => {
+    roleApi.list({ page: 2, page_size: 20 })
+    expect(get).toHaveBeenCalledWith('/admin/roles', { params: { page: 2, page_size: 20 } })
   })
 
   it('create 打 POST /admin/roles 并带 name/description', () => {
@@ -86,5 +86,39 @@ describe('roleApi 路由与请求体', () => {
   it('listByRole 以 query 参数传 role_id，而不是拼进路径', () => {
     menuApi.listByRole(ROLE_ID)
     expect(get).toHaveBeenCalledWith('/admin/menus', { params: { role_id: ROLE_ID } })
+  })
+})
+
+describe('roleApi.listAll 的翻页', () => {
+  /** 造一页响应 */
+  const pageOf = (names: string[], total: number) => ({
+    items: names.map((name) => ({ id: name, name, description: null, created_at: '', user_count: 0 })),
+    total,
+    page: 1,
+    page_size: 200,
+    total_pages: 1,
+  })
+
+  it('单页取完时只请求一次', async () => {
+    get.mockResolvedValue(pageOf(['admin', 'user'], 2))
+    const roles = await roleApi.listAll()
+    expect(roles.map((r) => r.name)).toEqual(['admin', 'user'])
+    expect(get).toHaveBeenCalledTimes(1)
+  })
+
+  it('多页时翻到取完为止', async () => {
+    // 总量 250 > 单页 200，必须再取一页，否则下拉会少 50 个角色
+    get.mockResolvedValueOnce(pageOf(Array.from({ length: 200 }, (_, i) => `r${i}`), 250))
+    get.mockResolvedValueOnce(pageOf(Array.from({ length: 50 }, (_, i) => `s${i}`), 250))
+    const roles = await roleApi.listAll()
+    expect(roles).toHaveLength(250)
+    expect(get).toHaveBeenCalledTimes(2)
+    expect(get.mock.calls[1][1]).toEqual({ params: { page: 2, page_size: 200 } })
+  })
+
+  it('总数与实际取到的条数对不上时抛错，而不是悄悄截断', async () => {
+    // 后端说有 10 条却一直返回空页：静默返回 0 条会让下拉变成空的
+    get.mockResolvedValue(pageOf([], 10))
+    await expect(roleApi.listAll()).rejects.toThrow(/分页异常/)
   })
 })

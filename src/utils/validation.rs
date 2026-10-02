@@ -36,6 +36,26 @@ pub fn validate_password(password: &str) -> ValidationResult<()> {
     Ok(())
 }
 
+/// 转义 LIKE 模式里的特殊字符
+///
+/// **必须转义**，否则用户搜 `100%` 会匹配到全部记录（`%` 在 LIKE 里是通配符），
+/// 搜 `a_b` 也会误中 `axb`。转义后要在 SQL 里配 `ESCAPE '\'`。
+///
+/// 反斜杠要**最先**转义：若先转义 `%` / `_`，它们产生的反斜杠会被后续步骤
+/// 再转义一次，变成 `\\%`，LIKE 读到的是字面反斜杠加通配符——漏洞照旧。
+pub fn escape_like_pattern(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '%' => out.push_str("\\%"),
+            '_' => out.push_str("\\_"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// 邮箱基本校验
 pub fn validate_email(email: &str) -> ValidationResult<()> {
     if !email.contains('@') || !email.contains('.') {
@@ -69,6 +89,28 @@ pub fn validate_uuid(s: &str) -> ValidationResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn like_pattern_escapes_wildcards() {
+        // 不转义的话，搜 "100%" 会匹配到全部记录
+        assert_eq!(escape_like_pattern("100%"), r"100\%");
+        // 下划线同样是通配符：a_b 会误中 axb
+        assert_eq!(escape_like_pattern("a_b"), r"a\_b");
+    }
+
+    /// 反斜杠必须最先转义，否则它自己产生的反斜杠会被再转义一次，
+    /// LIKE 读到的就是字面反斜杠 + 通配符 —— 漏洞照旧。
+    #[test]
+    fn like_pattern_escapes_the_escape_character_itself() {
+        assert_eq!(escape_like_pattern(r"a\%b"), r"a\\\%b");
+        assert_eq!(escape_like_pattern(r"\"), r"\\");
+    }
+
+    #[test]
+    fn like_pattern_leaves_ordinary_text_untouched() {
+        assert_eq!(escape_like_pattern("alice"), "alice");
+        assert_eq!(escape_like_pattern(""), "");
+    }
 
     #[test]
     fn username_accepts_valid_values() {

@@ -51,8 +51,22 @@ impl RoleRepository {
             .map_err(|e| AppError::InternalServerError(format!("查询角色名失败: {e}")))
     }
 
-    /// 查询所有角色（含用户数）
-    pub async fn list_all(&self) -> Result<Vec<(RoleRow, i64)>, AppError> {
+    /// 分页查询角色（含用户数），返回 `(当页角色, 总数)`
+    ///
+    /// v0.10.0 之前这里是 `list_all()`——不分页、不限量。
+    /// 角色数会随自定义角色增长，没有上限就迟早把整张表塞进内存并渲染成一屏。
+    pub async fn list_paginated(
+        &self,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<(RoleRow, i64)>, i64), AppError> {
+        let offset = (page - 1) * page_size;
+
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM roles")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("统计角色总数失败: {e}")))?;
+
         let rows = sqlx::query_as::<_, (Uuid, String, Option<String>, DateTime<Utc>, i64)>(
             r#"
             SELECT r.id, r.name, r.description, r.created_at,
@@ -61,14 +75,17 @@ impl RoleRepository {
             LEFT JOIN (
                 SELECT role_id, COUNT(*) AS cnt FROM user_roles GROUP BY role_id
             ) ur_cnt ON ur_cnt.role_id = r.id
-            ORDER BY r.created_at ASC
+            ORDER BY r.created_at ASC, r.id ASC
+            LIMIT $1 OFFSET $2
             "#,
         )
+        .bind(page_size)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("查询角色列表失败: {e}")))?;
 
-        Ok(rows
+        let items = rows
             .into_iter()
             .map(|(id, name, description, created_at, user_count)| {
                 (
@@ -81,7 +98,9 @@ impl RoleRepository {
                     user_count,
                 )
             })
-            .collect())
+            .collect();
+
+        Ok((items, total.0))
     }
 
     /// 查询用户拥有的所有角色

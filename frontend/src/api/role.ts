@@ -5,6 +5,7 @@
  */
 
 import http from './index'
+import type { PageResult } from './types/response'
 
 /** 角色列表项 */
 export interface RoleItem {
@@ -23,9 +24,40 @@ export interface RoleReq {
 
 /** 角色管理接口 */
 export const roleApi = {
-  /** GET /api/admin/roles */
-  list() {
-    return http.get<RoleItem[]>('/admin/roles')
+  /**
+   * GET /api/admin/roles?page=1&page_size=10
+   *
+   * **v0.10.0 起返回分页对象**（`{ items, total, page, page_size, total_pages }`），
+   * 不再是裸数组。字段名与后端 `RoleListParams` 逐字对应；
+   * 后端对未知参数返回 400 而非静默忽略。
+   */
+  list(params: { page?: number; page_size?: number }): Promise<PageResult<RoleItem>> {
+    return http.get('/admin/roles', { params }) as unknown as Promise<PageResult<RoleItem>>
+  },
+
+  /**
+   * 翻页取回**全部**角色
+   *
+   * 存在的原因：`list()` 分页之后，用户表单里的角色下拉如果只取一页，
+   * 就会**静默少显示**后面那些角色——用户看不到自己实际持有的角色，
+   * 保存时可能把权限改掉。这是分页引入的新坑，必须显式堵上。
+   *
+   * 下拉框天然需要完整集合（没法"翻页选角色"），
+   * 所以这里按后端上限 200/页 逐页取完；总数异常时抛错而不是悄悄截断。
+   */
+  async listAll(): Promise<RoleItem[]> {
+    const pageSize = 200
+    const all: RoleItem[] = []
+    let page = 1
+    for (;;) {
+      const res = await roleApi.list({ page, page_size: pageSize })
+      all.push(...res.items)
+      if (all.length >= res.total) return all
+      if (res.items.length === 0) {
+        throw new Error(`角色列表分页异常：已取 ${all.length} 条但 total 为 ${res.total}`)
+      }
+      page += 1
+    }
   },
 
   /** POST /api/admin/roles */

@@ -162,8 +162,10 @@ const REGISTRY = {
       return { req: { method: 'DELETE', path: '/api/admin/roles/' + r.id }, role: r }
     },
     verify: async (s, ctx, t) => {
-      const r = await api('GET', '/api/admin/roles')
-      const hit = (r.body?.data || []).some((x) => x.name === t.role.name)
+      // v0.10.0 起角色列表是分页对象（条目在 data.items），且默认每页只有 10 条。
+      // 角色按 created_at ASC 排序，探针刚建的角色一定在末尾——
+      // 只看第一页会把"还在"误判成"被越权删了"。必须翻页找完。
+      const hit = await roleExistsByName(t.role.name)
       return { ok: hit, detail: hit ? '角色仍在（正确）' : '角色不见了——越权撤权成功' }
     },
   },
@@ -311,6 +313,25 @@ async function callApi(fn) {
 /** 带 429 重试的请求包装：注册表里所有 arm/verify 都走它 */
 const api = (m, p, b) => callApi(() => s.api(m, p, b))
 const apiAs = (tok, m, p, b) => callApi(() => s.apiAs(tok, m, p, b))
+
+/**
+ * 翻页查找指定名字的角色是否还在
+ *
+ * `GET /api/admin/roles` 自 v0.10.0 起是分页对象且默认每页 10 条，
+ * 排序为 `created_at ASC`——探针刚建的角色一定落在最后一页。
+ * 只读第一页会把"角色还在"误判成"被越权删掉了"，那样的假红比不测更糟：
+ * 它会把人引去查一个根本不存在的授权洞。
+ */
+async function roleExistsByName(name) {
+  const pageSize = 200
+  for (let page = 1; page <= 50; page++) {
+    const r = await api('GET', `/api/admin/roles?page=${page}&page_size=${pageSize}`)
+    const items = r.body?.data?.items || []
+    if (items.some((x) => x.name === name)) return true
+    if (items.length < pageSize) return false
+  }
+  return false
+}
 
 const menuIdCache = new Map()
 async function menuIdOf(code) {

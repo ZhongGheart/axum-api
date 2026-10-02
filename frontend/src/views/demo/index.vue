@@ -56,15 +56,13 @@
       </BaseModal>
     </n-card>
 
-    <!-- ── 上传组件 ──────────────────────────────────────── -->
-    <n-card title="BaseUpload 上传组件" class="demo-card">
-      <BaseUpload
-        :action="'/api/upload'"
-        mode="drag"
-        accept="image/*"
-        @success="onUploadSuccess"
-      />
-    </n-card>
+    <!--
+      BaseUpload 暂时不在这里演示。
+      原先这里写死了 `:action="'/api/upload'"`，而**这个端点全仓库不存在**——
+      控件摆在那里，点了只会得到一个 404，却又没有任何报错提示。
+      文件上传要牵出对象存储、病毒扫描、内容类型校验与配额限制，
+      是独立议题，不该为一个演示页草率接上。等后端真有了上传端点再放回来。
+    -->
   </div>
 </template>
 
@@ -77,7 +75,7 @@
 import { ref } from 'vue'
 import { useMessage } from 'naive-ui'
 import type { FormRules, DataTableColumn } from 'naive-ui'
-import { BaseChart, BaseForm, BaseModal, BaseUpload, EnhancedBaseTable } from '@/components/common'
+import { BaseChart, BaseForm, BaseModal, EnhancedBaseTable } from '@/components/common'
 import type { FormField } from '@/components/common'
 
 const message = useMessage()
@@ -151,9 +149,6 @@ function onTableSearch(keyword: string) {
 
 // ── 上传 ────────────────────────────────────────────────────
 
-function onUploadSuccess() {
-  message.success('上传成功')
-}
 </script>
 
 <style scoped>
