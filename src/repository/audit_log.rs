@@ -2,6 +2,7 @@
 //!
 //! 只提供读取能力：写入由 `middleware::audit_log` 异步完成。
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use crate::error::AppError;
@@ -53,5 +54,49 @@ impl AuditLogRepository {
             .map_err(|e| AppError::InternalServerError(format!("查询日志失败: {e}")))?;
 
         Ok(PaginatedResponse::new(items, total.0, page, page_size))
+    }
+
+    /// 删除 `cutoff` 之前的日志，返回实际删除行数
+    ///
+    /// **分批**删除，而不是一条 `DELETE FROM audit_logs WHERE created_at < $1`：
+    /// 一次性删几十万行会长时间持锁并把 WAL 撑爆，期间其他事务只能干等。
+    /// 分批把锁持有时间切碎；某批没删满即说明已删到 cutoff 附近，提前收工。
+    ///
+    /// 子查询按 `created_at` 升序取最旧的一批，
+    /// 正好反向扫描 `idx_audit_logs_created`，不必全表排序。
+    pub async fn delete_older_than(
+        &self,
+        cutoff: DateTime<Utc>,
+        batch_size: i64,
+        max_batches: u32,
+    ) -> Result<u64, AppError> {
+        let batch_size = batch_size.max(1);
+        let mut total_deleted: u64 = 0;
+
+        for _ in 0..max_batches {
+            let deleted = sqlx::query(
+                r#"
+                DELETE FROM audit_logs WHERE id IN (
+                    SELECT id FROM audit_logs
+                    WHERE created_at < $1
+                    ORDER BY created_at
+                    LIMIT $2
+                )
+                "#,
+            )
+            .bind(cutoff)
+            .bind(batch_size)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("清理过期操作日志失败: {e}")))?
+            .rows_affected();
+
+            total_deleted += deleted;
+            if deleted < batch_size as u64 {
+                break;
+            }
+        }
+
+        Ok(total_deleted)
     }
 }

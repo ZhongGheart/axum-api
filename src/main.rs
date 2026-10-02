@@ -8,6 +8,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use axum_api::config;
 use axum_api::router::create_router;
+use axum_api::service::audit_retention::spawn_audit_retention;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,8 +23,17 @@ async fn main() -> anyhow::Result<()> {
     let addr = config.server_addr;
     tracing::info!("配置加载完成，监听地址: {addr}");
 
+    // 清理策略要在配置移交给 create_router 之前取一份副本
+    let audit_log_cfg = config.audit_log.clone();
+
     // ── 构建路由 ───────────────────────────────────────────────
-    let app = create_router(config).await?;
+    let (app, state) = create_router(config).await?;
+
+    // ── 后台任务 ───────────────────────────────────────────────
+    // 归 main 启动：它们属于进程生命周期。优雅关闭时会先停掉，
+    // 其中指标任务会做最后一次 flush，避免关停瞬间的指标丢失。
+    let metrics_flush_task = state.metrics_collector.spawn_flush_task();
+    let audit_retention_task = spawn_audit_retention(state.db_pool.writer().clone(), audit_log_cfg);
 
     // ── 启动服务器（带优雅关闭） ────────────────────────────────
     tracing::info!("服务器启动中 → http://{addr}");
@@ -38,6 +48,12 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // ── 收尾：先停后台任务，再退出 ──────────────────────────────
+    metrics_flush_task.shutdown().await;
+    if let Some(task) = audit_retention_task {
+        task.shutdown().await;
+    }
 
     Ok(())
 }

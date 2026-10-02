@@ -1228,3 +1228,177 @@ Node 22 自带全局 `WebSocket`，于是直接用 **CDP** 驱动**真实的 Goo
 
 1. 计划第 4 项：运维债（审计日志保留策略、接口耗时跨副本聚合）
 2. 全部完成后统一推送 `v0.7.0`（当前 `ad09d294` + 第 3 项两个 commit 均未推送）
+
+# v0.7.0 计划第 4 项 — 运维债（审计日志保留、接口耗时跨副本聚合）
+
+## 动手前确认的两件事（其中一件推翻了原计划）
+
+### 1. 审计日志确实无界增长
+
+`audit_logs` 每个已认证请求插一行，`middleware::audit_log` 无任何清理，
+表结构也没有分区。`idx_audit_logs_created` 只加速查询，不限制增长。
+
+### 2. 指标路径未归一化——这是原计划的**前置阻塞项**
+
+`api_metrics_mw` 记的是 `req.uri().path()`，即**含真实 ID 的具体路径**。
+实测（admin token，打两个不同的 UUID）：
+
+```
+总条目: 13 | 含 UUID 路径条目: 2
+    GET /api/admin/users/11111111-1111-4111-8111-111111111111 calls= 1
+    GET /api/admin/users/22222222-2222-4222-8222-222222222222 calls= 1
+```
+
+每个资源 ID 一条独立记录，于是：
+
+- **基数无界**：HashMap 按 ID 无限增长
+- **监控页失去意义**：`/api/admin/users/{id}` 每个只出现一次、count=1，
+  管理员看不出这个接口真实的 QPS 与耗时分布
+
+原先"进程内"只是让这个缺陷表现为内存涨；**一旦改成 Redis 聚合，
+就变成每个 UUID 一个 Redis key**，从内存问题升级成共享 Redis 的内存问题。
+因此路径归一化必须与聚合一起做，且**先做**。
+
+## 方案
+
+### 4a. 路径归一化（前置）
+
+改用 axum 的 `MatchedPath` 扩展取**路由模板**（`/api/admin/users/{id}`），
+未匹配路由（404）回退到原始 URI 路径——否则 404 流量会全部塌成一个键。
+
+### 4b. 指标聚合落到 Redis
+
+`MetricsCollector` 改为「本地增量缓冲 + 定时 flush 到 Redis」：
+
+- 本地 `Mutex<HashMap>` 只做合并，不碰网络（请求路径上零 Redis 往返）
+- 后台任务每 `METRICS_FLUSH_INTERVAL_SECONDS`（默认 5s）把增量 `HINCRBY` 进 Redis
+- `snapshot()` 时把**尚未 flush 的本地增量**合并进 Redis 读数，
+  免得页面最多等 5 秒才看到刚发生的调用
+- Redis key `metrics:ep:{method} {path}`，HASH 存 `c/e/t/mx/mn`，TTL 兜底防泄漏
+- **max/min 用 Lua `EVAL` 原子更新**：读改写会有竞态，
+  两个副本同时上报时可能丢一次极值
+- **flush 失败不清空本地缓冲**，留到下一轮重试。Redis 短暂故障不丢指标；
+  缓冲超过上限则告警并丢弃，防止 Redis 长期不可用时无限涨
+- `reset()` 改为「清本地缓冲 + 删 Redis 全部键」，
+  即**跨副本重置**。此前只清本进程，别的副本照旧累加——这本身是个真 bug
+
+优雅关闭时做最后一次 flush，损失上界为 0（崩溃则 ≤ 一个 flush 间隔）。
+
+顺带修一个既有隐患：`min_duration_ms` 以 `0` 当"未设置"，
+但亚毫秒请求的耗时**真的就是 0**，会被后续更大的值覆盖。改用 `Option<u64>`。
+
+### 4c. 审计日志保留策略
+
+新增 `AuditLogConfig`（`AUDIT_LOG_RETENTION_DAYS` 默认 90 天，
+`AUDIT_LOG_CLEANUP_INTERVAL_SECONDS` 默认 3600，
+`AUDIT_LOG_CLEANUP_BATCH_SIZE` 默认 10000）。设为 0 即关闭自动清理。
+
+删除**分批**执行，每轮最多若干批、删空即止：
+
+```sql
+DELETE FROM audit_logs WHERE id IN (
+  SELECT id FROM audit_logs WHERE created_at < $1 ORDER BY created_at LIMIT $2
+);
+```
+
+一次性 `DELETE` 大量行会长时间持锁并膨胀 WAL；分批把锁持有时间切碎。
+借 `idx_audit_logs_created` 反向扫描最旧的一批。
+
+**删除必须留痕**：`tracing::info!` 记录截止时间点与删除行数。
+审计数据被静默删除是不可接受的——出事后没人知道日志是什么时候没的。
+
+## 后台任务归属
+
+后台任务由 `main.rs` 启动，**不放进 `create_router`**：
+测试反复构建应用，若在 `create_router` 里 spawn，
+每个测试进程都会残留一批清理任务去打共享测试库。
+进程生命周期归 `main` 管，应用构建只管组装。
+
+## 起始 git 状态
+
+- 分支 `v0.7.0`，HEAD = `0453e060`（计划第 3 项）
+- 工作区干净；`ad09d294` / `0453e060` 均**未推送**
+
+## 计划第 4 项完成记录（运维债，**尚未推送**）
+
+### 落地内容
+
+- `config`：`AuditLogConfig` + `MetricsConfig`（见下表环境变量）
+- `middleware/api_metrics.rs`：**整体重写**为「本地增量缓冲 + 定时 flush 到 Redis」
+- `service/audit_retention.rs`：新增审计日志保留后台任务
+- `repository/audit_log.rs`：`delete_older_than`（分批）
+- `router/mod.rs`：`create_router` 返回 `(Router, AppState)`，
+  collector 改用 Redis 构造；后台任务**不在这里 spawn**
+- `main.rs`：启动两个后台任务，优雅关闭时先停任务（触发最后一次 flush）
+
+### 新增环境变量
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `AUDIT_LOG_RETENTION_DAYS` | 90 | 审计日志保留天数，0 = 关闭自动清理 |
+| `AUDIT_LOG_CLEANUP_INTERVAL_SECONDS` | 3600 | 清理间隔 |
+| `AUDIT_LOG_CLEANUP_BATCH_SIZE` | 10000 | 单批删除行数 |
+| `AUDIT_LOG_CLEANUP_MAX_BATCHES` | 20 | 单轮最多批数 |
+| `METRICS_FLUSH_INTERVAL_SECONDS` | 5 | 指标 flush 间隔（崩溃最多丢这么久） |
+| `METRICS_KEY_TTL_SECONDS` | 604800 | Redis 指标键 TTL（7 天） |
+| `METRICS_MAX_BUFFERED_ENDPOINTS` | 10000 | 本地缓冲端点数上限（Redis 长期挂时的兜底） |
+
+### 门禁结果（全绿）
+
+- `cargo fmt --check` / `clippy -D warnings`：clean
+- `cargo test --lib`：49 → **55**（+6）
+- 集成测试：56 → **63**（+7）
+- 前端未改动（本项纯后端），故未重跑前端门禁
+
+新增 6 条单元测试（合并算术、0 值 min 语义、avg 不除零、拆键剥前缀）；
+新增 7 条集成测试（路径模板归并、跨副本聚合、跨副本重置、未 flush 增量可见、
+部分已落库仍为一行、审计只删过期、分批且受上限约束）。
+
+### 缺陷注入验证（两条都真实失败）
+
+1. 路径改回 `req.uri().path()` → 路径模板归并测试 FAILED：
+ 实得**两行、每行 call_count=1**（正是原缺陷），期望一行 call_count=2
+2. `reset()` 改回只清本地缓冲 → 跨副本重置测试 FAILED：实得残留数据
+
+### 注入过程中暴露的两个真 bug（都已修 + 补测试）
+
+这是本次最值得记的部分——**注入验证不只是"确认测试有效"，
+读失败输出时发现了实现本身的两个 bug**：
+
+1. **`method` 变成 `metrics:ep:GET`**。`split_key` 忘了剥 Redis 键前缀。
+   之前所有测试都只断言 `path`（剥不剥前缀 path 都对），所以一直没暴露；
+   是失败输出里那行 `"method": "metrics:ep:GET"` 让我发现的。
+   已修 + 补单测 + 在集成测试里显式断言 `method == "GET"`
+2. **同一端点裂成两行**。`snapshot()` 合并时，Redis 键带前缀、本地缓冲键不带，
+   两者塞进同一张 map 成为两条独立记录 → **重复计数**。
+ 已修（插入前统一 `normalize_key`）+ 补测试
+   `one_endpoint_stays_one_row_when_it_is_partly_flushed_and_partly_pending`。
+   这个测试也是先写出来才暴露的——没有它，这个 bug 会带着"看起来正常"的
+   分行数据进生产
+
+教训：**只断言部分字段的测试，会给未断言字段留出静默出错的空间**。
+ 拆键、前缀这类"看起来无所谓"的地方最容易漏。断言要覆盖到人眼会看的每一列。
+
+### 真实进程验证（不止单测）
+
+- 起真实二进制（`METRICS_FLUSH_INTERVAL_SECONDS=2`、`AUDIT_LOG_CLEANUP_INTERVAL_SECONDS=20`）：
+ 三个不同 UUID 的请求归并成一行 `calls=3`；Redis 键 TTL ≈ 604785s（7 天）；
+ HASH 字段为 `c/e/t/mx/mn`
+- 造 1200 条过期日志 → 20s 周期自动清空（分批 500），保留期内 108 条未受影响
+- 保留任务 `info` 日志确认留痕：
+ `已清理过期操作日志 截止时间=... 删除行数=9`
+- 优雅关闭：请求后立即 SIGTERM，指标仍落库，日志
+ `接口指标已全部写入 Redis`
+- 真实 Chrome 打开接口监控页：按模板聚合、`method` 干净、`{user_id}` 一行
+
+### 已知取舍（诚实记录，非缺陷）
+
+- Redis 被 flush 或未持久化时指标会丢。对监控数据可接受，
+ 换来跨副本准确 + 重启不丢（优雅关闭不丢，崩溃最多丢一个 flush 间隔）
+- 多副本各自跑清理任务，无选主。因删除分批、走同一条索引、幂等，
+  只是徒增锁竞争、不会错删，故未引入分布式锁
+
+## v0.7.0 当前状态
+
+- 本地共 **3 个 commit，均未推送**（按用户指令：全部做完再统一推送）
+- 计划 4 项已全部完成
