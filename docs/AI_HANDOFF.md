@@ -1678,3 +1678,45 @@ carrier holds after  = []
 - 分支 `v0.8.0`（从 master 切出）
 - HEAD = `0715ece9 docs(handoff): 记录 v0.7.0 发布结果与 ref 歧义坑复发`
 
+---
+
+## ✅ v0.8.0 已发布（2026-10-02）
+
+https://github.com/ZhongGheart/axum-api/releases/tag/v0.8.0
+
+### 发布动作（全部已完成）
+
+| 步骤 | 结果 |
+|---|---|
+| PR #7 squash 合并进 `master` | `554859dc` |
+| tag `v0.8.0` 打在 merge commit 上 | `refs/tags/v0.8.0` → `554859dc` |
+| Release 已发布 | 非 draft、非 prerelease，且是 latest |
+| 删 `v0.8.0` 分支 | 见下 |
+| master CI | 三个 job 全绿 |
+
+`master` 从 `0715ece9`（v0.7.0 发布记录）前进到 `554859dc`。
+
+### ref 歧义坑这次没有复发
+
+v0.7.0 发布时踩过一次：`git push origin v0.7.0` 报
+`refspec matches more than one`，因为本地分支与新 tag 同名（记于 `cf8cbdde`）。
+**这次打 tag 时直接用了完整 refspec，一次推成功**：
+
+```
+git push origin refs/tags/v0.8.0:refs/tags/v0.8.0
+```
+
+这说明上次把它写进文档是有用的——真正的修复是"形成操作纪律"，
+而不是"再记一遍"。
+
+### 本版的核心结论：计划阶段会记错，实测阶段才会发现
+
+留档给下一项的 `create_menu` 授权下界（v0.7.0 写下、v0.8.0 计划照抄）
+**是被实测推翻的**：那个洞早被迁移 `007` 的唯一索引堵住，
+真正没堵的是 `delete_menu`。已把那段原文标注为"已被推翻，勿照此施工"，
+而不是删掉——删掉的话，后人仍可能从别处的转述里捡起这个错误前提。
+
+**教训**：授权类改动不要靠读代码推断"哪里没守"，先写探针把攻击链跑一遍。
+本版的两个洞（delete 无守卫、delete 级联删子树）都是探针跑出来的，
+不是看代码看出来的。
+
