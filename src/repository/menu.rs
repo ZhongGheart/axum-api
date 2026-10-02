@@ -30,6 +30,31 @@ fn prefixed_menu_columns() -> String {
         .join(", ")
 }
 
+/// 把写路径上的数据库约束冲突翻译成可操作的业务错误
+///
+/// 有两条约束原本会以 500「服务器内部错误」的形式冒到界面上，
+/// 而它们都是**入参问题**，不是服务端故障：
+///
+/// - `idx_menus_permission_unique`（迁移 `007`）：权限码必须唯一
+/// - `menus_type_check`：`type` 只能是 `menu` / `button` / `directory`
+///
+/// 入参错误报 500 有两个代价：错误监控被入参噪声污染，
+/// 且管理员在界面上只看到「服务器内部错误」，完全不知道该怎么改。
+///
+/// 唯一索引还有一个额外作用：并发下两个请求可能都通过了
+/// controller 的占用预查，最终由索引裁决——那条路也必须报冲突而不是 500。
+fn map_write_violation(e: sqlx::Error, fallback: String) -> AppError {
+    match e.as_database_error().and_then(|db| db.constraint()) {
+        Some("idx_menus_permission_unique") => {
+            AppError::Conflict("该权限码已被其他菜单使用".to_string())
+        }
+        Some("menus_type_check") => {
+            AppError::BadRequest("菜单类型只能是 menu / button / directory 之一".to_string())
+        }
+        _ => AppError::InternalServerError(fallback),
+    }
+}
+
 impl MenuRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -131,13 +156,9 @@ impl MenuRepository {
         .bind(menu.is_visible)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| match e.as_database_error().and_then(|db| db.constraint()) {
-            // 并发下两个请求可能都通过了 controller 的占用预查，
-            // 最终由唯一索引裁决。此时同样报冲突，而不是 500。
-            Some("idx_menus_permission_unique") => AppError::Conflict(
-                "该权限码已被其他菜单使用".to_string(),
-            ),
-            _ => AppError::InternalServerError(format!("创建菜单失败: {e}")),
+        .map_err(|e| {
+            let fallback = format!("创建菜单失败: {e}");
+            map_write_violation(e, fallback)
         })
     }
 
@@ -300,7 +321,10 @@ impl MenuRepository {
         .bind(prev_permission_cleared_by)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| AppError::InternalServerError(format!("更新菜单失败: {e}")))
+        .map_err(|e| {
+            let fallback = format!("更新菜单失败: {e}");
+            map_write_violation(e, fallback)
+        })
     }
 
     /// 把 `prev_permission` 写回 `permission`

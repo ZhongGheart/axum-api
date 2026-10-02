@@ -4046,3 +4046,40 @@ async fn deleting_a_directory_with_a_granted_button_below_is_denied() {
 
     cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
 }
+
+/// 非法的菜单类型应报 400，而不是服务器内部错误
+///
+/// `menus_type_check` 只允许 `menu` / `button` / `directory`。
+/// 修复前这个约束冲突会冒成 500「服务器内部错误」——入参问题被当成
+/// 服务端故障，既污染错误监控，管理员也不知道该改成什么。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_invalid_menu_type_is_a_bad_request() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&admin_tok),
+            Some(json!({
+                "name": unique("bad_type"),
+                "type": "page",
+                "path": format!("/{}", unique("badtype"))
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "非法菜单类型应报 400，实际: {body}"
+    );
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("menu") && msg.contains("button") && msg.contains("directory"),
+        "报错要告诉管理员合法取值是什么，实际: {msg}"
+    );
+}

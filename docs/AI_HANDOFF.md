@@ -1126,6 +1126,16 @@ if let Some(new_permission) = req.permission.as_deref().filter(|p| !p.is_empty()
 - `MenuNode`：新增 `restorable_permission`；**刻意不暴露** `cleared_by`
 - 前端：菜单树行显示"码已清空，可恢复 X"标签 + 恢复按钮
 
+### 真实浏览器回归 13/13（`/tmp/axum-e2e/delguard.mjs`）
+
+集成测试证明不了"守卫没有误伤正常管理流程"，所以补了真实 Chrome 回归：
+无码页面菜单可正常新建+删除（放行）、被他人依赖的码删除被拒 403 且码没被剥掉、
+撤销授权后删除放行（恢复路径真实可用）、菜单页正常渲染、无 console error。
+
+**这次回归顺带挖出 `menus_type_check` 也报 500**（见上方"计划外补的一项"）——
+我的脚本传了 `type: "page"` 拿到 500 才注意到。教训：
+写浏览器回归脚本时用错枚举值，恰好暴露了产品缺陷。
+
 ### 门禁结果（全绿）
 
 - `cargo test --lib`：49
@@ -1608,6 +1618,10 @@ carrier holds after  = []
 - `MenuRepository::is_permission_taken(code)`：权限码占用预查
 - `delete_menu` 装上授权下界，与 v0.7.0 的 update 守卫语义对齐
 - `create_menu` 加占用预查；`MenuRepository::create` 把唯一索引冲突映射成 `Conflict`
+- **计划外补的一项**：`menus_type_check`（`type` 非法值）原本也冒成 500。
+ 与权限码那条同源，现统一由 `map_write_violation` 翻译，覆盖 create/update 两条写路径。
+ 这是我在真实浏览器回归里撞出来的——脚本传了 `type: "page"` 拿到 500。
+ 不修的话等于把一个已知会误导管理员的 500 留在刚动过的函数里
 
 ### 一个设计要点：守卫不能把菜单锁死
 
@@ -1621,12 +1635,13 @@ carrier holds after  = []
 刻意**没有**给 admin 开后门：handoff 里既定的设计决定第 3 条
 "admin 是数据上的超级用户，不是代码里的后门"仍然成立。
 
-### 测试：集成测试 63 → 67（新增 4 条）
+### 测试：集成测试 63 → 68（新增 5 条）
 
 `deleting_a_granted_button_others_rely_on_requires_holding_it`、
 `deleting_a_directory_with_a_granted_button_below_is_denied`、
 `deleting_a_button_no_role_relies_on_is_allowed`、
-`declaring_an_already_used_permission_code_is_a_conflict`
+`declaring_an_already_used_permission_code_is_a_conflict`、
+`an_invalid_menu_type_is_a_bad_request`
 
 ### 缺陷注入验证（四条，含一条鉴别性结果）
 
@@ -1636,6 +1651,7 @@ carrier holds after  = []
 | 子树查询去掉递归 | 目录级联那条变红，直接删按钮那条**仍绿** |
 | 移除占用预查 | 冲突用例**仍绿** |
 | 预查与索引映射都移除 | 冲突用例变红 |
+| 移除 `menus_type_check` 分支 | 类型用例变红 |
 
 第二条证明递归查询真正承重，且两条用例覆盖**不同的**攻击路径
 （删按钮 / 删父目录）。这是本轮最有价值的一次注入。
@@ -1649,8 +1665,8 @@ carrier holds after  = []
 
 - `cargo fmt --all --check` / `cargo clippy --locked --all-targets --all-features -D warnings`：clean
 - 单元测试 55（未变，本项无纯逻辑单元可拆）
-- 集成测试 63 → 67
-- 前端未改动，故未重跑前端门禁（本项 diff 只碰 3 个 Rust 文件 + 文档/版本）
+- 集成测试 63 → 68
+- 前端代码未改动，但版本号有动，故仍跑了前端门禁：lint / typecheck / vitest 84 全绿
 
 ### 起始 git 状态
 
