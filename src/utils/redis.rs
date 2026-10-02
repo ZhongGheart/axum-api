@@ -125,16 +125,21 @@ impl RedisClient {
 
     /// 吊销某用户当前及之前签发的全部令牌
     ///
-    /// 记录"吊销时间点"，`iat` 早于该时间点的令牌一律失效。
-    /// 新登录签发的令牌 `iat` 不早于该时间点，因此不会被误伤。
+    /// 记录"吊销时间点"（**毫秒**），签发时间早于该时间点的令牌一律失效。
+    /// 新登录签发的令牌不早于该时间点，因此不会被误伤。
     /// TTL 取令牌最长有效期，过期后键自动清理。
+    ///
+    /// 必须毫秒而非秒：JWT 标准的 `iat` 只有秒级精度，若水位也只存到秒，
+    /// "吊销前签发"与"吊销后签发"会落在同一秒内无法区分——
+    /// 秒级方案只能二选一（放过旧令牌 / 误伤新登录），两个都是错的。
+    /// 与 `Claims::iat_ms` 配套使用。
     pub async fn revoke_user_sessions(
         &self,
         user_id: &uuid::Uuid,
         ttl_seconds: u64,
     ) -> Result<u64> {
         let key = format!("{}{}", Self::USER_REVOKED_PREFIX, user_id);
-        let revoked_before = chrono::Utc::now().timestamp() as u64;
+        let revoked_before = chrono::Utc::now().timestamp_millis() as u64;
         let mut conn = self.conn.clone();
         let _: () = conn
             .set_ex(key, revoked_before, ttl_seconds.max(1))

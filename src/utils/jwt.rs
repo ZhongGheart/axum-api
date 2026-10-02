@@ -24,6 +24,22 @@ pub struct Claims {
     pub username: String,
     /// 签发时间（Unix 时间戳，JWT 标准要求 u64）
     pub iat: u64,
+    /// 签发时间（Unix **毫秒**时间戳）
+    ///
+    /// 只用于会话吊销比对，不能拿它替代 `iat`：`exp` 的校验由
+    /// jsonwebtoken 按标准 `iat`/`exp`（秒）完成。
+    ///
+    /// 之所以要多一个claim，是因为 JWT 标准的 `iat` 只有**秒**级精度，
+    /// 而吊销时间点若也只存到秒，就分不清"令牌在吊销之前签发"与
+    /// "令牌在吊销之后签发"——两者可能落在同一秒里。此时任何秒级方案
+    /// 都必须二选一：要么放过旧令牌（漏吊销），要么误伤新登录的令牌。
+    /// 实测正是如此：登录后立刻改角色，旧令牌仍可用。
+    ///
+    /// `serde(default)` 让升级前签发的旧令牌仍能解析（此时为 0），
+    /// 且 0 一定小于任何吊销时间点 —— 方向是**失效**而非放行，
+    /// 即升级后首次吊销会把存量令牌一并作废，这是安全的一侧。
+    #[serde(default)]
+    pub iat_ms: u64,
     /// 过期时间（Unix 时间戳，JWT 标准要求 u64）
     pub exp: u64,
 }
@@ -71,6 +87,7 @@ impl JwtUtil {
             jti: Uuid::new_v4().to_string(),
             username: username.to_string(),
             iat: now,
+            iat_ms: chrono::Utc::now().timestamp_millis() as u64,
             exp: now + expiration_seconds,
         };
 

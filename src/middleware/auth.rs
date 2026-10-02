@@ -123,7 +123,11 @@ pub async fn auth_middleware(
                 "认证依赖不可用，请稍后重试",
             )
         })?;
-    if matches!(revoked_before, Some(ts) if claims.iat < ts) {
+    // 用毫秒级 `iat_ms` 比对，不用秒级 `iat`：秒级精度分不清
+    // "同一秒内先签发还是后签发"，会导致要么放过旧令牌、要么误伤新登录。
+    // 旧令牌（升级前签发）没有 `iat_ms`，serde 默认为 0，
+    // 一定小于任何吊销水位 —— 方向是失效，安全的一侧。
+    if matches!(revoked_before, Some(ts) if claims.iat_ms < ts) {
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
             "登录状态已失效，请重新登录",

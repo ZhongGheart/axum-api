@@ -18,7 +18,10 @@ use utoipa::OpenApi as _;
 #[openapi(
     info(
         title = "Axum Admin API",
-        version = "0.4.0",
+        // 版本号从 Cargo 派生，不再手写。手写的那份在 v0.4.0 之后
+        // 连续四版都没跟着 Cargo.toml 走，直到 v0.9.0 对账才发现 ——
+        // 凡是"该跟着别处走"的值，就不该有两份。
+        version = env!("CARGO_PKG_VERSION"),
         description = "基于 Axum + SQLx + JWT 的管理后台 API。规范由代码生成，与实现保持同步。",
     ),
     paths(

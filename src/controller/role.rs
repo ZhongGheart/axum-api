@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::permission::{
-    ensure_can_grant_roles, PermRoleCreate, PermRoleDelete, PermRoleList, PermRoleUpdate,
-    PermUserList, PermUserUpdate,
+    codes_of_roles, ensure_can_grant_roles, PermRoleCreate, PermRoleDelete, PermRoleList,
+    PermRoleUpdate, PermUserList, PermUserUpdate,
 };
 use crate::model::{normalize_role_name, ApiResponse, BUILTIN_ROLES};
 use crate::router::AppState;
@@ -112,6 +112,16 @@ pub async fn assign_user_role(
     // 与用户表单的 role 字段走同一套归一化，否则同一个角色
     // 经本接口提交 "Admin" 会 404、经表单提交 "admin" 却成功
     let role_name = normalize_role_name(&req.role_name)?;
+    // 目标用户必须存在。此前本接口直接写 `user_roles`，用户不存在时
+    // 外键违例冒成 500「服务器内部错误」——与 v0.8.0 修的
+    // 「声明已占用的权限码冒成 500」同源：入参错误被当成服务端故障，
+    // 既污染错误监控，调用方也看不懂到底是路径错了还是系统坏了。
+    state.auth_service.user_repo.find_by_id(user_id).await?;
+    let current_roles = state
+        .auth_service
+        .role_repo
+        .find_roles_by_user_id(user_id)
+        .await?;
     // 授权下界（v0.5.0 PR-3）：本接口是**追加**语义，不会覆盖既有角色，
     // 因此用户表单那道"整体替换"的守卫覆盖不到它——`role_name=admin`
     // 曾经是一条独立的提权路径，必须单独判定。
@@ -122,11 +132,31 @@ pub async fn assign_user_role(
         &format!("追加角色「{role_name}」"),
     )
     .await?;
+    // 授权下界（v0.9.0）：还要查**目标用户当前的角色**。
+    // 上一条只管"授予什么"，不管"授予给谁"，于是只持 `system:user:update`
+    // 的角色能给一个纯 admin 账号追加角色（实测 200，角色真的变了），
+    // 而 `update_user` / `delete_user` / `batch_delete_users` 三处都查目标。
+    // 把自己追加弱角色不受影响：调用者天然覆盖自己的全部权限码，
+    // 这条守卫对自己是恒真的——合法的自我降级路径不会被误伤。
+    ensure_can_grant_roles(&state, perm.guard(), &current_roles, "修改该用户的角色").await?;
+    // 幂等：已持有该角色时不写库、也不吊销会话。
+    // `assign_role_to_user` 用 `ON CONFLICT DO NOTHING`，重复调用本就什么都没写，
+    // 若照样吊销会话就是把一次无操作变成一次强制登出。
+    let already_held = current_roles.iter().any(|r| r == &role_name);
     state
         .auth_service
         .role_repo
         .assign_role_to_user(user_id, &role_name)
         .await?;
+    if !already_held {
+        // 权限已变化：吊销存量会话，旧令牌不得继续携带旧角色。
+        // 与 `update_user` 同一套处理——否则新授的码要等目标用户
+        // 自己重新登录才生效（实测：追加后原令牌仍 403，重新登录才 200）。
+        state
+            .auth_service
+            .revoke_all_sessions(&state.redis_client, user_id)
+            .await?;
+    }
     Ok(Json(ApiResponse::success("角色分配成功")))
 }
 
@@ -291,7 +321,7 @@ pub async fn update_role(
 )]
 pub async fn delete_role(
     State(state): State<AppState>,
-    _perm: PermRoleDelete,
+    perm: PermRoleDelete,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     let mut tx = state
@@ -315,6 +345,29 @@ pub async fn delete_role(
     // 内置角色不可删除：角色种子只在 roles 表为空时写入，删掉不会被重建
     if BUILTIN_ROLES.contains(&name.as_str()) {
         return Err(AppError::BadRequest(format!("内置角色「{name}」不可删除")));
+    }
+
+    // 授权下界（v0.9.0）：删角色 = 把这个角色承载的权限码从所有人身上撤走，
+    // 与 `PUT /roles/:id/menus`（给角色授权）是同一件事的两面，那条路 v0.7.0
+    // 就装了这道天花板，这条路当时没管。
+    //
+    // 实测（探针，非读代码推断）：只持 `system:role:delete` 的操作员可以删掉
+    // 一个承载 `system:log:list` 的角色——那个码他自己并不持有。
+    // 于是"只能授予自己已持有的权限"这条不变量，在删除这条路上是失效的。
+    //
+    // 放在内置角色检查**之后**：内置角色永不可删，这是与权限无关的固有事实，
+    // 若先报"缺少权限：X"，操作员会误以为拿到 X 就能删内置角色——
+    // 那是在把人往错误的方向引。鉴权该早于的是"这个角色有几个人在用"
+    // 这类**随调用者而变**的信息，它仍在下面那句校验之前。
+    //
+    // 不像 `delete_menu` 那样要判断"是否有人依赖"——角色只要存在，
+    // 它携带的码就都在生效，删掉必然改变每个人的权限。
+    let granted_codes = codes_of_roles(&state, std::slice::from_ref(&name)).await?;
+    if !granted_codes.is_empty() {
+        perm.guard().ensure_covers(
+            &granted_codes,
+            &format!("删除承载权限码「{}」的角色", granted_codes.join("、")),
+        )?;
     }
 
     // 仍有用户持有该角色时拒绝删除：user_roles 的 ON DELETE CASCADE 会

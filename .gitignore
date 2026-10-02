@@ -37,3 +37,9 @@ Thumbs.db
 sqlx-data.json
 .pnpm-store/
 node_modules/.pnpm-store/
+
+# ==============================
+# e2e 回归产物
+# ==============================
+# 截图、下载、Chrome 临时 profile：每次跑都重新生成，不该进版本库
+e2e/.artifacts/
