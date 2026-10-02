@@ -65,7 +65,7 @@
 - 新增 `AppError::PermissionDenied(String)`，403 响应体带缺失权限码。
 - 迁移 `migrations/007_permission_codes_unique.sql`：`menus.permission` 部分唯一索引。
 - `seed_navigation` 拆分：菜单树"仅 menus 为空才写"，权限码**无条件幂等补齐**
-  （v0.3 升级库 menus 非空但无按钮行）。**只对新���建的权限码行授予 admin**
+  （v0.3 升级库 menus 非空但无按钮行）。**只对新建的权限码行授予 admin**
   ——否则每次启动补授权会把管理员被显式撤销的权限悄悄恢复。已实测：撤销后重启，撤销保持。
 - `get_items_by_code`（`/api/dict/{code}/items`）**刻意不设权限码**：普通页面的
   DictSelect 依赖它，加了会让非管理员的字典下拉全部失效。
@@ -1506,3 +1506,93 @@ git push origin refs/tags/v0.7.0:refs/tags/v0.7.0
 
 另外 `docker` job 本机无法复现（无 Docker daemon），只在 CI 上验证过；
 它在 CI 上通过，所以分支的验证是完整的。
+
+---
+
+# v0.8.0 第 1 项 —— 菜单删除的授权下界（原计划前提被实测推翻）
+
+## 计划前提被实测推翻
+
+v0.7.0 留档的原计划是："`create_menu` 无授权下界，
+持 `system:menu:create` 的角色可以声明一个后端认识的码再分发给别的角色"，
+候选规则为"只允许声明当前没有任何菜单在用的码"。
+
+**实测结论：那个洞其实早就被堵上了，堵的方式和预期不同；
+而真正没被堵住的洞在 `delete_menu`。**
+
+## 实测证据（三条探针，跑完已丢弃，不留在仓库）
+
+### 探针 1：声明既有码会被数据库挡下
+
+用 admin 建一个 `permission = system:user:delete` 的按钮 →
+**500 Internal Server Error**，message 是"服务器内部错误"。
+
+挡住它的是迁移 `007` 的部分唯一索引：
+
+```
+CREATE UNIQUE INDEX idx_menus_permission_unique
+    ON menus (permission) WHERE permission IS NOT NULL AND permission <> '';
+```
+
+所以"声明一个既有码"在**数据库层**就被拒绝，不需要额外授权下界。
+原计划设想的规则已经被索引免费提供了。
+
+但代价是**入参错误被当成服务端故障**：该返回 400/409，实际返回 500。
+这会污染错误监控，也让管理员看不懂发生了什么。
+
+### 探针 2：create → delete → create 同一个码，三步全部 200
+
+delete 释放了唯一索引占位，于是同一个码可以被重新声明。
+**说明"唯一索引"这个下界可以被 delete 绕过**，它不是可靠的授权边界。
+
+### 探针 3（决定性）：删除已授予角色的按钮会把码从那个角色身上剥掉
+
+夹具：把一个临时码的按钮授予 carrier 角色；
+另建 deleter 角色，**只持 `menu:list` + `menu:delete`**（不持该码，也无 `menu:grant`）。
+
+```
+carrier holds before = ["probe:revoke:02f64"]
+deleter delete status = 200 OK
+carrier holds after  = []
+```
+
+**持 `system:menu:delete` 的角色，对别的角色完成了一次跨角色撤权，
+全程绕过 `system:menu:grant`。**
+
+## 真正的问题：v0.7.0 修的是同一个洞的一半
+
+| 入口 | v0.7.0 之后 | 后果 |
+|---|---|---|
+| `update_menu` 清空已授权按钮的码 | **要求持该码**（v0.7.0 新增守卫） | 安全 |
+| `delete_menu` 删掉已授权按钮 | **无任何检查** | 同样的跨角色撤权 |
+
+两条路径的**效果完全等价**（码从目标角色身上消失），
+但只堵了前者。`delete` 是锤子更大的那把：连按钮行本身都没了。
+
+自提权路径是闭合的：把码授予别的角色后，
+`ensure_can_grant_roles` 要求调用者已覆盖目标角色的码，
+所以把自己塞进那个角色会被拦下（已实测确认）。
+因此这条是跨角色**撤权**，不是自提权——但撤权本身已经足够严重。
+
+## 本项要做两件事
+
+### 1. `delete_menu` 授权下界（真正的安全修复）
+
+删除一个**携带权限码且已授予至少一个角色**的菜单时，要求持有该码。
+
+- 复用 v0.7.0 已有的 `is_granted_to_any_role`，语义与 update 的守卫完全对齐
+- 未授予任何角色的按钮照旧可删（与"清空无害"同理）
+- 目录/页面菜单不携带码，不受影响（沿用 v0.5.0 既定判断）
+- **副作用**：堵上探针 2 的 delete → recreate 绕行
+
+### 2. 声明已被占用的码返回 409 而不是 500
+
+把唯一索引冲突翻译成 `AppError::Conflict`。
+这是既有契约的补齐，不是新规则。
+
+## 起始 git 状态
+
+- 分支 `v0.8.0`（从 master 切出）
+- HEAD = `0715ece9 docs(handoff): 记录 v0.7.0 发布结果与 ref 歧义坑复发`
+- 上一版：v0.7.0 已发布（tag `v0.7.0` → merge commit `66f26595`）
+- `v0.7.0` 分支已删（远端与本地）
