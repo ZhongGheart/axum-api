@@ -23,8 +23,8 @@
         <n-form-item label="用户名" path="username">
           <n-input
             v-model:value="formData.username"
-            placeholder="3-50 个字符，字母或数字"
-            :maxlength="50"
+            :placeholder="USERNAME_PLACEHOLDER"
+            :maxlength="USERNAME_MAX_LEN"
             clearable
           >
             <template #prefix>
@@ -51,8 +51,8 @@
             v-model:value="formData.password"
             type="password"
             show-password-on="click"
-            placeholder="至少 6 个字符"
-            :maxlength="128"
+            :placeholder="PASSWORD_PLACEHOLDER"
+            :maxlength="PASSWORD_MAX_LEN"
             clearable
           >
             <template #prefix>
@@ -67,7 +67,7 @@
             type="password"
             show-password-on="click"
             placeholder="请再次输入密码"
-            :maxlength="128"
+            :maxlength="PASSWORD_MAX_LEN"
             clearable
           >
             <template #prefix>
@@ -99,7 +99,12 @@
 /**
  * 注册页面
  *
- * - 表单校验规则对齐后端（用户名 3-50 字符，密码至少 6 位，邮箱需含 @）
+ * - 表单校验规则来自 `@/utils/accountRules`，与改密页、管理员建号同源
+ *
+ * v0.18.0 之前这里写着"对齐后端（…密码至少 6 位…）"，而那正是**没对齐**的一版：
+ * 规则是 v0.10 时代手写的 `min: 6`，后端早已收紧为 8 位 + 两类字符。
+ * 用户按提示填 `abcdefgh` 能过前端校验，填完整个表单才收到 400。
+ *
  * - 密码确认校验
  * - 注册成功后自动跳转登录页
  */
@@ -114,6 +119,15 @@ import type { FormInst, FormRules } from 'naive-ui'
 import { authApi } from '@/api/auth'
 import { showSuccess } from '@/utils/message'
 import { handleError } from '@/api/helper'
+import {
+  emailRules,
+  PASSWORD_PLACEHOLDER,
+  passwordPolicyRules,
+  USERNAME_MAX_LEN,
+  USERNAME_PLACEHOLDER,
+  usernameRules,
+} from '@/utils/accountRules'
+import { PASSWORD_MAX_LEN } from '@/utils/password'
 
 // ── 状态 ────────────────────────────────────────────────────────
 
@@ -135,22 +149,16 @@ const formData = ref<RegisterForm>({
   confirmPassword: '',
 })
 
-// ── 表单校验规则（对齐后端 service/auth.rs） ──────────────────────
+// ── 表单校验规则 ────────────────────────────────────────────────
+//
+// 全部来自 `@/utils/accountRules`：口令部分委托 `utils/password.ts` 的
+// `passwordIssues`，也就是后端契约测试 `password_policy_agrees_with_the_frontend_copy`
+// 绑定的那个实现。这里不再自己写 min/max——v0.18.0 的缺陷正是"自己写了一份"。
 
 const formRules: FormRules = {
-  username: [
-    { required: true, message: '请输入用户名', trigger: 'blur' },
-    { min: 3, message: '用户名至少 3 个字符', trigger: 'blur' },
-    { max: 50, message: '用户名不能超过 50 个字符', trigger: 'blur' },
-  ],
-  email: [
-    { required: true, message: '请输入邮箱', trigger: 'blur' },
-    { type: 'email', message: '邮箱格式不正确', trigger: 'blur' },
-  ],
-  password: [
-    { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 6, message: '密码至少 6 个字符', trigger: 'blur' },
-  ],
+  username: usernameRules,
+  email: emailRules,
+  password: passwordPolicyRules,
   confirmPassword: [
     { required: true, message: '请再次输入密码', trigger: 'blur' },
     {

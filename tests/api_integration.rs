@@ -1792,19 +1792,15 @@ async fn updating_a_role_returns_the_real_row() {
     );
 
     // created_at 必须是数据库里的原值，而不是"刚刚"。
-    // 必须显式要 page_size=200：列表默认每页 10 条，而排序是 created_at ASC，
-    // 刚建的角色排在末尾，只取首页会找不到它——那是分页语义，不是 bug。
-    let (status, list) = send(
-        &app,
-        request("GET", "/api/admin/roles?page_size=200", Some(&token), None),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{list}");
-    let from_list = list["data"]["items"]
-        .as_array()
-        .expect("data.items 应为数组（v0.10.0 起角色列表是分页对象）")
-        .iter()
-        .find(|r| r["id"].as_str() == Some(&role_id.to_string()))
+    //
+    // 必须**翻页找**：列表默认每页 10 条，排序是 created_at ASC，
+    // 刚建的角色排在末尾，只取首页找不到它——那是分页语义，不是 bug。
+    // 但也不能只写死 `page_size=200` 就完事：`page_size` 上限就是 200，
+    // 而测试库的角色数会随 `operator_with_codes` 的残留一路累积
+    // （实测已过 200），于是"取 200 条"同样找不到它。
+    // 这不是分页的错，是"假设数据够少"的错——翻页找才是与数据量无关的写法。
+    let from_list = find_role_row_by_id(&app, &token, &role_id.to_string())
+        .await
         .expect("角色列表里应找得到刚更新的角色");
     assert_eq!(
         updated["data"]["created_at"].as_str(),
@@ -5387,7 +5383,91 @@ async fn audit_export_honors_filters_and_reports_truncation() {
 // 写死 `total == 5` 会被脏数据永久打红。
 // ──────────────────────────────────────────────
 
-/// 角色列表返回分页对象，逐页取回与一次取全量**完全一致**
+/// 翻页取回全部角色 id（按 `page_size` 逐页取，直到取空）
+///
+/// 角色列表**没有 keyword 参数**（`RoleListParams` 只有 page / page_size），
+/// 而 `page_size` 上限是 200。所以"一次取全量"这件事在角色总数超过 200 时
+/// **根本无法表达**——这正是下面那条用例曾经变红的原因。
+async fn all_role_ids(app: &Router, token: &str, page_size: i64) -> Vec<String> {
+    let mut ids = vec![];
+    let mut page = 1;
+    loop {
+        let (status, body) = send(
+            app,
+            request(
+                "GET",
+                &format!("/api/admin/roles?page={page}&page_size={page_size}"),
+                Some(token),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "第 {page} 页取角色失败: {body}");
+        let items = body["data"]["items"]
+            .as_array()
+            .expect("data.items 应为数组");
+        if items.is_empty() {
+            break;
+        }
+        for r in items {
+            ids.push(r["id"].as_str().unwrap_or_default().to_string());
+        }
+        page += 1;
+        assert!(page < 500, "翻页没有收敛，可能陷入死循环");
+    }
+    ids
+}
+
+/// 在分页列表里逐页找出指定 id 的那一行
+///
+/// 排序是 `created_at ASC`，刚建的角色**排在末尾**，
+/// 所以只取首页必然找不到它；而写死 `page_size=200` 在角色总数超过 200 时
+/// 也找不到——那不是分页语义，是"假设数据够少"。
+async fn find_role_row_by_id(app: &Router, token: &str, id: &str) -> Option<Value> {
+    let mut page = 1;
+    loop {
+        let (status, body) = send(
+            app,
+            request(
+                "GET",
+                &format!("/api/admin/roles?page={page}&page_size=200"),
+                Some(token),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "第 {page} 页取角色失败: {body}");
+        let items = body["data"]["items"]
+            .as_array()
+            .expect("data.items 应为数组");
+        if let Some(hit) = items.iter().find(|r| r["id"].as_str() == Some(id)) {
+            return Some(hit.clone());
+        }
+        if items.is_empty() {
+            return None;
+        }
+        page += 1;
+        assert!(page < 500, "翻页没有收敛，可能陷入死循环");
+    }
+}
+
+/// 角色列表返回分页对象，且**用两种页长翻页取回的集合完全一致**
+///
+/// ## 为什么不再断言"一次取全量"
+///
+/// 原来这条用例取 `page_size=200` 当"一页装得下全部"，再断言
+/// `total == items.len()`。可接口的 `page_size` 上限就是 200——
+/// 一旦库里角色超过 200 条（`operator_with_codes` 每轮漏一批，测试库长期累积），
+/// 这个前提本身就无法成立，`total == items.len()` 于是变成一句**错的话**：
+/// 它断言的不是分页正确，而是"数据够少"。
+///
+/// 值得注意的是，这个坑与用例上方那段注释**自相矛盾**：
+/// 那段特意强调"别写死条数，会被脏数据永久打红"，
+/// 而 `page_size=200` 正是同一种写死，只是换了个字段名。
+///
+/// 现在断言的是分页响应的真正不变量：
+/// 1. `items.len() == min(total, page_size)` —— 该给多少给多少，不多不少
+/// 2. 页长 2 与页长 200 翻页取回的**集合相同** —— 既不重也不漏
 #[tokio::test]
 #[ignore = "需要真实 Postgres + Redis"]
 async fn role_list_pages_over_the_same_set_as_one_big_page() {
@@ -5395,9 +5475,26 @@ async fn role_list_pages_over_the_same_set_as_one_big_page() {
     let token = admin_token(&app).await;
 
     let mut created = vec![];
-    for _ in 0..3 {
+    for _ in 0..5 {
         created.push(create_role_via_api(&app, &token, &unique("pgrole")).await);
     }
+
+    // ★ 关键：必须由测试自己造出 `created_at` 并列。
+    //
+    // 排序键只有 `created_at ASC` 时，同一时刻的行之间次序由数据库自行决定，
+    // 翻页就会跨页重复或漏行。若不主动制造并列，这条守卫能不能变红
+    // 完全取决于"库里现有数据的 created_at 恰好不并列"——那是运气，不是断言。
+    // （先前手工把全表 created_at 改成同一值才发现它会红，就是这个坑。）
+    //
+    // 所以这里把本用例新建的角色统一按同一时刻落库，让"稳定排序"成为刚需。
+    // 取 5 个而不是 3 个：`created_at=2020` 让它们排在全表最前，页长 2 时
+    // 并列组会横跨第 1/2/3 页之间的**两个**页边界——只要组内次序有抖动，
+    // 翻页结果就一定会出现重复或缺失，而不是靠运气侥幸通过。
+    sqlx::query("UPDATE roles SET created_at = '2020-01-01T00:00:00Z' WHERE id = ANY($1)")
+        .bind(created.clone())
+        .execute(&pool().await)
+        .await
+        .expect("把新建角色的 created_at 对齐失败");
 
     let (status, whole) = send(
         &app,
@@ -5411,69 +5508,62 @@ async fn role_list_pages_over_the_same_set_as_one_big_page() {
         !whole["data"].is_array(),
         "角色列表不应再返回裸数组: {whole}"
     );
-    let all_ids: Vec<String> = whole["data"]["items"]
+    let total = whole["data"]["total"].as_i64().expect("缺少 total");
+    let on_page = whole["data"]["items"]
         .as_array()
         .expect("data.items 应为数组")
-        .iter()
-        .map(|r| r["id"].as_str().unwrap_or_default().to_string())
-        .collect();
+        .len() as i64;
     assert_eq!(
-        whole["data"]["total"].as_i64(),
-        Some(all_ids.len() as i64),
-        "total 必须与 items 长度一致，否则分页会错乱: {whole}"
+        on_page,
+        total.min(200),
+        "单页条数必须是 min(total, page_size)：多了会跨页串行，少了说明漏读。total={total}"
     );
     assert!(whole["data"]["total_pages"].as_i64().unwrap_or(0) >= 1);
 
-    // 逐页取回，集合必须与一次取全量一致：既不重也不漏
-    let mut paged: Vec<String> = vec![];
-    let mut page = 1;
-    loop {
-        let (status, body) = send(
-            &app,
-            request(
-                "GET",
-                &format!("/api/admin/roles?page={page}&page_size=2"),
-                Some(&token),
-                None,
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let items = body["data"]["items"]
-            .as_array()
-            .expect("data.items 应为数组");
-        if items.is_empty() {
-            break;
-        }
-        for r in items {
-            paged.push(r["id"].as_str().unwrap_or_default().to_string());
-        }
-        page += 1;
-        assert!(page < 200, "翻页没有收敛，可能陷入死循环");
+    // 用两种页长各自翻完，集合必须一致：既不重也不漏
+    let paged_small = all_role_ids(&app, &token, 2).await;
+    let paged_big = all_role_ids(&app, &token, 200).await;
+
+    // 采集完就清掉本用例造的角色，**然后**才做断言。
+    // 否则一旦下面某条断言 panic，清理永远不会执行——而断言恰恰会在
+    // "分页真的有 bug"时失败，那时留下的脏数据 created_at=2020 排在全表最前，
+    // 会持续污染后续所有用例（注入验证时确实漏下过 17 个角色）。
+    let created_strs: Vec<String> = created.iter().map(|id| id.to_string()).collect();
+    for id in &created {
+        let _ = delete_role(&app, &token, *id).await;
     }
 
-    let mut sorted_paged = paged.clone();
+    // 先跟 total 对账。若翻页漏读，两种页长可能**同样**漏掉同一批，
+    // 集合比对就会一起假绿——所以"总数吻合"必须独立成立。
+    assert_eq!(
+        paged_small.len() as i64,
+        total,
+        "按页长 2 翻完只取回 {}/{} 条，说明分页漏读，两种页长比对会一起假绿",
+        paged_small.len(),
+        total
+    );
+
+    let mut sorted_paged = paged_small.clone();
     sorted_paged.sort();
     sorted_paged.dedup();
     assert_eq!(
         sorted_paged.len(),
-        paged.len(),
-        "翻页取回了重复的角色，说明分页缺稳定排序: {paged:?}"
+        paged_small.len(),
+        "翻页取回了重复的角色，说明分页缺稳定排序: {paged_small:?}"
     );
 
-    let mut sorted_all = all_ids.clone();
-    sorted_all.sort();
-    assert_eq!(
-        sorted_paged, sorted_all,
-        "逐页取回的角色集合与一次取全量不一致"
-    );
+    let mut sorted_big = paged_big.clone();
+    sorted_big.sort();
+    assert_eq!(sorted_paged, sorted_big, "不同页长翻页取回的角色集合不一致");
 
-    for id in created {
+    // 刚建的五个角色必须真的出现在结果里（否则上面两条可能都在比空集）。
+    // 判定只看归属，不看返回位置——注入故障时它们可能被排到别的页，
+    // 位置本身就是不可靠的。
+    for id in &created_strs {
         assert!(
-            all_ids.contains(&id.to_string()),
-            "刚建的角色 {id} 不该从列表里消失"
+            sorted_paged.contains(id),
+            "刚创建的角色 {id} 不在翻页结果里，说明集合比对在比一个不含新增项的旧快照"
         );
-        let _ = delete_role(&app, &token, id).await;
     }
 }
 
@@ -8818,4 +8908,541 @@ async fn moving_a_menu_is_recorded_in_the_audit_log() {
     cleanup_temp_menu_dir(&app, &token, leaf).await;
     cleanup_temp_menu_dir(&app, &token, root_a).await;
     cleanup_temp_menu_dir(&app, &token, root_b).await;
+}
+
+// ══════════════════════════════════════════════════════════════════
+// v0.18.0：口令策略不得挂到登录路径（HTTP 层约束）
+// ══════════════════════════════════════════════════════════════════
+
+/// 造一个"v0.11.0 之前就存在"的弱口令用户
+///
+/// 直接写 SQL 插入，哈希用 `axum_api::utils::password::hash_password`
+/// ——**绕过策略校验**正是这里的目的：策略是"设置口令"时的一道闸，
+/// 而闸门修好之后，闸门**之前**进来的存量用户必须还能从闸门走出去。
+async fn drop_user(username: &str) {
+    sqlx::query("DELETE FROM users WHERE username = $1")
+        .bind(username)
+        .execute(&pool().await)
+        .await
+        .expect("清理存量用户失败");
+}
+
+async fn insert_legacy_user(username: &str, password: &str) {
+    let hash = axum_api::utils::password::hash_password(password).expect("哈希计算失败");
+    sqlx::query(
+        "INSERT INTO users (username, email, password_hash, is_active, must_change_password) \
+         VALUES ($1, $2, $3, TRUE, FALSE)",
+    )
+    .bind(username)
+    .bind(format!("{username}@example.com"))
+    .bind(hash)
+    .execute(&pool().await)
+    .await
+    .expect("插入存量用户失败");
+}
+
+/// 存量弱口令用户仍能经 API 登录
+///
+/// 把 `password_policy_is_not_applied_to_login_verification`（单元测试）
+/// 升到 HTTP 层。单元测试只能证明"`validate_password` 会对这个口令报错"，
+/// 证不了**登录链路真的不会去调它**——而后者才是会锁死人的那个性质。
+///
+/// 这条性质的失效方式极其隐蔽：把 `validate_password` 加进
+/// `handle_login` 会让所有测试照样绿（测试用户口令全是合规的），
+/// 直到真实用户集体登不上系统。所以要在接口层钉住。
+///
+/// 顺带钉住两件**必须一起成立**的事：弱口令能被拒于设置、却不被拒于登录。
+/// 只测其中一头的话，两种错误实现都能通过。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_legacy_weak_password_user_can_still_log_in() {
+    let app = app().await;
+    let name = unique("legacy");
+
+    // v0.10 时代的策略只有"至少 6 位"，所以 6 位纯小写是**当年合法**的口令
+    let weak = "abcdef";
+
+    // 前置事实：这个口令确实**不满足现行策略**——否则下面那句断言是空话
+    assert!(
+        axum_api::utils::validation::validate_password(weak).is_err(),
+        "样例口令 {weak:?} 本应不满足现行策略；换策略后这条用例的前提要重挑"
+    );
+
+    insert_legacy_user(&name, weak).await;
+
+    // 该走的路：能被登录接受，并拿到可用的令牌
+    //
+    // **先取结果、清理、最后断言**：断言一旦红就跳到 panic，
+    // 写在后面的清理永远不会执行——那条断言本身正在测的场景
+    // （登录被拒）恰恰最容易让清理被跳过，于是每次红一次漏一个账号。
+    let (login_status, login_body) = login(&app, &name, weak).await;
+    let usable = if login_status == StatusCode::OK {
+        let tok = login_body["data"]["token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (status, _) = send(
+            &app,
+            request("GET", "/api/auth/permissions", Some(&tok), None),
+        )
+        .await;
+        status == StatusCode::OK
+    } else {
+        false
+    };
+
+    // 不该走的路：同一个口令**不能**被拿来设新号。两条一起断言，
+    // 防止有人"为了让上面那条通过"而把策略从设置路径上一并删掉
+    let (set_status, set_body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": unique("weaknew"),
+                "email": format!("{name}@probe.example.com"),
+                "password": weak,
+            })),
+        ),
+    )
+    .await;
+
+    drop_user(&name).await;
+
+    assert!(usable, "弱口令存量用户登录后应能正常使用系统");
+    assert_eq!(
+        set_status,
+        StatusCode::BAD_REQUEST,
+        "弱口令在设置时仍应被拒（否则策略被误删）: {set_body}"
+    );
+}
+
+/// 超长口令：策略在"设置"时拒，但存量用户仍能登录
+///
+/// 与上一条同类，但换了个方向卡住**长度上限**。
+///
+/// 登录页原来写死 `maxlength="128"`，可后端登录验的是 Argon2 哈希，
+/// 不看明文长度。若某天把长度规则也搬进登录路径，
+/// 持有超长口令的存量用户会在前端被直接挡在输入框那一层——
+/// 连"密码错误"这句话都看不到，只会觉得"系统坏了"。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_legacy_overlong_password_user_can_still_log_in() {
+    let app = app().await;
+    let name = unique("longpw");
+
+    // 200 字符，三类字符齐全——**只有长度**这一关不过。
+    // 用合规字符类型是关键：这样"被拒"的归因只能是长度，不是复杂度
+    let overlong = format!("Ab1{}", "x".repeat(197));
+    assert_eq!(overlong.chars().count(), 200);
+    assert!(
+        axum_api::utils::validation::validate_password(&overlong).is_err(),
+        "样例口令本应因超长被现行策略拒收"
+    );
+
+    insert_legacy_user(&name, &overlong).await;
+
+    // 同上：先取结果再清理，避免失败路径漏数据
+    let (login_status, login_body) = login(&app, &name, &overlong).await;
+    let usable = if login_status == StatusCode::OK {
+        let tok = login_body["data"]["token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (status, _) = send(
+            &app,
+            request("GET", "/api/auth/permissions", Some(&tok), None),
+        )
+        .await;
+        status == StatusCode::OK
+    } else {
+        false
+    };
+
+    drop_user(&name).await;
+    assert!(usable, "超长口令存量用户登录后应能正常使用系统");
+}
+
+/// 长邮箱用户能用邮箱登录，且注册接口不设比数据库更严的上限
+///
+/// 钉住登录页 `max: 50` → `max: 255` 这次修改的依据：
+/// `users.email` 是 `varchar(255)`，注册接口也接受长到这个上限的邮箱。
+/// 前端若把上限写死成 50，持有长邮箱的合法用户会在**自己的登录页上
+/// 敲不进自己的邮箱**，而后端从头到尾都认。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_long_email_can_be_used_to_log_in() {
+    let app = app().await;
+    let name = unique("longmail");
+    // 73 字符：合法邮箱，明显超过旧前端规则的 50。
+    //
+    // **局部部分必须每次唯一**：`users.email` 上有唯一约束，
+    // 而固定邮箱意味着"上一次失败后残留的账号"会让这一次直接撞唯一键。
+    // 之前就踩过：e2e 挂死那次留下的账号用了同一个固定邮箱，
+    // 导致这条用例在整轮里报了一个与被测性质无关的 `duplicate key`。
+    // 前缀拼在 40 个 a 之后（而不是替代它）——否则总长会掉到 50 整，
+    // 恰好等于旧前端的上限，这条用例就不再能证明任何事了。
+    // 下面的 assert 把这个前提钉住：长度一变就红，而不是悄悄退化成空测试。
+    let email = format!(
+        "{}{}@bbbbbbbbbbbbbbbbbbbb.example.com",
+        "a".repeat(40),
+        name
+    );
+    assert!(
+        email.chars().count() > 50,
+        "样例邮箱必须长于旧前端的 50 上限，当前只有 {} 个字符，这条用例就白写了",
+        email.chars().count()
+    );
+
+    insert_legacy_user(&name, "Abcdef12").await;
+    sqlx::query("UPDATE users SET email = $2 WHERE username = $1")
+        .bind(&name)
+        .bind(&email)
+        .execute(&pool().await)
+        .await
+        .expect("改邮箱失败");
+
+    let (login_status, login_body) = login(&app, &email, "Abcdef12").await;
+    let usable = if login_status == StatusCode::OK {
+        let tok = login_body["data"]["token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (status, _) = send(
+            &app,
+            request("GET", "/api/auth/permissions", Some(&tok), None),
+        )
+        .await;
+        status == StatusCode::OK
+    } else {
+        false
+    };
+
+    drop_user(&name).await;
+    assert!(usable, "长邮箱应能用于登录");
+}
+
+/// 剥掉 JS/TS 注释，只留下真正会执行的代码
+///
+/// 这条剥离是 `account_forms_use_the_shared_validator` 能成立的前提。
+/// 那几个页面里都留着解释修复来由的注释，**里面就写着 `min: 6`**——
+/// 因为"v0.18.0 之前这里是 `min: 6`"正是最该被保留的那句话。
+/// 裸 `contains` 会把这段注释判成违规，于是要么测试永远红，
+/// 要么有人去删掉有用的注释来讨好测试。两种结局都比缺陷本身更糟。
+///
+/// 状态机而非正则：正则分不清 `//` 是注释还是字符串里的一部分
+/// （URL、`'https://…'` 这类），而误判方向恰好是**把真代码当注释删掉**——
+/// 那会让守卫在真正有 `min: 6` 时依然绿。
+fn strip_js_comments(source: &str) -> String {
+    #[derive(PartialEq)]
+    enum State {
+        Code,
+        LineComment,
+        BlockComment,
+        SingleQuote,
+        DoubleQuote,
+        Backtick,
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut state = State::Code;
+    let mut chars = source.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match state {
+            State::Code => match c {
+                '/' if chars.peek() == Some(&'/') => {
+                    chars.next();
+                    state = State::LineComment;
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    state = State::BlockComment;
+                }
+                '\'' => {
+                    state = State::SingleQuote;
+                    out.push(c);
+                }
+                '"' => {
+                    state = State::DoubleQuote;
+                    out.push(c);
+                }
+                '`' => {
+                    state = State::Backtick;
+                    out.push(c);
+                }
+                _ => out.push(c),
+            },
+            State::LineComment => {
+                if c == '\n' {
+                    state = State::Code;
+                    out.push(c);
+                }
+            }
+            State::BlockComment => {
+                if c == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    state = State::Code;
+                }
+            }
+            State::SingleQuote | State::DoubleQuote | State::Backtick => {
+                if c == '\\' {
+                    // 转义：连下一个字符一起吞掉，否则 `'\''` 会提前闭合
+                    out.push(c);
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                } else {
+                    if (state == State::SingleQuote && c == '\'')
+                        || (state == State::DoubleQuote && c == '"')
+                        || (state == State::Backtick && c == '`')
+                    {
+                        state = State::Code;
+                    }
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 只取 `<script>` 块，并剥掉其中的注释
+///
+/// `<template>` 与 `<style>` 里不该出现校验规则，但它们也常带说明性文字。
+/// 收窄到 script 既贴合意图，也少一类误报来源。
+fn script_code_of(vue_source: &str) -> String {
+    let start = vue_source
+        .find("<script")
+        .expect("vue 文件里找不到 <script> 块");
+    let after = &vue_source[start..];
+    let end = after.find("</script>").expect("<script> 块未闭合");
+    strip_js_comments(&after[..end])
+}
+
+/// 前后端用户名校验**必须给出同一结论**
+///
+/// 与 `password_policy_agrees_with_the_frontend_copy` 同构，但换了一条轴。
+///
+/// 用户名规则在前端 `utils/accountRules.ts` 与后端 `validation.rs` 各存一份，
+/// 而这次的漂移比口令那次更隐蔽：**两边都是"合法"的**，
+/// 差别只在于前端放行了一批后端会拒的字符（或反过来），
+/// 于是用户看到的是"前端全绿 → 提交 → 400 用户名只能包含…"。
+///
+/// 做法同样是从前端源码里解析样例表，用 Rust 跑同一批取值再比对结论。
+#[test]
+fn username_policy_agrees_with_the_frontend_rules() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("frontend/src/utils/accountRules.ts"))
+        .expect("读取 frontend/src/utils/accountRules.ts 失败");
+
+    // 同样只在数组体内解析：该文件顶部的文档注释里也有 `{ name: '...', ok: true }`
+    let body_start = source
+        .find("export const USERNAME_POLICY_CASES")
+        .expect("前端未导出 USERNAME_POLICY_CASES");
+    let body = &source[body_start..];
+    let body_end = body
+        .find("\n]")
+        .expect("USERNAME_POLICY_CASES 数组未正常闭合");
+    let body = &body[..body_end];
+
+    let mut cases: Vec<(String, bool)> = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find("{ name: '") {
+        let after = &rest[at + "{ name: '".len()..];
+        let Some(end_quote) = after.find('\'') else {
+            break;
+        };
+        let name = after[..end_quote].to_string();
+        let tail = &after[end_quote + 1..];
+        let Some(ok_at) = tail.find(", ok: ") else {
+            break;
+        };
+        let verdict = &tail[ok_at + ", ok: ".len()..];
+        let verdict_len = if verdict.starts_with("true") {
+            4
+        } else if verdict.starts_with("false") {
+            5
+        } else {
+            panic!("无法解析 ok 字段: {verdict}");
+        };
+        cases.push((name, verdict.starts_with("true")));
+        rest = &tail[ok_at + ", ok: ".len() + verdict_len..];
+    }
+
+    assert!(
+        cases.len() >= 8,
+        "从前端解析到的用户名样例过少（{} 条），样例表可能被改坏",
+        cases.len()
+    );
+
+    let mut mismatches: Vec<String> = Vec::new();
+    for (name, expected_ok) in &cases {
+        let actual_ok = axum_api::utils::validation::validate_username(name).is_ok();
+        if actual_ok != *expected_ok {
+            mismatches.push(format!(
+                "{name:?}：前端期望 {expected_ok}，后端实际 {actual_ok}"
+            ));
+        }
+    }
+
+    assert!(
+        mismatches.is_empty(),
+        "前后端用户名校验判定不一致：\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// 样例表里必须真的带上一批多字节用户名，否则这条测试形同虚设
+///
+/// `validate_username` 改成按字符计数这件事，只有在样例里出现
+/// 多字节用户名时才会被覆盖到。全是 ASCII 的样例表会让上面那条
+/// 在"又改回按字节"的回归下照样绿。
+#[test]
+fn username_policy_cases_cover_multibyte_names() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("frontend/src/utils/accountRules.ts"))
+        .expect("读取 frontend/src/utils/accountRules.ts 失败");
+
+    let body_start = source
+        .find("export const USERNAME_POLICY_CASES")
+        .expect("前端未导出 USERNAME_POLICY_CASES");
+    let body = &source[body_start..];
+    let body_end = body
+        .find("\n]")
+        .expect("USERNAME_POLICY_CASES 数组未正常闭合");
+    let body = &body[..body_end];
+
+    // 只统计样例名里"字节数多于字符数"的那些，即确实含多字节字符
+    let multibyte: Vec<&str> = body
+        .lines()
+        .filter_map(|line| {
+            let at = line.find("{ name: '")? + "{ name: '".len();
+            let end = line[at..].find('\'')? + at;
+            let name = &line[at..end];
+            (name.len() > name.chars().count()).then_some(name)
+        })
+        .collect();
+
+    assert!(
+        multibyte.len() >= 2,
+        "样例表里的多字节用户名只有 {} 条（{multibyte:?}），\
+         按字节/按字符的回归将无法被上一条测试发现",
+        multibyte.len()
+    );
+}
+
+/// 账号表单页面必须用共享校验器，不能各写各的
+///
+/// ## 这条测试为什么存在
+///
+/// v0.11.0 把口令策略收紧后，`password_policy_agrees_with_the_frontend_copy`
+/// 把 `utils/password.ts` 绑到了后端——**但只绑了工具，没绑页面**。
+/// 于是注册页与管理员建号对话框整整七版没人碰，各自留着 v0.10 时代的
+/// `min: 6`。契约测试一路绿着，而页面在教用户填一个后端不会收的密码。
+///
+/// 也就是说：真正会漂移的是"页面"，而当时的守卫盯着的是"工具"。
+/// 这个洞不补，下一次收紧策略会以同样的方式再来一遍。
+#[test]
+fn account_forms_use_the_shared_validator() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // 创建账号的两个入口 + 登录页
+    let pages = [
+        "frontend/src/views/register/index.vue",
+        "frontend/src/views/system/user/index.vue",
+        "frontend/src/views/login/index.vue",
+    ];
+
+    let mut problems: Vec<String> = Vec::new();
+
+    for page in pages {
+        let path = root.join(page);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            problems.push(format!("{page}：读不到文件"));
+            continue;
+        };
+
+        // 注释里写着 `min: 6` 是**应该保留**的修复史记录，
+        // 所以只在剥离注释后的真代码里找违规
+        let source = script_code_of(&raw);
+
+        if !raw.contains("@/utils/accountRules") {
+            problems.push(format!(
+                "{page}：没有引用共享校验器 @/utils/accountRules，各写各的规则必然漂移"
+            ));
+        }
+
+        // 硬编码的口令长度下限：v0.10 策略（至少 6 位）的化石
+        for needle in ["min: 6", "min:6", "密码至少 6", "至少 6 个字符"] {
+            if source.contains(needle) {
+                problems.push(format!(
+                    "{page}：出现硬编码 {needle:?}——那是 v0.10 的策略化石，\
+                     当前策略是至少 8 位 + 两类字符（见 utils/password.ts）"
+                ));
+            }
+        }
+
+        // 用户名/邮箱字段的手写长度规则
+        for needle in ["用户名至少 3", "用户名不能超过 50"] {
+            if source.contains(needle) {
+                problems.push(format!(
+                    "{page}：出现手写规则 {needle:?}，长度应取自 accountRules 的常量"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "账号表单没有使用共享校验器：\n{}",
+        problems.join("\n")
+    );
+}
+
+/// 共享校验器导出的常量必须与后端常量一致
+///
+/// 页面上那些 placeholder、"最多 N 个字符"的提示都印着这些数字。
+/// 它们离后端有两份拷贝（Rust 与 TS），一旦不一致，
+/// 用户看到的提示就在说谎——而这正是本版修的那类缺陷的根因。
+#[test]
+fn account_rule_constants_agree_with_the_backend() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(root.join("frontend/src/utils/accountRules.ts"))
+        .expect("读取 frontend/src/utils/accountRules.ts 失败");
+
+    let expect = |const_name: &str, expected: usize| -> Result<(), String> {
+        let needle = format!("export const {const_name} = {expected}");
+        if source.contains(&needle) {
+            Ok(())
+        } else {
+            Err(format!(
+                "accountRules.ts 里没有 `{const_name} = {expected}`；\
+                 后端值变了，前端常量要跟着改（页面提示会印着这个数字）"
+            ))
+        }
+    };
+
+    let mut problems = Vec::new();
+    for (name, value) in [
+        (
+            "USERNAME_MIN_LEN",
+            axum_api::utils::validation::USERNAME_MIN_LEN,
+        ),
+        (
+            "USERNAME_MAX_LEN",
+            axum_api::utils::validation::USERNAME_MAX_LEN,
+        ),
+        ("IDENTIFIER_MAX_LEN", 255),
+    ] {
+        if let Err(msg) = expect(name, value) {
+            problems.push(msg);
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "前后端常量不一致：\n{}",
+        problems.join("\n")
+    );
 }

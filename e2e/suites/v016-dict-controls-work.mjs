@@ -20,6 +20,34 @@ const wait = (ms) => sleep(ms)
 let typeId = null
 const itemIds = {}
 
+/**
+ * 清掉本套件可能残留的夹具（按 code 找，不是按 id）
+ *
+ ## 为什么要幂等
+ *
+ * `CODE` 是**固定值** `custom_type`——demo 页上的 `DictSelect` 读的就是这个编码，
+ * 换掉它这个套件就失去意义了。所以它只能靠"每次都删干净"来保证可重跑。
+ *
+ * 而原先的清理只写在套件**末尾**：任何一条断言 panic / `throw`，
+ * 末尾那几行就执行不到，夹具留在库里。下一轮 `seed()` 撞上唯一约束
+ * `dict_types_code_key` 直接 500，于是**这个套件从此再也不能跑**——
+ * 一次中途失败会被放大成永久性的假红。
+ *
+ * 实测踩过：整轮 e2e 里它中途失败留下 `custom_type`，
+ * 紧接着单独重跑就变成"建字典类型失败 500"，而根因在上一次运行。
+ *
+ * 所以开头也清一次。删类型会级联删掉它下面的字典项，不必逐个删。
+ */
+async function purgeFixture() {
+  const r = await s.api('GET', '/api/admin/dict/types')
+  const stale = (r.body?.data || []).filter((x) => x.code === CODE)
+  for (const t of stale) {
+    await s.api('DELETE', `/api/admin/dict/types/${t.id}`)
+  }
+  if (stale.length > 0) await s.api('POST', '/api/admin/dict/refresh')
+  return stale.length
+}
+
 /** 造一份字典：三个项，丙是禁用的 */
 async function seed() {
   const t = await s.api('POST', '/api/admin/dict/types', {
@@ -105,6 +133,11 @@ await s.shot('v016-page-renders')
 // ── 1. 禁用项必须从业务页面的下拉框里消失 ────────────────────
 
 s.log('\n[1] 禁用项还留在下拉框里吗')
+// 先清残留再种：保证"上一次中途失败"不会让这一轮永久性假红
+const purged = await purgeFixture()
+if (purged > 0) {
+  console.log(`(清掉了上一轮残留的 ${purged} 个 ${CODE} 夹具)`)
+}
 await seed()
 
 const read1 = await readValues()

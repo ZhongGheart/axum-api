@@ -33,7 +33,7 @@
           <n-input
             v-model:value="formData.username"
             placeholder="请输入用户名或邮箱"
-            :maxlength="50"
+            :maxlength="IDENTIFIER_MAX_LEN"
             clearable
             @keyup.enter="handleLogin"
           >
@@ -84,7 +84,9 @@
 /**
  * 登录页面
  *
- * - 表单校验规则对齐后端（用户名 3-50 字符，密码至少 6 位）
+ * - 表单规则取自共享校验器 `utils/accountRules.ts`
+ *   （这个字段收的是"用户名或邮箱"，所以刻意不套用户名字符集规则；
+ *    口令只判空——后端登录验的是 Argon2 哈希，不套明文复杂度策略）
  * - 记住登录：只记忆用户名，口令不落盘
  * - 口令经 HTTPS 明文提交，后端 Argon2 校验
  */
@@ -96,6 +98,7 @@ import { useUserStore } from '@/stores/user'
 import { showSuccess } from '@/utils/message'
 import { getStorage, setStorage, removeStorage } from '@/utils/storage'
 import { buildSessionEndedMessage, takeSessionEnded } from '@/utils/session'
+import { IDENTIFIER_MAX_LEN, loginIdentifierRules, loginPasswordRules } from '@/utils/accountRules'
 
 // ── 状态 ────────────────────────────────────────────────────────
 
@@ -140,18 +143,22 @@ const formData = ref<LoginForm>({
 
 const rememberMe = ref(false)
 
-// ── 表单校验规则（对齐后端 service/auth.rs） ──────────────────────
+// ── 表单校验规则 ────────────────────────────────────────────────
+//
+// v0.18.0 之前这里是两份手写规则，与后端都对不上：
+//
+// - `min: 6`：v0.10 时代口令策略的化石。后端登录验 Argon2 哈希，
+//   压根不看明文复杂度，这条规则没有任何依据（方向上是宽松的，
+//   所以一直没锁死谁，但它不是"对齐后端"，注释里却这么写）
+// - `max: 50`：**真缺陷**。这个字段收的是"用户名或邮箱"，而后端
+//   `find_by_username_or_email` 是一条裸查询，`users.email` 列宽 255。
+//   实测 73 字符的邮箱注册与登录都成功，但前端输入框只给 50 个字符——
+//   持有长邮箱的合法用户在自己的登录页上敲不进自己的邮箱。
+//   另：字符集规则也**不能**加，含 `@` 的邮箱会被自己人拦下。
 
 const formRules: FormRules = {
-  username: [
-    { required: true, message: '请输入用户名或邮箱', trigger: 'blur' },
-    { min: 3, message: '用户名至少 3 个字符', trigger: 'blur' },
-    { max: 50, message: '用户名不能超过 50 个字符', trigger: 'blur' },
-  ],
-  password: [
-    { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 6, message: '密码至少 6 个字符', trigger: 'blur' },
-  ],
+  username: loginIdentifierRules,
+  password: loginPasswordRules,
 }
 
 // ── 记住密码 ────────────────────────────────────────────────────

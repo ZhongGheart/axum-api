@@ -16,6 +16,9 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const SUITE_DIR = join(HERE, 'suites')
 const filter = process.argv[2]
 
+/** 单个套件的硬上限。正常套件跑几十秒，这个值留了很大余量 */
+const SUITE_TIMEOUT_MS = Number(process.env.E2E_SUITE_TIMEOUT_MS || 300000)
+
 const all = readdirSync(SUITE_DIR)
   .filter((f) => f.endsWith('.mjs'))
   .sort()
@@ -41,22 +44,38 @@ for (const file of picked) {
   console.log('>>> ' + file)
   console.log('='.repeat(70))
 
+  // 硬超时：即使某个套件挂死，也不能把整轮回归永远卡在这里。
+  //
+  // harness 那边已经加了退出守卫（未捕获异常时先关浏览器再退出），
+  // 但守卫只覆盖"抛异常"这一种死法。若浏览器进程或 CDP 卡在某个 I/O 上，
+  // 事件循环既不空转也不抛错，就只能靠外部超时兜底。
+  //
+  // 失败套件**永不退出**是比"失败"更坏的结果：它会让人以为测试在跑，
+  // 而整轮结论一个都拿不到。
   const r = spawnSync(process.execPath, [join(SUITE_DIR, file)], {
     stdio: 'inherit',
     env: process.env,
+    timeout: SUITE_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
   })
   // signal 导致的退出码是 null；区分"被信号杀掉"与"断言失败"
+  const timedOut = r.signal === 'SIGKILL' && r.status === null
   const failed = r.status !== 0
-  results.push({ file, failed, status: r.status, signal: r.signal })
+  results.push({
+    file,
+    failed,
+    status: timedOut ? '超时' : r.status,
+    signal: timedOut ? `超过 ${SUITE_TIMEOUT_MS / 1000}s 未退出` : r.signal,
+  })
 }
 
 console.log('\n' + '='.repeat(70))
 console.log('e2e 总汇总')
 console.log('='.repeat(70))
 for (const r of results) {
-  const why = r.signal ? '被信号 ' + r.signal + ' 终止'
-    : r.status === 0 ? '通过'
-    : '失败（退出码 ' + r.status + '）'
+  const why = r.status === 0 ? '通过'
+    : r.signal ? '被终止（' + r.signal + '）'
+    : '失败（' + r.status + '）'
   console.log((r.failed ? 'FAIL  ' : 'PASS  ') + r.file + '  ::  ' + why)
 }
 

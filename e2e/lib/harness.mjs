@@ -78,6 +78,35 @@ export class Session {
     this.check(name, !absent, detail)
   }
 
+  /**
+   * 装上"无论怎么退出都必须收尾"的守卫
+   *
+   * ## 为什么需要它
+   *
+   * `waitFor` 是**故意**超时就抛错的（注释里写了原因：继续跑会让后续断言
+   * 全建立在一个根本没出现的页面上，整轮结论都是假的）。可一旦抛错，
+   * 套件末尾的 `s.stop()` 就永远执行不到——CDP 的 WebSocket 仍然开着，
+   * Node 的事件循环因此永不退出。
+   *
+   * 后果不是"报错难看"，而是**挂死**：失败的那个套件不退出，
+   * `run.mjs` 用的是同步 spawn，于是**整轮 e2e 永远卡在那里**。
+   * 做缺陷注入时这一点尤其致命——注入后本该看到一条 FAIL，
+   * 实际看到的是永远转圈的终端，只能手动 Ctrl-C。
+   *
+   * 11 个套件全都缺 try/finally。与其逐个改（改动面大且容易漏），
+   * 不如在这里兜住：任何未捕获异常或未处理拒绝都先收尾再退出。
+   */
+  #installExitGuard() {
+    const bail = (kind, err) => {
+      console.error(`\n[e2e] ${kind}，正在收尾并退出: ${err && (err.stack || err.message || err)}`)
+      try { this.cdp?.close() } catch { /* 收尾失败也不该盖住原始错误 */ }
+      // 兜底再兜一层：万一还有别的句柄吊着，至少不无限期挂着
+      setTimeout(() => process.exit(1), 2000).unref()
+    }
+    process.on('uncaughtException', (e) => bail('未捕获异常', e))
+    process.on('unhandledRejection', (e) => bail('未处理的 Promise 拒绝', e))
+  }
+
   async start() {
     const { version, proc } = await launchBrowser()
     this.proc = proc
@@ -125,6 +154,8 @@ export class Session {
     await this.send('Runtime.enable')
     await this.send('Network.enable')
     await this.send('Log.enable')
+
+    this.#installExitGuard()
   }
 
   send(method, params = {}) {
@@ -172,6 +203,39 @@ export class Session {
       + ' return true'
     )
     if (!ok) throw new Error('输入框未找到: ' + placeholder)
+  }
+
+  /**
+   * 像真人一样**逐字敲进**输入框（走 CDP 按键事件）
+   *
+   * 为什么不直接用 `setInput`：那个方法用原生 value setter 赋值，
+   * 它**绕过 `maxlength`**。实测填 73 个字符时：
+   *
+   * | 方式                        | max=255 | max=50 |
+   * |-----------------------------|---------|--------|
+   * | `setInput`（setter 赋值）    |   73    |   73   |
+   * | `Input.insertText`（本方法）|   73    |   50   |
+   * | 逐字 `dispatchKeyEvent`     |   73    |   50   |
+   *
+   * 所以凡是断言"用户能不能把这么长的东西敲进去"的用例，
+   * 必须走本方法。否则输入框上限被改回 50 时，断言照样绿——
+   * 假阳性比没有断言更糟，它会让缺陷看起来已被覆盖。
+   */
+  async typeInto(placeholder, value) {
+    const sel = '[...document.querySelectorAll("input")]'
+      + '.find(i => i.placeholder && i.placeholder.includes('
+      + JSON.stringify(placeholder) + '))'
+    const focused = await this.evalJs(
+      'const el = ' + sel + ';'
+      + ' if (!el) return false;'
+      + ' el.focus(); el.value = "";'
+      + ' el.dispatchEvent(new Event("input", { bubbles: true }));'
+      + ' return true'
+    )
+    if (!focused) throw new Error('输入框未找到: ' + placeholder)
+
+    // insertText 一次注入整串：受 maxlength 约束，且比逐字按键快得多
+    await this.send('Input.insertText', { text: value })
   }
 
   async clickByText(text) {

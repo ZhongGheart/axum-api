@@ -9,10 +9,25 @@ pub type ValidationResult<T> = Result<T, AppError>;
 
 /// 用户名校验（3-50 字符，字母数字下划线）
 pub fn validate_username(username: &str) -> ValidationResult<()> {
-    if username.len() < 3 || username.len() > 50 {
-        return Err(AppError::BadRequest(
-            "用户名长度必须在 3-50 个字符之间".into(),
-        ));
+    // 按**字符数**而非字节数判定，与下面 `validate_password` 同一把尺子。
+    //
+    // 原来这里写的是 `username.len()`（字节），而报错文案说的是"3-50 个**字符**"
+    // ——文案和判据说的不是一回事。实测：17 个汉字（51 字节）只有 17 个字符，
+    // 却被这条规则拒掉，管理员看到的是"用户名长度必须在 3-50 个字符之间"，
+    // 对着一个明明合规的用户名。
+    //
+    // 更要命的是**存储层根本不按字节**：`users.username` 是 `varchar(50)`，
+    // Postgres 的 varchar(n) 计的是**字符**。实测 20 个汉字（60 字节）能被列收下。
+    // 也就是说字节制比数据库更严，凭空砍掉了三分之二的中文用户名容量，
+    // 而这条多余的限制没有任何业务理由。
+    //
+    // 与 `validate_password` 的理由逐字相同：多字节字符不该因为编码不同
+    // 就得到不同的长度结论。
+    let len = username.chars().count();
+    if !(USERNAME_MIN_LEN..=USERNAME_MAX_LEN).contains(&len) {
+        return Err(AppError::BadRequest(format!(
+            "用户名长度必须在 {USERNAME_MIN_LEN}-{USERNAME_MAX_LEN} 个字符之间"
+        )));
     }
     if !username
         .chars()
@@ -24,6 +39,11 @@ pub fn validate_username(username: &str) -> ValidationResult<()> {
     }
     Ok(())
 }
+
+/// 用户名最小长度（按字符计）
+pub const USERNAME_MIN_LEN: usize = 3;
+/// 用户名最大长度（按字符计，与 `users.username` 的 varchar(50) 同单位）
+pub const USERNAME_MAX_LEN: usize = 50;
 
 /// 口令最小长度
 pub const PASSWORD_MIN_LEN: usize = 8;
@@ -179,6 +199,55 @@ mod tests {
     fn username_accepts_valid_values() {
         assert!(validate_username("alice_01").is_ok());
         assert!(validate_username("alice-01").is_ok());
+    }
+
+    /// 用户名长度按**字符**计，不按字节
+    ///
+    /// 修复前用 `str::len()`（字节），而报错文案说的是"字符"：
+    /// 17 个汉字只有 17 个字符、51 字节，却被判成超长；
+    /// 而 `users.username` 是 `varchar(50)`，Postgres 按字符计，本来就收得下。
+    #[test]
+    fn username_length_counts_characters_not_bytes() {
+        // 50 个汉字 = 150 字节。字节制下必超，字符制下正好卡在上界
+        let exactly_max = "中".repeat(USERNAME_MAX_LEN);
+        assert_eq!(exactly_max.chars().count(), USERNAME_MAX_LEN);
+        assert!(
+            exactly_max.len() > USERNAME_MAX_LEN,
+            "前提：这串的字节数应大于上限，否则测不到字节制与字符制的差别"
+        );
+        assert!(validate_username(&exactly_max).is_ok());
+
+        // 再多一个字符就该拒——且拒的必须是"字符数"这一条
+        let over = "中".repeat(USERNAME_MAX_LEN + 1);
+        assert!(matches!(
+            validate_username(&over),
+            Err(AppError::BadRequest(_))
+        ));
+
+        // 下界同理按字符：2 个汉字是 6 字节，字节制下会误判为合法
+        let under = "中".repeat(USERNAME_MIN_LEN - 1);
+        assert!(under.len() >= USERNAME_MIN_LEN);
+        assert!(matches!(
+            validate_username(&under),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    /// 报错文案里的区间必须来自常量，不能是写死的数字
+    ///
+    /// 原文案硬编码 "3-50"，与判据脱钩过一次（判据是字节、文案说字符）。
+    /// 这里锁住文案与常量同源。
+    #[test]
+    fn username_length_message_quotes_the_constants() {
+        let msg = match validate_username("ab") {
+            Err(AppError::BadRequest(m)) => m,
+            other => panic!("期望长度报错，实得 {other:?}"),
+        };
+        assert!(
+            msg.contains(&USERNAME_MIN_LEN.to_string())
+                && msg.contains(&USERNAME_MAX_LEN.to_string()),
+            "报错应引用常量区间，实际文案：{msg}"
+        );
     }
 
     #[test]

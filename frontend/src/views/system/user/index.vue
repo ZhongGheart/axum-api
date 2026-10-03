@@ -39,13 +39,22 @@
     >
       <n-form ref="formRef" :model="formData" :rules="formRules" label-placement="left" label-width="80px">
         <n-form-item label="用户名" path="username">
-          <n-input v-model:value="formData.username" :maxlength="50" />
+          <n-input
+            v-model:value="formData.username"
+            :placeholder="USERNAME_PLACEHOLDER"
+            :maxlength="USERNAME_MAX_LEN"
+          />
         </n-form-item>
         <n-form-item label="邮箱" path="email">
-          <n-input v-model:value="formData.email" :maxlength="255" />
+          <n-input v-model:value="formData.email" placeholder="请输入邮箱地址" :maxlength="255" />
         </n-form-item>
         <n-form-item v-if="!isEditing" label="密码" path="password">
-          <n-input v-model:value="formData.password" type="password" />
+          <n-input
+            v-model:value="formData.password"
+            type="password"
+            :placeholder="PASSWORD_PLACEHOLDER"
+            :maxlength="PASSWORD_MAX_LEN"
+          />
         </n-form-item>
         <n-form-item label="角色" path="roles">
           <n-select
@@ -94,6 +103,15 @@ import {
   currentRoleNames,
   pickDefaultRoles,
 } from '@/utils/role'
+import {
+  emailRules,
+  PASSWORD_PLACEHOLDER,
+  passwordPolicyRules,
+  USERNAME_MAX_LEN,
+  USERNAME_PLACEHOLDER,
+  usernameRules,
+} from '@/utils/accountRules'
+import { PASSWORD_MAX_LEN } from '@/utils/password'
 
 // ── 状态 ────────────────────────────────────────────────────────
 
@@ -148,17 +166,15 @@ const formData = ref<UserForm>({
   is_active: true,
 })
 
+// 用户名/邮箱/口令三组规则来自 `@/utils/accountRules`，与注册页、改密页同源。
+//
+// v0.18.0 之前这里是自己写的：`password: [{ min: 6 }]` 且**完全没有用户名字符集
+// 规则**。管理员在对话框里输入 `user@name` 能过前端校验，保存后才收到
+// "用户名只能包含字母、数字、下划线和连字符"。
 const formRules: FormRules = {
-  username: [
-    { required: true, message: '请输入用户名' },
-    { min: 3, message: '至少 3 个字符' },
-    { max: 50, message: '不超过 50 个字符' },
-  ],
-  email: [
-    { required: true, message: '请输入邮箱' },
-    { type: 'email', message: '邮箱格式不正确' },
-  ],
-  password: [{ min: 6, message: '密码至少 6 个字符', trigger: 'blur' }],
+  username: usernameRules,
+  email: emailRules,
+  password: passwordPolicyRules,
   // 多选：naive-ui 的 `required` 对数组不生效，必须配 `type:'array'` + `min`
   roles: [
     { required: true, type: 'array', min: 1, message: '请至少选择一个角色' },
