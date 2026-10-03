@@ -22,6 +22,37 @@ use sqlx::PgPool;
 pub const USER_COLUMNS: &str =
     "id, username, email, password_hash, is_active, must_change_password, created_at, updated_at";
 
+/// 把 `users` 上的唯一约束冲突翻译成 409，否则一律当内部错误
+///
+/// **每个字段有两个约束名，这是有意的**：迁移 001 的 `username VARCHAR(50) UNIQUE`
+/// 叫 `users_username_key`，而迁移 013 为了大小写不敏感另建的
+/// `CREATE UNIQUE INDEX ... ON users (lower(username))` 叫 `users_username_lower_key`。
+/// 实测仅大小写不同的插入撞的是**后者**：
+/// ```
+/// INSERT INTO users (username, email, password_hash) VALUES ('ADMIN', 'x@e.com', 'h');
+/// ERROR: duplicate key value violates unique constraint "users_username_lower_key"
+/// ```
+/// 只认旧名字的话，这条路径会落到 500 而不是 409——而它正是 013 注释里
+/// 承诺的"第二道防线"，防线拦住了却报 500，等于把一个可诊断的冲突
+/// 变成"用户说系统坏了"。
+///
+/// 两处调用点的措辞不同（`create` 说"已被注册"、`update` 说"已被占用"），
+/// 那是**既有**的对外文案，不在这里顺手统一：改它对本次缺陷没有帮助，
+/// 却会让前端/日志里已有的比对失效。措辞由调用方传入。
+fn conflict_from(e: &sqlx::Error, action: &str, username_msg: &str, email_msg: &str) -> AppError {
+    if let Some(pg_err) = e.as_database_error() {
+        if let Some(constraint) = pg_err.constraint() {
+            if constraint == "users_username_key" || constraint == "users_username_lower_key" {
+                return AppError::Conflict(username_msg.to_string());
+            }
+            if constraint == "users_email_key" || constraint == "users_email_lower_key" {
+                return AppError::Conflict(email_msg.to_string());
+            }
+        }
+    }
+    AppError::InternalServerError(format!("{action}: {e}"))
+}
+
 /// 用户仓储
 ///
 /// 提供用户相关的数据库 CRUD 操作。
@@ -217,17 +248,7 @@ impl UserRepository {
         .await
         .map_err(|e| {
             tracing::error!(target: "repository", "更新用户失败 (id={}): {:?}", id, e);
-            if let Some(pg_err) = e.as_database_error() {
-                if let Some(constraint) = pg_err.constraint() {
-                    if constraint == "users_username_key" {
-                        return AppError::Conflict("用户名已被占用".to_string());
-                    }
-                    if constraint == "users_email_key" {
-                        return AppError::Conflict("邮箱已被占用".to_string());
-                    }
-                }
-            }
-            AppError::InternalServerError(format!("更新用户失败: {e}"))
+            conflict_from(&e, "更新用户失败", "用户名已被占用", "邮箱已被占用")
         })
     }
 
@@ -332,18 +353,9 @@ impl UserRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            // 检查是否唯一约束冲突
-            if let Some(pg_err) = e.as_database_error() {
-                if let Some(constraint) = pg_err.constraint() {
-                    if constraint == "users_username_key" {
-                        return AppError::Conflict("用户名已被注册".to_string());
-                    }
-                    if constraint == "users_email_key" {
-                        return AppError::Conflict("邮箱已被注册".to_string());
-                    }
-                }
-            }
-            AppError::InternalServerError(format!("创建用户失败: {e}"))
+            // 上层的查重已经挡掉了绝大多数重复，这条只兜"两个并发请求同时通过查重"
+            // 那种窗口期——所以它报的是唯一约束，不是业务判定
+            conflict_from(&e, "创建用户失败", "用户名已被注册", "邮箱已被注册")
         })
     }
 

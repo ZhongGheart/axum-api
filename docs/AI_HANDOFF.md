@@ -4887,10 +4887,21 @@ POST /api/admin/roles    {"name":"caserole",...}       → 409 角色名「caser
 **注意顺序**：第 2 项涉及迁移与存量数据，风险最高；1 与 3 是低风险独立项。
 若要拆，建议先做 1+3 拿一个干净版本，2 单独一版。
 
-## v0.19.0 进行中（四项合一，用户指令「合在一起做 v0.19.0」）
+## v0.19.0 四项全部完成（用户指令「合在一起做 v0.19.0」）
 
-起始 git 状态：HEAD `9f5e05d5`，分支 `master`，工作区干净（只有 `src/repository/user.rs` 的中间态）。
-纪律：提交后**不推送**，等用户指令。
+起始 git 状态：HEAD `9f5e05d5`，分支 `master`。
+纪律：提交后**不推送**，等用户指令统一推。
+
+| # | 项 | 状态 |
+|---|---|---|
+| 1 | 修 `export/users` 的 SELECT + 根治列名漂移 | ✅ `0c26ad6c` |
+| 2 | 承重守卫从写端点扩到全部 50 个端点 | ✅ `0c26ad6c` |
+| 3 | `operator_with_codes` 的 19 处泄漏 | ✅ `3c26640b` |
+| 4 | 用户名/邮箱大小写归一 + 迁移 013 | ✅ 本次提交 |
+
+**尚未推送**：`0c26ad6c`、`3c26640b`、第 4 项的提交。
+**尚未发布**：v0.19.0 的 tag / Release / CHANGELOG / 版本号都没动——
+等用户指令再推。推送前记得版本号 `Cargo.toml` + `package.json` + CHANGELOG 一起改。
 
 ### 已完成：第 1 项 — `export/users` 的 SELECT + 根治列名漂移
 
@@ -4937,27 +4948,199 @@ GET /api/admin/export/users 返回了 500 Internal Server Error：{"code":500,..
 ```
 测试红，报错直接点名端点。回滚后复跑绿。
 
-### 待做：第 3 项 — `operator_with_codes` 的 23 处泄漏
+### 已完成：第 3 项 — `operator_with_codes` 的 19 处泄漏
 
-`tests/api_integration.rs:2779` 的 `operator_with_codes` 返回 `(token, role_id, user_id)`，
-但 23 个调用点无一清理，测试库累积 270 角色 / 424 用户。
-需加 `cleanup_operator` 并在 23 处调用。相关注释在 `:1799`、`:3429`、`:5460`。
+实测：库里累积 **212 个操作员角色 / 424 个账号**（整库 270 角色 / 424 用户，即绝大多数都是它），
+而 142 个用例**全绿**。测试不检查自己留下的垃圾，就永远发现不了自己在漏。
 
-### 待做：第 4 项 — 用户名/邮箱大小写归一 + 迁移（风险最高）
+新增 `cleanup_operator(app, admin_tok, user_id, role_id)`，19 个调用点全部配上。
+**走 API 而非 SQL，且顺序是先删用户后删角色**——实测反序会被挡回 400
+「仍有 1 个用户使用该角色，请先调整这些用户的角色」。那条拒绝是**有意设计**：
+`user_roles` 的 `ON DELETE CASCADE` 会**静默**剥掉这些用户的角色，
+让人变成"没有任何角色"的用户而不自知。清理要顺着它的意思，而不是绕开它。
 
-缺口实测（真实 HTTP）：
+**为什么走 API 而不像 `cleanup_holder` 那样走 SQL**：两者授权状态不同。
+本夹具角色挂的是 `system:user:list` 这类**真实**权限码，admin 按种子持有全部，
+授权下界（能授予的 ⊆ 已持有的）自然放行；`cleanup_holder` 的角色挂
+`tmp:*:priv:*` 一次性专属码，admin 按设计不持有，才只能走 SQL。
+两种形态都实测删得掉。走 API 的额外好处：不绕过被测逻辑。
+
+守卫 `the_permission_code_fixtures_leave_no_holder_behind` 的范围从一支扩到两支。
+此前它的注释写着"`operator_with_codes` 那是另一笔账、另一个版本的活"——就是本条。
+
+**关键前置：给夹具加了 `OPERATOR_FIXTURE_PREFIX = "opf_"`。** 不加就没法精确圈定：
+原命名 `{prefix}_role_{hex}` 与 `grantee_role_*`、`strong_role_*`、`tmp_holder_role_*`
+撞形状，守卫要么长期误报、要么被人加豁免——两者都等于没有守卫。
+**顺序不能反**：先有前缀与清理，最后才放大守卫范围，否则本条会长期红。
+
+`the_retention_endpoint_obeys_the_log_permission` 原本已有手工清理
+（删用户 + 删角色），改成调 `cleanup_operator`，否则会重复删导致 404。
+
+缺陷注入验证（已做）：抽掉 19 处中的 1 处清理 →
+- 对应测试**仍然通过**（这正是问题：泄漏是静默的）
+- 守卫当场红并点名残留：`opf_hr_role_c634c48b` / `opf_hr_user_d7b5b3b4`
+回滚、清掉注入的残留后复跑绿。
+
+19 个测试逐个跑过全绿；跑完后 `opf_%` 残留为 0。
+顺带清掉历史累积 181 角色 + 181 账号（只按 19 支夹具前缀精确匹配，
+种子 `admin`/`user` 与其他夹具一律不碰）。库里角色 270 → 87。
+
+**踩坑**：我用脚本按"列 0 的 `}` 即函数结尾"定位插入点，先用括号配平验证了 19 处全部闭合，
+但真正写入时用了**替换**而不是**插入**，把 18 个函数的收尾 `}` 覆盖掉了。
+教训：这类批量改写，定位方法要验证，**写入方式更要单独验证**——
+改完必须 `cargo fmt` + `cargo check` 过一遍，不能只看脚本输出。
+
+### 第 4 项：用户名/邮箱大小写归一 + 迁移 ✅ 已完成
+
+**为什么这是本版风险最高的一项**：用户名不只是展示用，它是**登录键**，
+也是管理员在用户列表里辨认账号的依据。而 Postgres 的 `UNIQUE(username)`
+是**大小写敏感**的——不归一的话 `Admin` / `ADMIN` / `aDmIn` 能与真 `admin`
+并存，而**自助注册一次就能造出来**。管理员在列表上看到 `Admin` 无从判断它
+是不是真 admin，于是"给 admin 绑个角色"、"重置 admin 口令"这类操作会被引到
+伪造账号上。这不是理论风险，是一次注册请求的事。
+
+#### 归一函数（`src/utils/validation.rs`）
+
+- `normalize_username` / `normalize_email`：trim + 小写，**先归一再校验**，
+  保证"被校验的就是被存下的"。
+- `normalize_login_input`：trim + 小写、**不校验**。登录框接受用户名或邮箱两者，
+  用户名规则会把合法邮箱判非法；且不区分"格式错/不存在"以免给爆破者枚举信号。
+  形状照 `src/model/role.rs:41` `normalize_role_name`。
+
+**三条写入路径全部改走归一值**：`service/auth.rs::register`、
+`controller/user.rs::create`、`controller/user.rs::update`。
+查重因此自动变成"归一后比较"，不需要额外再写一条大小写不敏感的查重——
+两处规则迟早会走偏。审计记归一后的值：有人拿 `Admin` 撞已存在的 `admin`
+会留下"针对真账号的 409"，正是调查想要的信号。
+
+**读取路径**：`service/auth.rs::login` 开头算一次 `login_input`，**全流程复用**
+（查库 + 限流 key + 3 处审计）。分头各算迟早对不上账。
+注意 `account_scope` 本来就已经 `.to_lowercase()`，即登录失败计数的 Redis key
+**早就**大小写不敏感了——本项补的是"账号本身"那一层，不是限流那一层。
+
+#### 迁移 `013_normalize_user_identities.sql` — 冲突时报错，而不是跳过
+
+**不能照抄 008（角色名）的做法。** 008 对冲突行是**跳过**的，理由写在它的注释里：
+「迁移期不该把整个应用卡在起不来」。角色名这样可以，用户名不行——
+跳过后那行会变成**登录不到的孤儿账号**：归一后所有写入都是小写，
+`find_by_username("admin")` 只命中小写那行，旧 `Admin` 行再也登不进去，
+却仍挂在库里、仍持原角色，且在用户列表里与真 admin **肉眼无法区分**。
+那等于"声称修好了大小写唯一性"，实际反而留下一个更难查的冒充入口——比迁移前更糟。
+合并账号会丢权限（`user_roles` 按 user_id 关联），必须管理员显式决定。
+所以选 `RAISE EXCEPTION` + 把冲突行列出来：应用起不来是可见的故障，
+一个静默的冒充入口不是。
+
+迁移四段：①归一无冲突的 username ②归一 email ③DO 块冲突则报错并列出行
+④建 `lower()` 函数唯一索引做第二道防线。
+裁空白用 `regexp_replace(x,'^[[:space:]]+|[[:space:]]+$','','g')`，
+**不写 `btrim(name,'[:space:]')`**——那是字符集合，会把 admin 裁成 dmin（见 008 注释）。
+
+#### 迁移三个场景都单独验过（均已回滚）
+
+- A 仅归一无冲突 → 成功，`'  MixedCase  '` → `mixedcase`
+- B 仅用户名冲突 → 报 `用户名冲突（归一后）: caseprobe → CaseProbe, caseprobe`
+- C 仅邮箱冲突 → 报 `casetest@example.com → CaseTest@Example.com, casetest@example.com`
+
+#### 🐛 写测试时发现并修掉的真缺陷：约束名只认旧的
+
+`repository/user.rs` 按**约束名**把唯一冲突翻成 409，只认迁移 001 的
+`users_username_key` / `users_email_key`。而 013 新建的函数索引叫
+`users_username_lower_key`，**仅大小写不同的插入撞的是它**——实测：
+
 ```
-注册 CaseProbe → 200 / 注册 caseprobe → 200   ★两个独立账号
-建角色 CaseRole → 200（归一成 caserole）/ 建角色 caserole → 409
+INSERT ... VALUES ('ADMIN', ...) →
+ERROR: duplicate key value violates unique constraint "users_username_lower_key"
 ```
-Postgres `UNIQUE(username)` 大小写敏感 → `Admin`/`ADMIN`/`aDmIn` 可与真 `admin` 并存，
-自助注册即可造出，用户列表肉眼无法区分。邮箱同理。
 
-要做：
-- 归一函数照抄 `src/model/role.rs:41` 的 `normalize_role_name` 形状（trim + 小写）
-- 唯一性检查改成归一后比较
-- 迁移必须**报出冲突而非静默合并**（静默合并会丢权限）。
-  参考 `migrations/008_normalize_role_names.sql`：它用 `NOT EXISTS` 跳过冲突行而非让迁移失败
+只认旧名字的话这条会落到 **500 而不是 409**：013 注释里承诺的"第二道防线"
+拦住了却报 500，等于把一个可诊断的冲突变成"用户说系统坏了"。
+已抽 `conflict_from(e, action, username_msg, email_msg)` 同时认四个名字。
+两处调用点的措辞不同（`create` 说"已被注册"、`update` 说"已被占用"）是**既有**对外文案，
+由调用方传入，没有顺手统一——改它对本次缺陷没帮助，却会让已有的文案比对失效。
+
+这条路径走 HTTP 时**永远测不到**（应用侧查重会先一步挡住），
+所以测试里直接调 `UserRepository::create` 断言拿到 `AppError::Conflict`——
+目的就是不让这条路径保持不可见。
+
+#### 测试
+
+`tests/api_integration.rs` 新增 3 条 + `validation.rs` 的 `mod tests` 新增 4 条：
+
+| 测试 | 覆盖 |
+|---|---|
+| `user_identities_are_normalized_on_every_write_path` | 注册/建号/改号**三个入口**各验归一；大小写变体 409；`ADMIN`/`Admin`/`aDmIn` 冒充被挡；落库确为小写；冲突时不得留下半改的行 |
+| `login_accepts_any_casing_of_username_and_email` | 用户名与邮箱**两条查询路径**都大小写不敏感（登录框两者都接受） |
+| `the_database_rejects_identities_differing_only_in_case` | 函数索引在 DB 层拒绝；钉住撞的是 `*_lower_key`；仓储层翻成 409 |
+| `normalization_happens_before_validation` | 顺序：49 个 a + `İ` 归一后 51 字符必须拒（否则放行一个存下去就超长的用户名） |
+| `username_is_trimmed_and_lowercased` / `email_is_trimmed_and_lowercased` / `login_input_is_normalized_but_never_validated` | 归一规则本身；登录输入**不校验**（`ab`、带空格的非邮箱都放行给查询） |
+
+写测试时又踩了一次同样的坑：`İ`(U+0130) 小写后是 `i` + U+0307 组合上点，
+而 **U+0307 是 Mn（组合记号），不是字母数字**，所以 `is_alphanumeric()` 对它返回 false。
+我原先把它当成"归一后更宽松"的例子写进断言，测试当场红——真实结论是归一对它只会**更严**。
+已改成用两端空白论证"顺序错了会误拒"，并把这条事实写进注释。
+
+#### 前端同步（原本会漂移）
+
+`frontend/src/utils/accountRules.ts` 的 `usernameIssues` / `emailIssues`
+原本校验**输入框原文**，而后端现在校验**归一后的值**——不一起改的话，
+前端会红着拦下一个后端明明接受的输入（`  alice  ` 的空格既不在字符集里、
+长度也超了）。已加 `normalizeUsername` / `normalizeEmail` 并让两个
+`xxxIssues` 先归一再判。
+
+连带改了 Rust↔前端契约测试 `username_policy_agrees_with_the_frontend_rules`：
+它原来调 `validate_username`，现在调 **`normalize_username`**——
+对账的必须是前端实际走的那条路径，否则报错只会说"不一致"却指不出哪边错了。
+
+契约样例表加了 `{ name: '  alice  ', ok: true }` / `{ name: 'ALICE', ok: true }`
+/ `{ name: '   ', ok: false }` 三条，钉住"校验的是归一后的值"。
+
+**又踩了一次"字面量 vs 转义"的坑**：我本来想加 `{ name: '\tadmin\r', ok: true }`，
+但契约测试是按**文本**解析这张表的（找下一个单引号截断），它会拿到字面的
+反斜杠 t 而不是制表符——JS 侧 trim 掉的是空白、Rust 侧看到的是 `	admin
+`
+这串反斜杠，两侧结论必然相反，而报错只会说"不一致"。已删掉该条并在表旁
+写明原因（与表里既有的"必须写字面量不能写 `.repeat()`"是同一类坑）。
+
+前端另加 5 组 vitest 断言（`normalizeUsername`/`normalizeEmail` +
+两端空白与大小写不影响校验结论 + 长度按归一后字符数计）。
+
+#### 缺陷注入验证（每处都做了，会红并回滚）
+
+| 注入 | 结果 |
+|---|---|
+| 三个归一函数全退回 `raw.to_string()` | 2 条集成测试红（红在 trim 那一关） |
+| **只去掉 `.to_lowercase()`，保留 trim** | 2 条红，且**红在大小写断言上**（隔离出"大小写"这一个属性） |
+| 约束名只认 `*_key`（退回缺陷版） | `the_database_rejects_identities_differing_only_in_case` 红：`InternalServerError(... "users_username_lower_key")` |
+| 契约样例表把 `  alice  ` 改成 `ok: false` | 契约测试红：`"  alice  "：前端期望 false，后端实际 true` |
+
+第一次注入只去掉小写时测试红在**别的地方**（trim 那一关），
+说明"大小写"这个属性其实没被单独覆盖，于是做了第二次更精确的注入。
+
+#### 门禁结果（全绿）
+
+| 项 | 结果 |
+|---|---|
+| `cargo fmt --check` | ✅ |
+| `cargo clippy --all-targets -- -D warnings` | ✅ 0 warning |
+| `cargo test --all-targets` | ✅ 81 单元 + 12 非 ignored |
+| `cargo test --test api_integration -- --ignored --test-threads=1` | ✅ **133 passed / 0 failed** |
+| `pnpm lint` | ✅ 0 errors（`env.d.ts` 1 个历史 warning） |
+| `pnpm typecheck` / `pnpm test` / `pnpm build` | ✅ / ✅ **161 passed** / ✅ |
+
+**真实 HTTP 复核**（新二进制 session 46736，18080 端口，真实 PG+Redis）：
+注册 `  LiVeProbe  ` → 200 存成 `liveprobe` / `liveprobe@example.com`；
+`LIVEPROBE`/`LiVeProbe`/`liveprobe` 注册 → 全 409；
+`ADMIN`/`Admin`/`aDmIn` 注册 → 全 409；
+登录 `liveprobe`/`LIVEPROBE`/`LiVeProbe`/`  LiVeProbe  `/`liveprobe@EXAMPLE.COM`
+→ 全 200；错口令仍 401；管理员建号 `  AdMinProbe  ` → 存 `adminprobe`；
+**`export/users` 仍 200 / 17288 字节 / magic `PK\x03\x04`（第 1 项未回退）**。
+
+探针数据已按精确用户名删净；`username <> lower(username) OR email <> lower(email)`
+的存量计数为 **0**。
+
+> 缺陷注入跑红的 3 次会在清理前中止，库里留了 3 个大写账号
+> （`MiXeDcaselogin_*` / `MiXeDnorm_*` / `dbcasedbcase_*`，各带 1 个 `user` 角色）。
+> 已确认是本轮注入产生并删净。**注入型红测必然留残留**，收尾记得查一次。
 
 ### 已确认**不是**缺口（别重复排查）
 

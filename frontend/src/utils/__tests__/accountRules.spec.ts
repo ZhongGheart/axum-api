@@ -11,6 +11,8 @@ import { describe, it, expect } from 'vitest'
 import {
   usernameIssues,
   emailIssues,
+  normalizeUsername,
+  normalizeEmail,
   USERNAME_MIN_LEN,
   USERNAME_MAX_LEN,
   IDENTIFIER_MAX_LEN,
@@ -116,6 +118,53 @@ describe('usernameIssues', () => {
     expect(emoji.length).toBe(60)
     const problems = usernameIssues(emoji).join()
     expect(problems).toContain('只能包含')
+  })
+})
+
+describe('normalizeUsername（v0.19.0：校验对象必须是归一后的值）', () => {
+  it('trim + 小写，且不动中间内容', () => {
+    expect(normalizeUsername('  MiXeD_Name  ')).toBe('mixed_name')
+    expect(normalizeUsername('alice')).toBe('alice')
+  })
+
+  /**
+   * 两端空白**不该**被当成非法字符集
+   *
+   * 后端归一在校验之前，`  alice  ` 在那边是合法的 `alice`。
+   * 这里若按原文判，空格不在字符集里、长度也超了，前端就会红着
+   * 拦下一个后端明明接受的输入。
+   */
+  it('两端空白不影响校验结论', () => {
+    expect(usernameIssues('  alice  ')).toEqual([])
+    expect(usernameIssues('alice')).toEqual([])
+    // 空白本身仍不构成合法用户名：归一后是空串
+    expect(usernameIssues('   ').join()).toContain(`${USERNAME_MIN_LEN} 个字符`)
+  })
+
+  it('大小写不同的同一个名字得到相同结论', () => {
+    expect(usernameIssues('ALICE')).toEqual([])
+    expect(usernameIssues('Alice')).toEqual([])
+  })
+
+  /**
+   * 长度按**归一后**的字符数算
+   *
+   * 50 个字符加两端空白共 52 个码元：按原文判会超限，按归一后判正好卡在上限。
+   */
+  it('长度按归一后的字符数计', () => {
+    const padded = `  ${'a'.repeat(USERNAME_MAX_LEN)}  `
+    expect(padded.length).toBe(USERNAME_MAX_LEN + 4)
+    expect(usernameIssues(padded)).toEqual([])
+  })
+})
+
+describe('normalizeEmail（与 normalizeUsername 同形）', () => {
+  it('trim + 小写', () => {
+    expect(normalizeEmail('  Case@Test.COM  ')).toBe('case@test.com')
+  })
+
+  it('两端空白不影响邮箱校验结论', () => {
+    expect(emailIssues('  alice@example.com  ')).toEqual([])
   })
 })
 

@@ -121,17 +121,20 @@ impl AuthService {
         req: RegisterRequest,
         client_ip: &str,
     ) -> Result<UserInfo, AppError> {
-        validation::validate_username(&req.username)?;
+        // 归一在**校验之前**：`users.username` / `users.email` 的唯一数据源。
+        // 下面的查重用的就是归一后的值，于是查重自动变成"归一后比较"——
+        // 不必再单独写一条大小写不敏感的查重，那样两处规则迟早会走偏。
+        let username = validation::normalize_username(&req.username)?;
         validation::validate_password(&req.password)?;
-        validation::validate_email(&req.email)?;
+        let email = validation::normalize_email(&req.email)?;
 
-        if (self.user_repo.find_by_username(&req.username).await?).is_some() {
+        if (self.user_repo.find_by_username(&username).await?).is_some() {
             self.audit(AuthAudit {
                 action: Self::ACTION_REGISTER,
                 path: Self::PATH_REGISTER,
                 status_code: 409,
                 client_ip,
-                username: &req.username,
+                username: &username,
                 user_id: None,
                 result: "用户名已被注册",
             })
@@ -139,13 +142,13 @@ impl AuthService {
             return Err(AppError::Conflict("用户名已被注册".to_string()));
         }
 
-        if (self.user_repo.find_by_email(&req.email).await?).is_some() {
+        if (self.user_repo.find_by_email(&email).await?).is_some() {
             self.audit(AuthAudit {
                 action: Self::ACTION_REGISTER,
                 path: Self::PATH_REGISTER,
                 status_code: 409,
                 client_ip,
-                username: &req.username,
+                username: &username,
                 user_id: None,
                 result: "邮箱已被注册",
             })
@@ -160,8 +163,8 @@ impl AuthService {
             .user_repo
             .create(
                 Uuid::new_v4(),
-                &req.username,
-                &req.email,
+                &username,
+                &email,
                 &password_hash,
                 // 用户自己设的口令，不需要强制改密
                 false,
@@ -175,7 +178,10 @@ impl AuthService {
             path: Self::PATH_REGISTER,
             status_code: 200,
             client_ip,
-            username: &req.username,
+            // 记**归一后**的值，与本函数其余几条审计一致：
+            // 有人拿 `Admin` 去撞已存在的 `admin` 时，审计里留下的是
+            // 一次针对真账号的 409，而不是一个看不出意图的 `Admin`
+            username: &username,
             user_id: Some(user.id),
             result: "注册成功",
         })
@@ -200,7 +206,11 @@ impl AuthService {
         redis_client: &RedisClient,
         client_ip: &str,
     ) -> Result<LoginResponse, AppError> {
-        let account_scope = format!("account:{}", req.username.trim().to_lowercase());
+        // 归一一次，下面全流程复用：查库、限流 key、审计三处必须**同一个值**。
+        // 分头各算一次的话，哪天有人给其中一处忘了归一，
+        // 就会得到"限流按小写计数、查库按原样查"这种对不上的账。
+        let login_input = validation::normalize_login_input(&req.username);
+        let account_scope = format!("account:{login_input}");
         let ip_scope = format!("ip:{client_ip}");
 
         // 被锁定也要落审计：这正是"有人在爆破"最直接的证据，
@@ -217,7 +227,7 @@ impl AuthService {
                     path: Self::PATH_LOGIN,
                     status_code: 429,
                     client_ip,
-                    username: req.username.trim(),
+                    username: &login_input,
                     user_id: None,
                     result: "失败次数过多，账号或来源 IP 已锁定",
                 })
@@ -226,9 +236,11 @@ impl AuthService {
             return Err(e);
         }
 
+        // 登录输入同样要归一：`admin` / `Admin` / `ADMIN@Example.com`
+        // 必须落到同一个账号，否则"大小写不敏感"只是写入侧的一半承诺
         let user = match self
             .user_repo
-            .find_by_username_or_email(req.username.trim())
+            .find_by_username_or_email(&login_input)
             .await?
         {
             Some(user) => user,
@@ -240,7 +252,7 @@ impl AuthService {
                     path: Self::PATH_LOGIN,
                     status_code: 401,
                     client_ip,
-                    username: req.username.trim(),
+                    username: &login_input,
                     user_id: None,
                     result: "账号不存在",
                 })
@@ -256,7 +268,7 @@ impl AuthService {
                 path: Self::PATH_LOGIN,
                 status_code: 403,
                 client_ip,
-                username: req.username.trim(),
+                username: &login_input,
                 user_id: Some(user.id),
                 result: "账号已停用",
             })
@@ -275,7 +287,7 @@ impl AuthService {
                     path: Self::PATH_LOGIN,
                     status_code: 401,
                     client_ip,
-                    username: req.username.trim(),
+                    username: &login_input,
                     user_id: Some(user.id),
                     result: "口令不符",
                 })

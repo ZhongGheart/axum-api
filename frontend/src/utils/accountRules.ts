@@ -44,29 +44,49 @@ export const IDENTIFIER_MAX_LEN = 255
  */
 const USERNAME_PATTERN = /^[\p{L}\p{N}_-]+$/u
 
+/**
+ * 用户名归一（trim + 小写）——必须与后端 `normalize_username` 同形
+ *
+ * **校验的对象必须是归一后的值**，不能是输入框里的原文。
+ * 后端归一在校验之前，于是 `  alice  ` 在后端是合法的 `alice`；
+ * 若这里按原文判，空格既不在字符集里、长度也超了，前端会红着拦下一个
+ * 后端明明接受的输入。漂移方向与 `accountRules.ts` 顶部记的那些完全一样：
+ * 前端比后端严，用户填完整个表单才知道规则。
+ */
+export function normalizeUsername(username: string): string {
+  return username.trim().toLowerCase()
+}
+
 /** 用户名的问题列表；空数组表示通过 */
 export function usernameIssues(username: string): string[] {
+  const normalized = normalizeUsername(username)
   const problems: string[] = []
-  const len = [...username].length
+  const len = [...normalized].length
   if (len < USERNAME_MIN_LEN) {
     problems.push(`至少 ${USERNAME_MIN_LEN} 个字符`)
   }
   if (len > USERNAME_MAX_LEN) {
     problems.push(`最多 ${USERNAME_MAX_LEN} 个字符`)
   }
-  if (len > 0 && !USERNAME_PATTERN.test(username)) {
+  if (len > 0 && !USERNAME_PATTERN.test(normalized)) {
     problems.push('只能包含字母、数字、下划线和连字符')
   }
   return problems
 }
 
+/** 邮箱归一（trim + 小写）——与后端 `normalize_email` 同形，理由同 `normalizeUsername` */
+export function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase()
+}
+
 /** 邮箱的问题列表；空数组表示通过 */
 export function emailIssues(email: string): string[] {
   const problems: string[] = []
-  if (!email.includes('@') || !email.includes('.')) {
+  const normalized = normalizeEmail(email)
+  if (!normalized.includes('@') || !normalized.includes('.')) {
     problems.push('格式需包含 @ 与 .')
   }
-  if ([...email].length > 255) {
+  if ([...normalized].length > 255) {
     problems.push('最长 255 个字符')
   }
   return problems
@@ -183,6 +203,16 @@ export const USERNAME_POLICY_CASES: ReadonlyArray<{ name: string; ok: boolean }>
   // （两侧对 U+1D49C 的判定是一致的：Rust `is_alphabetic()` 为 true，
   //   JS 的 `\p{L}` 也匹配，所以它是合法用户名，不是取巧的取值。）
   { name: '𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜𝒜', ok: true },
+  // 下面三条是 v0.19.0 的分水岭：**两端空白不算问题、大小写算同一个**，
+  // 因为后端归一在校验之前。后端若改成先校验后归一，这三条会立刻红。
+  { name: '  alice  ', ok: true },
+  { name: 'ALICE', ok: true },
+  // **只能写空格，不能写 '\t' / '\r' 这类转义**：后端契约测试是按**文本**
+  // 解析这张表的（找下一个单引号截断），它会拿到字面的反斜杠 t，
+  // 而不是制表符——于是 JS 侧 trim 掉的是空白、Rust 侧看到的是 `\tadmin\r`
+  // 这串反斜杠，两侧结论必然相反，而报错只会说"不一致"。
+  // 空白归一由上面两条空格样例覆盖，足够了。
+  { name: '   ', ok: false },
   { name: 'ab', ok: false },
   { name: 'alice space', ok: false },
   { name: 'alice@host', ok: false },

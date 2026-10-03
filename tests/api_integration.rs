@@ -1722,6 +1722,458 @@ async fn role_names_are_normalized_on_write_and_conflicts_return_409() {
     let _ = delete_role(&app, &token, role_id).await;
 }
 
+// ──────────────────────────────────────────────
+// 用户名 / 邮箱归一（v0.19.0）
+// ──────────────────────────────────────────────
+
+/// 三个写入入口（自助注册、管理员建号、管理员改号）都必须归一，且撞名回 409
+///
+/// 用户名不只是展示用：它是**登录键**，也是管理员在用户列表里辨认账号的依据。
+/// 而 Postgres 的 `UNIQUE(username)` 是**大小写敏感**的——不归一的话
+/// `Admin` 能与真 `admin` 并存，且自助注册一次就能造出来。
+/// 管理员在列表上看到 `Admin` 无从判断它是不是真 admin，
+/// 于是"给 admin 绑个角色"、"重置 admin 口令"这类操作会被引到伪造账号上。
+///
+/// 三个入口分开断言：只测其中一个，另外两个照样能漏。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn user_identities_are_normalized_on_every_write_path() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let suffix = unique("norm").to_lowercase();
+
+    // ── 入口 1：自助注册 ──────────────────────────────────
+    let noisy = format!("  MiXeD{suffix}  ");
+    let canonical = format!("mixed{suffix}");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": noisy,
+                "email": format!("  MiXeD{suffix}@Example.COM  "),
+                "password": "normpass1A",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "注册应成功: {body}");
+    assert_eq!(
+        body["data"]["username"].as_str(),
+        Some(canonical.as_str()),
+        "注册时用户名应归一（trim + 小写）: {body}"
+    );
+    let registered_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    // 落库确为小写（不是"响应被改过、库里还是原样"）
+    assert_eq!(
+        email_in_db(&canonical).await,
+        format!("mixed{suffix}@example.com"),
+        "邮箱也应归一后落库"
+    );
+    assert!(
+        !user_exists(&noisy).await,
+        "原始写法 {noisy:?} 不应作为独立账号落库"
+    );
+
+    // 大小写变体撞名 → 409。**必须真的撞上同一个归一结果**：
+    // 建的是 mixed_{suffix}，所以变体也得是 MIXED 前缀
+    for variant in [
+        canonical.to_uppercase(),
+        format!("MiXeD{suffix}"),
+        format!("mixed{suffix}  "),
+    ] {
+        let (status, body) = send(
+            &app,
+            request(
+                "POST",
+                "/api/auth/register",
+                None,
+                Some(json!({
+                    "username": variant,
+                    "email": format!("other{suffix}@example.com"),
+                    "password": "normpass1A",
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "归一后同名应回 409（变体 {variant:?}）: {body}"
+        );
+    }
+
+    // 邮箱同理：用户名换一个，邮箱只差大小写仍要 409
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": format!("othermails{suffix}"),
+                "email": format!("MIXED{suffix}@EXAMPLE.COM"),
+                "password": "normpass1A",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "仅邮箱大小写不同也应回 409: {body}"
+    );
+
+    // ── 冒充内置账号：ADMIN / Admin 必须被挡 ────────────────
+    //
+    // 这是本项的**核心风险**，值得单独断言而不是顺带带过：
+    // 不归一时它们与真 admin 并存，且管理员在用户列表上肉眼分不出来
+    for impostor in ["ADMIN", "Admin", "aDmIn", " admin "] {
+        let (status, body) = send(
+            &app,
+            request(
+                "POST",
+                "/api/auth/register",
+                None,
+                Some(json!({
+                    "username": impostor,
+                    "email": format!("impostor{suffix}@example.com"),
+                    "password": "normpass1A",
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{impostor:?} 归一后等于 admin，不应能注册出冒充账号: {body}"
+        );
+    }
+    // 邮箱也不能撞上真 admin
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": format!("mailimpostor{suffix}"),
+                "email": "ADMIN@EXAMPLE.COM",
+                "password": "normpass1A",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "ADMIN@EXAMPLE.COM 归一后等于真 admin 邮箱，不应放行: {body}"
+    );
+
+    // ── 入口 2：管理员建号 ────────────────────────────────
+    let managed_noisy = format!("  AdMin{suffix}  ");
+    let managed_canonical = format!("admin{suffix}");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&token),
+            Some(json!({
+                "username": managed_noisy,
+                "email": format!("  AdMin{suffix}@Example.COM  "),
+                "password": "user1234",
+                "role": "user",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "管理员建号应成功: {body}");
+    assert_eq!(
+        body["data"]["username"].as_str(),
+        Some(managed_canonical.as_str()),
+        "管理员建号也应归一: {body}"
+    );
+    let managed_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+    assert!(!user_exists(&managed_noisy).await);
+
+    // 建号撞名（含大小写变体）→ 409
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&token),
+            Some(json!({
+                "username": managed_canonical.to_uppercase(),
+                "email": format!("dup{suffix}@example.com"),
+                "password": "user1234",
+                "role": "user",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "管理员建号撞名应回 409: {body}"
+    );
+
+    // 管理员也不能建出 ADMIN 冒充账号
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&token),
+            Some(json!({
+                "username": "ADMIN",
+                "email": format!("adminimp{suffix}@example.com"),
+                "password": "user1234",
+                "role": "admin",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "管理员不该能建出 ADMIN 冒充内置账号: {body}"
+    );
+
+    // ── 入口 3：管理员改号 ────────────────────────────────
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{managed_id}"),
+            Some(&token),
+            Some(json!({
+                "username": format!("  ReCased{suffix}  "),
+                "email": format!("  ReCased{suffix}@Example.COM  "),
+                "password": "user1234",
+                "role": "user",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "管理员改号应成功: {body}");
+    let recased = format!("recased{suffix}");
+    assert_eq!(
+        body["data"]["username"].as_str(),
+        Some(recased.as_str()),
+        "改号也应归一: {body}"
+    );
+    assert_eq!(
+        email_in_db(&recased).await,
+        format!("{recased}@example.com"),
+        "改号时邮箱也应归一后落库"
+    );
+
+    // 改成别人的名字（含大小写变体）→ 409，且**不得**改坏原行
+    for taken in [
+        "ADMIN".to_string(),
+        format!("MiXeD{suffix}"),
+        canonical.to_uppercase(),
+    ] {
+        let (status, body) = send(
+            &app,
+            request(
+                "PUT",
+                &format!("/api/admin/users/{managed_id}"),
+                Some(&token),
+                Some(json!({
+                    "username": taken,
+                    "email": format!("{recased}@example.com"),
+                    "password": "user1234",
+                    "role": "user",
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "改成 {taken:?} 应回 409: {body}"
+        );
+        assert_eq!(
+            email_in_db(&recased).await,
+            format!("{recased}@example.com"),
+            "冲突时不得留下半改的行"
+        );
+    }
+
+    delete_user_via_api(&app, &token, managed_id).await;
+    // 注册出来的账号没有角色，直接 SQL 删；留着会在共享库里攒下
+    // 登录名含关键词的垃圾行，干扰后续按关键词查证的用例
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(registered_id)
+        .execute(&pool().await)
+        .await
+        .expect("清理注册账号失败");
+}
+
+/// 登录对用户名与邮箱都**大小写不敏感**
+///
+/// 写入侧归一只做完一半：存下去的是小写，若登录仍按原样查库，
+/// 用户改成习惯的大小写后就登不进来——用户视角就是"我明明注册成功了"。
+/// 用户名和邮箱两条查询路径都要验，因为登录框两者都接受。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn login_accepts_any_casing_of_username_and_email() {
+    let app = app().await;
+    let suffix = unique("caselogin").to_lowercase();
+    let username = format!("mixed{suffix}");
+    let email = format!("mixed{suffix}@example.com");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": format!("  MiXeD{suffix}  "),
+                "email": format!("  MiXeD{suffix}@Example.COM  "),
+                "password": "caselogin1A",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "注册应成功: {body}");
+    let user_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    // 用户名的各种大小写
+    for variant in [
+        username.clone(),
+        username.to_uppercase(),
+        format!("MiXeD{suffix}"),
+        format!("  MIXED{suffix}  "),
+    ] {
+        let (status, body) = login(&app, &variant, "caselogin1A").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "用户名变体 {variant:?} 应能登录: {body}"
+        );
+    }
+
+    // 邮箱的各种大小写
+    for variant in [
+        email.clone(),
+        email.to_uppercase(),
+        format!("MiXeD{suffix}@Example.COM"),
+        format!("  MIXED{suffix}@EXAMPLE.COM  "),
+    ] {
+        let (status, body) = login(&app, &variant, "caselogin1A").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "邮箱变体 {variant:?} 应能登录: {body}"
+        );
+    }
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool().await)
+        .await
+        .expect("清理账号失败");
+}
+
+/// 数据库层的函数唯一索引：仅大小写不同的行直接写库也会被拒
+///
+/// 应用侧归一是第一道防线，但**任何绕过应用的写库路径**（手工 SQL、
+/// 导数据、将来某个漏了归一的新入口）都得被挡住，否则就是等到
+/// "用户列表里出现两个肉眼一样的账号"才被发现。
+///
+/// 顺带钉住一件事：撞的必须是 `*_lower_key` 而不是迁移 001 的 `*_key`，
+/// 因为完全相同的名字先撞旧约束、只有大小写不同才撞新的那个。
+/// 仓库层据此翻译 409——只认旧名字的话这条会变成 500。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_database_rejects_identities_differing_only_in_case() {
+    let app = app().await;
+    let suffix = unique("dbcase").to_lowercase();
+    let username = format!("dbcase{suffix}");
+    let email = format!("{username}@example.com");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": username,
+                "email": email,
+                "password": "dbcasepass1A",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "注册应成功: {body}");
+    let user_id: uuid::Uuid = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    // 用户名仅大小写不同
+    let err =
+        sqlx::query("INSERT INTO users (username, email, password_hash) VALUES ($1, $2, 'x')")
+            .bind(username.to_uppercase())
+            .bind(format!("u{suffix}@example.com"))
+            .execute(&pool().await)
+            .await
+            .expect_err("仅大小写不同的用户名应在数据库层被拒");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("users_username_lower_key"),
+        "应撞函数唯一索引，实际: {msg}"
+    );
+
+    // 邮箱仅大小写不同
+    let err =
+        sqlx::query("INSERT INTO users (username, email, password_hash) VALUES ($1, $2, 'x')")
+            .bind(format!("e{suffix}"))
+            .bind(email.to_uppercase())
+            .execute(&pool().await)
+            .await
+            .expect_err("仅大小写不同的邮箱应在数据库层被拒");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("users_email_lower_key"),
+        "应撞函数唯一索引，实际: {msg}"
+    );
+
+    // 仓库层必须把这个约束名翻成 409，而不是 500
+    //
+    // 直接调仓储而不是绕 HTTP：走 HTTP 时应用侧的查重会先一步挡住，
+    // 永远到不了这条路径——于是"只认 users_username_key"这个缺陷
+    // 就能一路绿灯发布，直到某个绕过归一的入口撞上它才在生产上 500。
+    // 这条断言存在的意义就是**不让那条路径保持不可见**。
+    let repo = axum_api::repository::user::UserRepository::new(pool().await);
+    let err = repo
+        .create(
+            uuid::Uuid::new_v4(),
+            &username.to_uppercase(),
+            &format!("repo{suffix}@example.com"),
+            "x",
+            false,
+        )
+        .await
+        .expect_err("仅大小写不同的用户名在仓库层也应回冲突，而不是内部错误");
+    assert!(
+        matches!(err, axum_api::error::AppError::Conflict(_)),
+        "仓库层应把 users_username_lower_key 翻成 409，实际: {err:?}"
+    );
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool().await)
+        .await
+        .expect("清理账号失败");
+}
+
 /// 内置角色不可改名，也不能把自定义角色改名成内置角色名。
 ///
 /// 与「内置角色不可删除」同源：`ADMIN_ROLE = "admin"` 是最后一名管理员保护
@@ -9524,7 +9976,11 @@ fn username_policy_agrees_with_the_frontend_rules() {
 
     let mut mismatches: Vec<String> = Vec::new();
     for (name, expected_ok) in &cases {
-        let actual_ok = axum_api::utils::validation::validate_username(name).is_ok();
+        // 对账的是 `normalize_username` 而不是 `validate_username`：
+        // 前端校验的是**归一后**的值（`normalizeUsername`），所以这里必须
+        // 走同一条路径。用 `validate_username` 的话，`  alice  ` 这类样例
+        // 两侧结论相反，而测试报"不一致"却指不出到底哪边错了。
+        let actual_ok = axum_api::utils::validation::normalize_username(name).is_ok();
         if actual_ok != *expected_ok {
             mismatches.push(format!(
                 "{name:?}：前端期望 {expected_ok}，后端实际 {actual_ok}"

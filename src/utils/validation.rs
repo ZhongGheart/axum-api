@@ -45,6 +45,50 @@ pub const USERNAME_MIN_LEN: usize = 3;
 /// 用户名最大长度（按字符计，与 `users.username` 的 varchar(50) 同单位）
 pub const USERNAME_MAX_LEN: usize = 50;
 
+/// 用户名归一——**`users.username` 的唯一数据源**
+///
+/// 用户名不只是展示用：它是登录键，也是管理员在用户列表里辨认账号的依据。
+/// 而 Postgres 的 `UNIQUE(username)` 是**大小写敏感**的，所以不归一的话
+/// `Admin` / `ADMIN` / `aDmIn` 能与真 `admin` 并存——自助注册即可造出来，
+/// 管理员在列表上看到 `Admin` 无法判断它是不是真 admin。
+/// 钓鱼、社工、"给 admin 绑个角色"这类操作都会被引到伪造账号上。
+/// 这不是理论风险，是一次注册请求的事。
+///
+/// 形状照 [`crate::model::role::normalize_role_name`]：那边角色名是 RBAC
+/// 的授权键，这边用户名是登录键，**都是不能有第二种形态的标识符**。
+///
+/// **先归一、再校验**，而不是反过来：这样"被校验的"就是"被存下的"。
+/// 边角例子是 `İ`(U+0130)，小写后是 2 个字符（`i` + 组合上点）：
+/// 先校验会放行并存下一个比原值更长的字符串，
+/// 先归一则按存下去的长度判定（并按字符集规则被拒）。
+pub fn normalize_username(raw: &str) -> ValidationResult<String> {
+    let username = raw.trim().to_lowercase();
+    validate_username(&username)?;
+    Ok(username)
+}
+
+/// 邮箱归一——**`users.email` 的唯一数据源**
+///
+/// 理由同 [`normalize_username`]：邮箱能登录，而 `UNIQUE(email)` 同样
+/// 大小写敏感，于是 `Case@Test.com` 与 `casetest@com` 会登录到两个不同 id。
+pub fn normalize_email(raw: &str) -> ValidationResult<String> {
+    let email = raw.trim().to_lowercase();
+    validate_email(&email)?;
+    Ok(email)
+}
+
+/// 登录输入归一（trim + 小写），**不做任何校验**
+///
+/// 单独一个函数而不是复用 [`normalize_username`] / [`normalize_email`]：
+/// 登录框接受**用户名或邮箱**两者，而用户名的字符集规则（不允许 `@` 与 `.`）
+/// 会把合法邮箱判非法。查不到就是查不到——非法输入在这一层只需要
+/// "归一后去库里找"，找不到自然回统一的「用户名或密码错误」，
+/// 不需要提前给它一条能区分"格式错"与"不存在"的报错：
+/// 那等于给爆破者一个免费的账号枚举信号。
+pub fn normalize_login_input(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
 /// 口令最小长度
 pub const PASSWORD_MIN_LEN: usize = 8;
 /// 口令最大长度
@@ -264,6 +308,98 @@ mod tests {
             validate_username(&"a".repeat(51)),
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    /// 归一必须发生在**校验之前**，顺序反过来会留下"校验的不是存下去的那个值"
+    ///
+    /// 这不是洁癖：`İ`(U+0130) 按 Unicode 规则小写后是 **2 个字符**
+    /// （`i` + U+0307 组合上点）。若先校验后归一，一个"校验时刚好 50 字符"
+    /// 的用户名归一后变成 51 个字符——而 `users.username` 是 `varchar(50)`，
+    /// 落库要么被 Postgres 截断要么直接报错，而报错发生在**校验已经通过之后**，
+    /// 调用方拿到的是一个完全无法归因的失败。
+    #[test]
+    fn normalization_happens_before_validation() {
+        // 前提：`İ`.to_lowercase() 确实会产生两个字符，顺序才有意义
+        let dotted_i = "\u{0130}";
+        assert_eq!(dotted_i.to_lowercase().chars().count(), 2);
+
+        // 归一后越界 → 必须拒。49 个 a + 1 个 İ：原始 50 字符（合法），
+        // 归一后 51 字符（超出 varchar(50)）
+        let at_limit_then_over = format!("{}\u{0130}", "a".repeat(USERNAME_MAX_LEN - 1));
+        assert_eq!(at_limit_then_over.chars().count(), USERNAME_MAX_LEN);
+        assert!(
+            validate_username(&at_limit_then_over).is_ok(),
+            "前提：未归一时它是合法的，若这里就拒了，测不到顺序问题"
+        );
+        assert!(
+            matches!(
+                normalize_username(&at_limit_then_over),
+                Err(AppError::BadRequest(_))
+            ),
+            "校验必须作用在归一后的值上：否则会放行一个存下去就超长的用户名"
+        );
+
+        // 反方向：两端空白不在字符集内，先校验就会把本来能用的输入判非法。
+        // （曾想用 `İİİ` 举例，但小写后的 U+0307 是组合记号而非字母数字，
+        //   字符集照样会拒——归一对这条只会更严，不能拿来论证"更宽松"）
+        assert!(
+            matches!(validate_username("  admin  "), Err(AppError::BadRequest(_))),
+            "前提：未归一时两端空白让字符集判定失败"
+        );
+        assert_eq!(
+            normalize_username("  admin  ").unwrap(),
+            "admin",
+            "归一在校验之前，才能让'只是多了两端空白'的输入被接受"
+        );
+    }
+
+    /// 用户名归一：trim + 小写，且归一后的值才是被校验、被存下的那个
+    #[test]
+    fn username_is_trimmed_and_lowercased() {
+        assert_eq!(normalize_username("  MiXeD_Name  ").unwrap(), "mixed_name");
+        // 内嵌空格仍然非法：归一只动两端，不该顺手放宽字符集
+        assert!(matches!(
+            normalize_username("mi xed"),
+            Err(AppError::BadRequest(_))
+        ));
+        // 全是空白 → 归一后为空 → 长度不足
+        assert!(matches!(
+            normalize_username("   "),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    /// 邮箱归一：与用户名同规则
+    #[test]
+    fn email_is_trimmed_and_lowercased() {
+        assert_eq!(
+            normalize_email("  Case@Test.COM  ").unwrap(),
+            "case@test.com"
+        );
+        // 归一后仍不合形状才拒
+        assert!(matches!(
+            normalize_email("  NOT_AN_EMAIL  "),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    /// 登录输入只归一、**不校验**
+    ///
+    /// 登录框接受用户名或邮箱两者，而 `validate_username` 不允许 `@`：
+    /// 若在这里复用它，合法的邮箱登录会被判非法。
+    /// 同时也**不能**给"格式错"单独一条报错——那等于给爆破者一个
+    /// 免费的账号枚举信号，查不到就统一回"用户名或密码错误"。
+    #[test]
+    fn login_input_is_normalized_but_never_validated() {
+        assert_eq!(
+            normalize_login_input("  Admin@Example.COM  "),
+            "admin@example.com"
+        );
+        assert_eq!(normalize_login_input("\t ADMIN \n"), "admin");
+        // 用户名规则会拒的东西，这里照样放行给查询去处理
+        assert_eq!(normalize_login_input("ab"), "ab");
+        assert_eq!(normalize_login_input("not an email"), "not an email");
+        assert_eq!(normalize_login_input("   "), "");
     }
 
     #[test]

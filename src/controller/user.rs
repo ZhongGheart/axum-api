@@ -253,8 +253,11 @@ pub async fn create_user(
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     use crate::utils::password::hash_password;
 
-    validation::validate_username(&req.username)?;
-    validation::validate_email(&req.email)?;
+    // 归一在**校验之前**（见 `validation::normalize_username`）：
+    // 下面的查重用的就是归一后的值，查重因此自动是"归一后比较"，
+    // 不必再单独写一条大小写不敏感的查重——两处规则迟早会走偏。
+    let username = validation::normalize_username(&req.username)?;
+    let email = validation::normalize_email(&req.email)?;
     // 角色存在性校验必须在写用户之前：仓库层的校验在 replace_user_roles 里，
     // 那时用户行已经落库且两者不在同一事务，失败会留下"没有任何角色的用户"
     let roles = resolve_roles(&state, &requested_roles(&req)).await?;
@@ -275,7 +278,7 @@ pub async fn create_user(
     if state
         .auth_service
         .user_repo
-        .find_by_username(&req.username)
+        .find_by_username(&username)
         .await?
         .is_some()
     {
@@ -284,7 +287,7 @@ pub async fn create_user(
     if state
         .auth_service
         .user_repo
-        .find_by_email(&req.email)
+        .find_by_email(&email)
         .await?
         .is_some()
     {
@@ -299,8 +302,8 @@ pub async fn create_user(
         .user_repo
         .create(
             Uuid::new_v4(),
-            &req.username,
-            &req.email,
+            &username,
+            &email,
             &password_hash,
             // 管理员建号：口令由管理员设定，用户本人从未参与选择，
             // 因此强制其首次登录后改掉（v0.11.0）
@@ -350,8 +353,9 @@ pub async fn update_user(
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(req): ApiJson<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
-    validation::validate_username(&req.username)?;
-    validation::validate_email(&req.email)?;
+    // 同建号：先归一再校验，落库与查重都用归一后的值
+    let username = validation::normalize_username(&req.username)?;
+    let email = validation::normalize_email(&req.email)?;
     let new_roles = resolve_roles(&state, &requested_roles(&req)).await?;
 
     let current_roles = state
@@ -381,7 +385,7 @@ pub async fn update_user(
     let updated = state
         .auth_service
         .user_repo
-        .update(id, &req.username, &req.email, req.is_active.unwrap_or(true))
+        .update(id, &username, &email, req.is_active.unwrap_or(true))
         .await?;
 
     let mut facts: Vec<String> = Vec::new();
