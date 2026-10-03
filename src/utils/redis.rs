@@ -290,6 +290,42 @@ impl RedisClient {
         Ok(())
     }
 
+    /// 按前缀删除所有键，返回**实际删除的键数**
+    ///
+    /// 用 SCAN 增量遍历而不是 KEYS：KEYS 会一次性遍历整个键空间并阻塞 Redis
+    /// 的单线程事件循环，而这个操作是管理员在界面上随时能点的。
+    /// 游标循环必须每轮都判 `cursor == 0`，否则会漏掉最后一批键。
+    pub async fn delete_by_prefix(&self, prefix: &str) -> Result<u64> {
+        let mut conn = self.conn.clone();
+        let pattern = format!("{prefix}*");
+        let mut cursor: u64 = 0;
+        let mut deleted: u64 = 0;
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(500)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| {
+                    crate::error::AppError::InternalServerError(format!("Redis SCAN 失败: {e}"))
+                })?;
+            cursor = next;
+            if !keys.is_empty() {
+                let n: u64 = conn.del(&keys).await.map_err(|e| {
+                    crate::error::AppError::InternalServerError(format!("Redis DEL 失败: {e}"))
+                })?;
+                deleted += n;
+            }
+            if cursor == 0 {
+                break;
+            }
+        }
+        Ok(deleted)
+    }
+
     /// 检查用户级限流
     pub async fn check_user_rate_limit(
         &self,

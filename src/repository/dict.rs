@@ -9,6 +9,23 @@ use crate::utils::redis::RedisClient;
 
 const DICT_CACHE_PREFIX: &str = "dict:";
 
+/// 把字典项写入时的约束冲突翻译成人话
+///
+/// 为什么要专门做这一层：仓储层已经在写路径上"先取消旧默认项"，
+/// 但那是应用层保证——两个并发请求会各自看到"现在还没有默认项"，
+/// 最后各写一个，由迁移 012 的部分唯一索引裁决。
+/// 那条路径如果不翻译，管理员看到的是"服务器内部错误"，
+/// 既不知道发生了什么，也不知道该改什么。
+/// 沿用 `repository/menu.rs` 的 `map_write_violation` 同一套路。
+fn map_dict_item_write_violation(e: sqlx::Error, fallback: String) -> AppError {
+    match e.as_database_error().and_then(|db| db.constraint()) {
+        Some("idx_dict_items_single_default") => {
+            AppError::Conflict("该字典已有一个默认项，请稍后重试或先取消原有默认项".to_string())
+        }
+        _ => AppError::InternalServerError(fallback),
+    }
+}
+
 /// 字典仓储
 #[derive(Debug, Clone)]
 pub struct DictRepository {
@@ -114,6 +131,21 @@ impl DictRepository {
         .map_err(|e| AppError::InternalServerError(format!("查询字典项失败: {e}")))
     }
 
+    /// 列出**对外可用**的字典项：跳过 `status='disabled'` 的项
+    ///
+    /// 字典管理页需要看到禁用项（否则管理员没法把它们改回来），
+    /// 因此 `list_items` 不过滤；读取端点必须过滤——管理页看得到、
+    /// 业务页面看不到，才是"禁用"这个开关真正生效的样子。
+    pub async fn list_enabled_items(&self, type_id: Uuid) -> Result<Vec<DictItem>, AppError> {
+        sqlx::query_as::<_, DictItem>(
+            "SELECT * FROM dict_items WHERE dict_type_id = $1 AND status = 'enabled' ORDER BY sort_order ASC",
+        )
+        .bind(type_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询字典项失败: {e}")))
+    }
+
     /// 按 ID 查询字典项
     ///
     /// v0.13.0 起为 `pub`：删除入口需要在**删之前**查一次 `label`/`value`，
@@ -128,14 +160,46 @@ impl DictRepository {
     }
 
     pub async fn create_item(&self, item: &DictItem) -> Result<DictItem, AppError> {
+        // 与 update_item 同一条规则：禁用项不能当默认项，
+        // 否则读取端点过滤掉它之后，"默认"就指向一个不存在的东西
+        if item.is_default && item.status != "enabled" {
+            return Err(AppError::BadRequest(
+                "已禁用的字典项不能设为默认项，请先启用它".into(),
+            ));
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+        // 同一字典只允许一个默认项。设置新的默认项前先把旧的取消，
+        // 否则"默认"这个词就没有意义（实测可同时存在任意多个）。
+        //
+        // 与 INSERT 放同一个事务：分两次写的话，并发请求会各自看到
+        // "现在还没有默认项"，最后写两个，DB 唯一索引直接报错。
+        if item.is_default {
+            sqlx::query(
+                "UPDATE dict_items SET is_default = FALSE WHERE dict_type_id = $1 AND is_default",
+            )
+            .bind(item.dict_type_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("清除旧默认项失败: {e}")))?;
+        }
         let saved = sqlx::query_as::<_, DictItem>(
             "INSERT INTO dict_items (id, dict_type_id, label, value, sort_order, status, is_default, color) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",
         )
         .bind(item.id).bind(item.dict_type_id).bind(&item.label).bind(&item.value)
         .bind(item.sort_order).bind(&item.status).bind(item.is_default).bind(&item.color)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| AppError::InternalServerError(format!("创建字典项失败: {e}")))?;
+        .map_err(|e| {
+            let fallback = format!("创建字典项失败: {e}");
+            map_dict_item_write_violation(e, fallback)
+        })?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
         self.invalidate_cache_for_type(item.dict_type_id).await;
         Ok(saved)
     }
@@ -155,15 +219,49 @@ impl DictRepository {
         let value = &fields.value;
         let sort = fields.sort_order.unwrap_or(old.sort_order);
         let status = fields.status.as_deref().unwrap_or(&old.status);
-        let def = fields.is_default.unwrap_or(old.is_default);
         let color = fields.color.as_deref().or(old.color.as_deref());
+
+        // 禁用的项不能是默认项：读取端点按 status 过滤掉禁用项，
+        // 于是"禁用 + 默认"= 一个谁都看不见的默认项——又是一个说了不算的开关。
+        // 请求里显式要 `is_default=true` 时直接说清楚，不静默改写管理员的输入；
+        // 没显式提（`None`）时按"禁用它就不该再当默认"处理，静默清除是符合意图的。
+        let def = match fields.is_default {
+            Some(true) if status != "enabled" => {
+                return Err(AppError::BadRequest(
+                    "已禁用的字典项不能设为默认项，请先启用它".into(),
+                ));
+            }
+            Some(v) => v,
+            None => status == "enabled" && old.is_default,
+        };
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+        if def {
+            // 排除自身：否则会先把自己的 is_default 清成 FALSE
+            sqlx::query("UPDATE dict_items SET is_default = FALSE WHERE dict_type_id = $1 AND is_default AND id <> $2")
+                .bind(old.dict_type_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::InternalServerError(format!("清除旧默认项失败: {e}")))?;
+        }
         let saved = sqlx::query_as::<_, DictItem>(
             "UPDATE dict_items SET label=$2,value=$3,sort_order=$4,status=$5,is_default=$6,color=$7 WHERE id=$1 RETURNING *",
         )
         .bind(id).bind(label).bind(value).bind(sort).bind(status).bind(def).bind(color)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| AppError::InternalServerError(format!("更新字典项失败: {e}")))?;
+        .map_err(|e| {
+            let fallback = format!("更新字典项失败: {e}");
+            map_dict_item_write_violation(e, fallback)
+        })?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
         self.invalidate_cache_for_type(old.dict_type_id).await;
         Ok(saved)
     }
@@ -188,6 +286,10 @@ impl DictRepository {
     // ── 缓存与批量查询 ──────────────────────────────────
 
     /// 根据编码获取字典（先查 Redis，再查 DB）
+    ///
+    /// **只返回对外可用的数据**：`status='disabled'` 的字典类型与字典项都不返回。
+    /// 这是"禁用"这个开关真正生效的地方——字典管理页仍看得到禁用项（`list_items`
+    /// 不过滤，管理员要能改回来），但业务页面读不到。
     pub async fn get_dict_by_code(&self, code: &str) -> Result<Vec<DictItemResponse>, AppError> {
         // 尝试从 Redis 读取
         if let Some(ref redis) = self.redis {
@@ -201,7 +303,13 @@ impl DictRepository {
         // 回源到 DB
         let type_opt = self.find_type_by_code(code).await?;
         if let Some(t) = type_opt {
-            let items = self.list_items(t.id).await?;
+            // 类型被禁用 → 整份字典不可用。注意**不写缓存**：
+            // 空结果一旦被缓存住，管理员重新启用类型后还得等 TTL 到期才恢复，
+            // 而"我刚点了启用，怎么还没生效"正是这个开关最该避免的观感。
+            if t.status != "enabled" {
+                return Ok(vec![]);
+            }
+            let items = self.list_enabled_items(t.id).await?;
             let resp: Vec<DictItemResponse> = items
                 .iter()
                 .map(|i| DictItemResponse {
@@ -275,6 +383,20 @@ impl DictRepository {
         match self.find_type_by_id(type_id).await {
             Ok(t) => self.invalidate_cache(&t.code).await,
             Err(e) => tracing::warn!("字典缓存失效跳过（类型 {type_id} 查询失败）: {e}"),
+        }
+    }
+
+    /// 清空**全部**字典缓存，返回实际删除的键数
+    ///
+    /// 这是"刷新缓存"真正需要的那一步。写路径的 `invalidate_cache` 只覆盖
+    /// 自己那几个键，一旦它失败（Redis 抖动）就没有任何补救手段了——
+    /// 而管理员唯一能点的按钮此前只是把缓存读一遍再原样写回。
+    pub async fn clear_all_dict_cache(&self) -> Result<u64, AppError> {
+        match &self.redis {
+            Some(r) => r.delete_by_prefix(DICT_CACHE_PREFIX).await,
+            // 没有 Redis 客户端就意味着根本没有缓存。如实报 0，
+            // 让界面能区分"本来就没有缓存"和"清掉了 N 个键"。
+            None => Ok(0),
         }
     }
 }

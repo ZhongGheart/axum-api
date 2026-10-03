@@ -1,5 +1,7 @@
 /** 数据字典 API */
 
+import type { DictCacheRefresh } from '@/utils/dict'
+
 import http from './index'
 
 /** 字典类型 */
@@ -72,5 +74,6 @@ export const dictApi = {
 
   /** 字典读取（任意已登录用户；非管理页面也会用到） */
   getCachedDict(code: string) { return http.get<DictItemInfo[]>(`/dict/${code}/items`) },
-  refreshCache() { return http.post<null>('/admin/dict/refresh') },
+  /** 返回真实清理数量，不再是无条件的一句"刷新成功" */
+  refreshCache() { return http.post<DictCacheRefresh>('/admin/dict/refresh') },
 }

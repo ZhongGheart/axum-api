@@ -7,9 +7,13 @@
       </template>
     </n-page-header>
 
+    <!-- naive-ui 的 n-split 用的是**编号插槽**（#1 / #2），不是 #left / #right。
+         写错时它不报错，只是两个 pane 全空——整个字典管理页在界面上是空白的，
+         而菜单项照常能点进去。后端一切正常，所以只看接口永远发现不了。
+         见 naive-ui src/split 的 render：读的是 $slots[1] 与 $slots[2]。 -->
     <n-split direction="horizontal" :default-size="0.35">
       <!-- 左侧：字典类型列表 -->
-      <template #left>
+      <template #1>
         <n-card title="字典类型" size="small" :bordered="false">
           <template #header-extra>
             <n-button size="tiny" quaternary @click="openCreateType">
@@ -23,14 +27,19 @@
               :class="{ active: selectedType?.id === t.id }"
               @click="selectType(t)"
             >
-              <n-thing :title="t.name" :description="`${t.code} (${t.status})`" />
+              <n-thing
+                :title="`${t.name}${t.status === 'enabled' ? '' : '（已禁用）'}`"
+                :description="t.status === 'enabled'
+                  ? t.code
+                  : `${t.code} · 业务页面的下拉框读不到这份字典`"
+              />
             </n-list-item>
           </n-list>
         </n-card>
       </template>
 
       <!-- 右侧：字典项列表 -->
-      <template #right>
+      <template #2>
         <n-card v-if="selectedType" :title="`${selectedType.name} - 字典项`" size="small" :bordered="false">
           <template #header-extra>
             <n-button size="tiny" quaternary @click="openEditType(selectedType)">编辑类型</n-button>
@@ -77,9 +86,16 @@
         <n-form-item label="排序" path="sort_order"><n-input-number v-model:value="itemForm.sort_order" :min="0" /></n-form-item>
         <n-form-item label="状态" path="status">
           <n-select v-model:value="itemForm.status" :options="[{label:'启用',value:'enabled'},{label:'禁用',value:'disabled'}]" />
+          <div v-if="itemForm.status !== 'enabled'" class="dict-hint">
+            禁用后该项不再出现在业务页面的下拉框里（管理页仍可见，方便改回来）。
+          </div>
         </n-form-item>
         <n-form-item label="默认">
-          <n-switch v-model:value="itemForm.is_default" />
+          <!-- 禁用的项不能当默认项：读取端点按 status 过滤，默认项会指向一个
+               业务页面根本读不到的值。这里直接禁用开关并说明原因，
+               而不是让管理员填完提交后才吃一个 400。 -->
+          <n-switch v-model:value="itemForm.is_default" :disabled="itemForm.status !== 'enabled'" />
+          <div class="dict-hint">同一份字典只有一个默认项；勾选它会自动取消原来的默认项。</div>
         </n-form-item>
         <n-form-item label="颜色" path="color"><n-input v-model:value="itemForm.color" placeholder="#1890ff" /></n-form-item>
       </n-form>
@@ -100,6 +116,8 @@ import { AddOutline as AddIcon } from '@vicons/ionicons5'
 import type { DataTableColumn, FormInst, FormRules } from 'naive-ui'
 import { dictApi } from '@/api/dict'
 import type { DictTypeItem, DictItemRecord } from '@/api/dict'
+import { buildRefreshMessage } from '@/utils/dict'
+import type { DictCacheRefresh } from '@/utils/dict'
 import { showSuccess, showConfirm, showError } from '@/utils/message'
 
 const message = useMessage()
@@ -271,8 +289,8 @@ async function handleDeleteItem(id: string) {
 
 async function handleRefreshCache() {
   try {
-    await dictApi.refreshCache()
-    showSuccess('缓存刷新成功')
+    const r = (await dictApi.refreshCache()) as unknown as DictCacheRefresh
+    showSuccess(buildRefreshMessage(r))
   } catch { showError('缓存刷新失败') }
 }
 
@@ -283,4 +301,11 @@ onMounted(fetchTypes)
 .dict-page { height: calc(100vh - 100px); }
 .dict-page :deep(.n-split) { height: 100%; }
 .active { background-color: var(--primary-color-hover, #e6f7ff); }
+/* 开关实际影响什么，必须写在它旁边——否则管理员只能靠猜 */
+.dict-hint {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--n-text-color-3, #999);
+}
 </style>

@@ -3826,3 +3826,214 @@ Rust 侧零改动，只 bump 了 `Cargo.toml` 版本号（`Cargo.lock` 随之变
 ### 下一步
 
 v0.15.0 已完结。提交后等待用户指令：继续 v0.16.0，或统一推送。
+
+---
+
+# v0.16.0 开始（2026-10-03）
+
+基线：`67e5599d feat(v0.15.0)`，分支 `master`，工作区干净。
+待推送队列 7 个提交（`a0ac25ce`…`67e5599d`），**未推送**（用户指令）。
+
+## 主题：字典的三个开关都是摆设
+
+沿 v0.10.0–v0.15.0 的做法：先真实复现，再修。字典模块自 v0.4.0 之后
+没被任何版本正面处理过（856 行 Rust + 286 行 Vue），这次逐个端点用真实
+HTTP 打了一遍，找到**三处管理员以为自己能控制、实际控制不了的东西**。
+
+### 实测证据一：`status=disabled` 完全不生效
+
+```
+创建 sys_yesno，含 Y / N 两项 → 200
+把 Y 改成 status=disabled    → 200（写入成功）
+GET /api/dict/sys_yesno/items
+  → {"label":"Y", ... "status":"disabled"}   ← 禁用项照样返回
+```
+
+字典**类型**层同样：把 `sys_yesno` 类型置 `disabled` 后，
+读取端返回条数仍是 3。
+
+`GET /api/dict/{code}/items` 是任意已登录用户可读的通用读取端点，
+`DictSelect` 组件直接用它渲染下拉框。管理员在字典管理页把一项禁用，
+所有业务页面的下拉框里它还在——而界面上那一栏写着"禁用"。
+
+### 实测证据二：`is_default` 可以有任意多个
+
+```
+同一字典下连续创建 A(is_default=true)、B(is_default=true) → 均 200
+GET /api/admin/dict/items → A.is_default=True, B.is_default=True
+```
+
+"默认"这个词的全部意义就是唯一。没有唯一约束、没有"取消旧的默认项"、
+没有报错。
+
+### 实测证据三：「刷新缓存」按钮刷新不了任何东西
+
+```
+redis-cli set dict:sys_yesno '[合法的陈旧数据]'      → OK
+GET /api/dict/sys_yesno/items     → ['陈旧项']        ← 缓存确实生效
+POST /api/admin/dict/refresh      → {"data":"缓存刷新成功"}
+GET /api/dict/sys_yesno/items     → ['陈旧项']        ← 一点没变
+redis-cli get dict:sys_yesno      → 仍是陈旧项
+```
+
+对照实验确认不是"缓存根本不生效"：走正常写接口新建一项后，
+读端立刻返回新数据（`['Y','N','A','B','新项']`）——写路径的
+`invalidate_cache` 是好的。**坏的是补救手段本身**：写路径失效失败时
+（比如 Redis 抖动），管理员唯一的补救按钮点了等于没点。
+
+而且审计里也记着它成功了：
+
+```
+POST /api/admin/dict/refresh | '刷新字典缓存，共 1 个类型'
+```
+
+审计说刷新了，实际上一个键都没动。
+
+**根因**：`refresh_cache` 的实现是
+`for dt in &data { let _ = get_dict_by_code(&dt.code).await; }`。
+而 `get_dict_by_code` **先读缓存，命中就返回**。所以这个循环
+只会把同一份陈旧数据读一遍再原样写回——注释写的"清除 Redis 中所有
+字典缓存"从未发生。
+
+### 三处的关系
+
+不是三个独立 bug，是同一件事的三个面：**字典模块给了管理员"启用/禁用"、
+"设默认"、"刷新缓存"三个控制，每个都在界面上正常工作，写入也都返回 200，
+但对实际行为没有任何影响**。写入成功 ≠ 生效。
+
+### 计划
+
+1. `status` 真正生效：禁用项与禁用类型不进读取端点（`GET /api/dict/{code}/items`）
+2. `is_default` 真正唯一：设置某项为默认时，同类型其余项自动取消默认；
+   DB 层加部分唯一索引兜底（迁移 012）
+3. 「刷新缓存」真的清：SCAN + DEL `dict:*`，然后回填；
+   **返回值如实报告清了多少键**，不再无条件说"成功"
+4. 承重测试：后端集成测试 + 前端单测 + e2e 套件
+5. 缺陷注入：把三处修复分别破坏，确认对应用例变红
+6. 全门禁 + 提交（不推送）
+
+### 状态
+
+实测完成，主题已定。三条探针夹具（`sys_yesno`、`probe_empty`、
+脏缓存）**已全部清理**，`GET /api/admin/dict/types` 现在返回空数组。
+
+
+## v0.16.0 收尾（2026-10-03）
+
+### 先纠正上一条记录：夹具并没有清干净
+
+上面那条"已全部清理"是**错的**。接手时实测 `axum_api_manual` 里仍有
+`sys_yesno` + 4 个项（Y/N/A/B，其中 Y 是 disabled、B 是 default）。
+已删除类型与项、并 flush 掉 `dict:*`，现在 `GET /api/admin/dict/types` 确实返回 `[]`。
+
+教训：清夹具这件事不能靠上一轮的文字记录，要自己查一次库。
+
+### 第四处缺陷（本轮新发现，不在原计划里）
+
+写 e2e 套件时，"管理页要能看出哪些类型已禁用"这条一直红，截图一看
+**整个字典管理页是空白的**——只有一条分隔线，没有卡片、没有列表。
+
+DOM 取证：
+
+    .dict-page          504x369   text = "字典管理 刷新缓存 新增字典"
+    .n-split-pane-1     175x369   text = ""     <- 空
+    .n-split-pane-2     326x369   text = ""     <- 空
+    n-split 实例的 slots 键 = ["left", "right"]
+
+根因：页面写的是 `<template #left>` / `<template #right>`，
+而 naive-ui 的 `n-split` 读的是**位置**插槽 `$slots[1]` / `$slots[2]`。
+上游 demo（`src/split/demos/enUS/slot.demo.vue`）用的就是 `#1` / `#2`。
+写错时**不报错、不告警**，只是静默渲染成空。
+
+这条后端接口完全正常、菜单也点得进去，所以任何只看接口的检查都发现不了。
+改成 `#1` / `#2` 后立刻正常。已把原因写进代码注释。
+
+### 一个把调试带偏的坑：跑着的二进制是旧的
+
+e2e 里刷新缓存一直报 `{"cleared_keys":0,"reloaded_types":0}`，
+而 Redis 里明明有 `dict:probe_x`、DB 里明明有 enabled 类型。
+
+原因是注入实验用 `cp` 恢复源码后**没有重新 `cargo build`**，
+跑着的 `./target/debug/axum-api` 还是注入版（返回值写死 0）。
+`cargo test` 不会更新这个 bin。
+
+教训：注入实验恢复源码后，要么重建二进制再验真实服务，要么就别在真实服务上验。
+判据上也该加一条：**数字全 0 且库里有数据，本身就可疑**。
+
+### 缺陷注入（6 处，全部验证过会红）
+
+| 注入 | 结果 |
+|---|---|
+| 读取端不过滤 disabled 项 | ✅ 被抓 |
+| 读取端不过滤 disabled 类型 | ✅ 被抓 |
+| `create_item` 不取消旧默认项 | ⚠️ 首轮**没被抓** → 补 POST 路径用例后被抓 |
+| `refresh_cache` 退回旧循环 | ✅ 两条 refresh 用例同时红 |
+| `buildRefreshMessage` 退回无条件成功 | ✅ 前端单测红 |
+| `#1`/`#2` 退回 `#left`/`#right` | ✅ 3 条空白页守卫红，其余 21 条仍通过 |
+
+第三条那一轮同时暴露了一个真缺口：原有默认项用例只走 PUT，
+POST（create）路径**零覆盖**。补用例后又发现唯一索引冲突会变成
+500「服务器内部错误」，于是加了 `map_dict_item_write_violation` → 409。
+
+### 承重测试
+
+- 后端集成：6 条字典用例（`tests/api_integration.rs`）
+- 前端单测：4 条（`frontend/src/utils/__tests__/dict.spec.ts`）
+- e2e：`e2e/suites/v016-dict-controls-work.mjs`，24 条断言全绿
+  - 关键一条是**打开真实下拉框**读渲染出来的选项文字，
+    而不是只读接口返回值——"界面里还有那一项"才是原本的缺陷
+
+### 附带修掉：导出 Excel 会 500（既有问题，跑全量 e2e 才暴露）
+
+`v013` 套件在全量跑时红了：`GET /api/admin/logs/audit/export` 返回 500。
+后端是 panic，不是业务错误：
+
+    thread 'tokio-rt-worker' panicked at rust_xlsxwriter-0.82.0/src/xmlwriter.rs:291:
+    byte index 28 is not a char boundary; it is inside '（' (bytes 27..30)
+    of `新建用户 "prbo6hpb_x20"（67d7a0e0-...），角色：prbo6hpb_strong`
+
+定位过程：
+
+1. `_x` 在第 22 字节，库按字节切 `original[24..28]` = `20"\xef`
+2. 第 28 字节落在 `（`（27..30）中间 → panic
+3. 触发条件极容易凑齐：审计摘要本来就有全角括号，
+   用户名又是管理员自己填的 → **任何含 `_x` 的名字都让整个审计导出永久 500**
+
+为什么以前没发现：这是既有问题（`src/controller/user.rs` 的摘要格式早于本版），
+但只有**全量按序**跑 e2e 才会撞上——`role-assignment-guard` 先造出 `*_x20` 用户，
+后面的 `v013` 再导出才炸。单跑 v013 或按别的顺序跑都看不到。
+
+修法：`rust_xlsxwriter` 0.82 → 0.99.1。本项目只用到 `Workbook` / `Worksheet` /
+`Format` / `write_string` / `set_column_width` 这几个稳定 API，**升级零代码改动**。
+验证过导出内容逐字未变（`删除字典类型 "probe_x"（0c292627-...）` 原样出现在
+sharedStrings 里，没被转义成 `probe_x005F_x`）。
+
+顺带删掉 e2e/probe 留在 `axum_api_manual` 里的 `prb%` 夹具
+（2 个用户、6 个角色）。正是这些 `_x` 用户制造了上面那个 panic 的输入。
+清理后：1 用户（admin）/ 2 角色 / 0 字典类型。
+
+### 门禁（全绿）
+
+| 项 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | ✅ |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | ✅ 零警告 |
+| 后端单测 | ✅ 74 passed |
+| 集成（非 ignored 组） | ✅ 8 passed |
+| 集成（`--ignored` 组，真实 PG+Redis） | ✅ 116 passed |
+| 前端 lint | ✅ 0 error（1 个既有 warning 在 `env.d.ts`，与本版无关） |
+| 前端 typecheck | ✅ |
+| 前端 vitest | ✅ 137 passed / 16 文件 |
+| 前端 build | ✅ |
+| e2e 9 套件 | ✅ 全绿（`v013` 由 18/21 → 25/25） |
+| 授权探针 | ✅ 41/41 |
+
+版本号已 bump 到 0.16.0（`Cargo.toml` + `frontend/package.json` + `Cargo.lock`）；
+CHANGELOG 新增 `[0.16.0]`；README 第 62 行字典能力描述改为如实描述。
+
+注意：bump 版本号会让 `Cargo.lock` 里的 `axum-api` 版本过期，
+`cargo clippy --locked` 会直接报错。需要 `cargo update --offline -p axum-api`。
+
+### 尚未提交
+
+全部改动仍在工作区，**未提交、未推送**（按用户指令：全部完成或收到指令才统一推送）。

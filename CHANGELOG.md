@@ -2,6 +2,116 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.16.0] - 2026-10-03
+
+主题：**字典的三个开关都是摆设。**
+
+字典模块自 v0.4.0 之后没被任何版本正面处理过（856 行 Rust + 286 行 Vue），
+而 117 条集成测试里**没有一条碰字典**。逐个端点真实 HTTP 打了一遍，
+发现三处管理员"以为自己能控制、实际控制不了"的东西，外加一处让整页空白。
+
+### 缺口表
+
+| 缺口 | 实测依据 |
+|---|---|
+| `status=disabled` 完全不生效 | 禁用字典项后 `GET /api/dict/sys_yesno/items` 仍返回它；禁用**类型**后读取端仍返回 3 条。`DictSelect` 直接用该端点渲染下拉框，于是管理页写着"禁用"的选项，在所有业务页面的下拉框里照常出现 |
+| `is_default` 可以有任意多个 | 连续创建 A(is_default=true)、B(is_default=true) → 均 200 → 两个都是 `True`。没有任何约束 |
+| 「刷新缓存」刷新不了任何东西 | 塞入陈旧数据后点按钮，返回 `{"data":"缓存刷新成功"}`，再读**仍是陈旧数据**，Redis 里键也没动。审计还记着"刷新字典缓存，共 1 个类型" |
+| 字典管理页整个是空白的 | 页面用 `#left`/`#right` 命名插槽，而 naive-ui 的 `n-split` 只认编号插槽 `#1`/`#2` → 两个 pane 全空。菜单点得进去、接口全部正常，所以只看接口永远发现不了 |
+
+前三处是同一件事的三个面：模块给了管理员三个控制，每个在界面上都正常工作、
+写入也都返回 200，但**对实际行为没有任何影响**。写入成功 ≠ 生效。
+
+### 修法一：`status` 真的生效
+
+新增 `list_enabled_items()`，读取端点改走它；类型被禁用时整份字典返回空。
+
+一个容易漏的细节：**禁用类型时的空结果不能写进缓存**。否则管理员重新启用后，
+读到的还是那份"空"，要等一小时 TTL 才能看到自己刚做的修改。
+
+`list_items()`（管理页用）保持不过滤——管理页必须能看到禁用项才改得回来。
+
+### 修法二：`is_default` 靠 DB 兜底
+
+`create_item` / `update_item` 改为事务：设默认前先
+`UPDATE ... SET is_default=FALSE WHERE dict_type_id=$1 AND is_default`。
+放在同一事务里是因为分两次写的话，并发请求会各自看到"现在还没有默认项"，最后写两个。
+
+迁移 `012_dict_item_single_default.sql` 先清理既有违规（每组保留 `created_at` 最早的一个），
+再建部分唯一索引 `idx_dict_items_single_default ON dict_items(dict_type_id) WHERE is_default`。
+
+索引冲突映射成 409 而不是 500（沿用 `repository/menu.rs` 的 `map_write_violation` 套路）——
+并发下唯一索引兜底触发时，界面应当说"资源冲突"，不该说"服务器内部错误"。
+
+顺带堵上一个组合坑：**禁用项不能设默认**。否则会出现"默认项指向一个业务页面看不到的值"，
+表单里看不见却默认选中——比没有默认值更难排查。
+
+### 修法三：「刷新缓存」真的清
+
+新增 `RedisClient::delete_by_prefix()`（SCAN 游标循环 + 批量 DEL，每轮判 `cursor == 0`）。
+`refresh_cache` 改为：真删 → 只回填 `status=enabled` 的类型。
+
+返回值从 `"缓存刷新成功"` 改为
+`DictCacheRefresh { cleared_keys, reloaded_types, skipped_disabled_types }`，
+前端 `buildRefreshMessage()` 如实转述，并且**把 0 单独说出来**：
+"没有需要清理的缓存键"和"已清空 3 个缓存键"如果都报同一句"成功"，
+管理员无法区分"确实清了"与"什么都没发生"。
+
+审计也跟着记实际数量，而不是"刷新字典缓存"。
+
+### 修法四：字典管理页不再空白
+
+`#left`/`#right` → `#1`/`#2`，并在代码里写明为什么
+（写错时 naive-ui 不报错，只是静默渲染成空）。
+
+### 附带修掉：导出 Excel 会 500（跑全量 e2e 才暴露）
+
+`v013` 套件在跑全量时红了：`GET /api/admin/logs/audit/export` 返回 500。
+后端日志是一段 panic：
+
+```
+thread 'tokio-rt-worker' panicked at rust_xlsxwriter-0.82.0/src/xmlwriter.rs:291:
+byte index 28 is not a char boundary; it is inside '（' (bytes 27..30)
+of `新建用户 "prbo6hpb_x20"（67d7a0e0-...），角色：prbo6hpb_strong`
+```
+
+触发条件很容易凑齐：审计摘要里只要有 `_x`，且它后面 4 个字节内有中文，
+库里的 `escape_xml_escapes` 就会按字节切片 `original[index+2..index+6]` 而 panic。
+而审计摘要本来就有全角括号（`新建用户 "..."（uuid），角色：...`），
+用户名又是管理员自己填的——**任何一个含 `_x` 的名字都会让整个审计导出永久 500**。
+
+这是既有问题（`src/controller/user.rs` 的摘要格式早于本版），
+但只有**全量按序**跑 e2e 才会撞上：`role-assignment-guard` 先造出 `*_x20` 的用户，
+后面的 `v013` 再导出就炸。所以此前"门禁全绿"里没有它。
+
+修法：`rust_xlsxwriter` 0.82 → 0.99.1。库自己的转义逻辑会在非字符边界切片，
+升级后这条路径已修正。已验证导出内容**逐字未变**
+（`删除字典类型 "probe_x"（0c292627-...）` 原样出现在 sharedStrings 里，
+没有被转义成 `probe_x005F_x`）。本项目只用到 `Workbook` / `Worksheet` /
+`Format` / `write_string` 这几个稳定 API，升级零改动。
+
+### 缺陷注入
+
+四处修复逐个反向破坏，确认对应用例会红：
+
+| 注入 | 结果 |
+|---|---|
+| 读取端不过滤 disabled **项** | ✅ 被抓 |
+| 读取端不过滤 disabled **类型** | ✅ 被抓 |
+| `create_item` 不取消旧默认项 | ⚠️ **第一轮没被抓**——原有那条用例只走 PUT（update 路径），POST（create 路径）零覆盖。补了 `creating_a_default_item_clears_the_previous_one` 后被抓（且暴露 500→409 映射缺失） |
+| `refresh_cache` 退回 `for dt { get_dict_by_code() }` | ✅ 两条 refresh 用例同时变红 |
+| `buildRefreshMessage` 退回无条件"成功" | ✅ 前端单测变红 |
+| `#1`/`#2` 退回 `#left`/`#right` | ✅ 新增的 3 条空白页守卫变红，其余 21 条仍通过（证明守卫是针对性的） |
+
+### 验证
+
+集成测试 6 条字典用例 + 前端单测 4 条 + e2e 套件 24 条断言。
+e2e 覆盖到**真实下拉框**里禁用项消失，而不是只验接口返回值。
+
+全门禁：后端单测 74 + 集成 124（8 非 ignored + 116 ignored）、
+前端 137（16 个文件）、e2e 9 套件全绿（`v013` 由 18/21 变 25/25）、
+授权探针 41/41。
+
 ## [0.15.0] - 2026-10-03
 
 主题：**会话失效时，界面说的是"404 页面未找到"。**

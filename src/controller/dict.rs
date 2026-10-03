@@ -9,8 +9,8 @@ use crate::middleware::permission::{
     PermDictCreate, PermDictDelete, PermDictList, PermDictRefresh, PermDictUpdate,
 };
 use crate::model::{
-    ApiResponse, CreateDictItemRequest, CreateDictTypeRequest, DictItem, DictItemResponse,
-    DictType, DictTypeWithItems,
+    ApiResponse, CreateDictItemRequest, CreateDictTypeRequest, DictCacheRefresh, DictItem,
+    DictItemResponse, DictType, DictTypeWithItems,
 };
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
@@ -271,18 +271,44 @@ pub async fn list_all_cached(
     path = "/api/admin/dict/refresh",
     tag = "数据字典",
     security(("bearer_auth" = [])),
-    responses((status = 200, description = "缓存已刷新", body = ApiResponse<String>))
+    responses((status = 200, description = "缓存已刷新（返回真实的清理数量）", body = ApiResponse<DictCacheRefresh>))
 )]
 pub async fn refresh_cache(
     State(state): State<AppState>,
     _perm: PermDictRefresh,
     audit: AuditDetail,
-) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    // 清除 Redis 中所有字典缓存（生产环境可用 SCAN）
-    let data = state.dict_repo.list_all_with_items().await?;
-    for dt in &data {
-        let _ = state.dict_repo.get_dict_by_code(&dt.code).await;
+) -> Result<Json<ApiResponse<DictCacheRefresh>>, AppError> {
+    // **先真删，再回填。**
+    //
+    // 此前的实现是 `for dt in &data { get_dict_by_code(&dt.code).await }`，
+    // 而 `get_dict_by_code` 第一件事就是读缓存、命中即返回——于是这个循环
+    // 只是把同一份陈旧数据读出来再原样写回去。注释写的"清除 Redis 中所有
+    // 字典缓存"从未发生，界面却弹"缓存刷新成功"，审计也记"刷新字典缓存"。
+    //
+    // 它坏在唯一该起作用的时候：写路径的 `invalidate_cache` 失败之后，
+    // 管理员能点的就只剩这个按钮。
+    let cleared_keys = state.dict_repo.clear_all_dict_cache().await?;
+
+    let types = state.dict_repo.list_types().await?;
+    let mut reloaded_types = 0u64;
+    let mut skipped_disabled_types = 0u64;
+    for t in &types {
+        // 禁用类型不进读取端点，回填它的缓存没有任何读者。
+        // 如实计入"跳过"而不是悄悄算进成功里。
+        if t.status != "enabled" {
+            skipped_disabled_types += 1;
+            continue;
+        }
+        state.dict_repo.get_dict_by_code(&t.code).await?;
+        reloaded_types += 1;
     }
-    audit.push(format!("刷新字典缓存，共 {} 个类型", data.len()));
-    Ok(Json(ApiResponse::success("缓存刷新成功")))
+
+    audit.push(format!(
+        "清空字典缓存 {cleared_keys} 个键，回填 {reloaded_types} 个类型（跳过 {skipped_disabled_types} 个已禁用类型）"
+    ));
+    Ok(Json(ApiResponse::success(DictCacheRefresh {
+        cleared_keys,
+        reloaded_types,
+        skipped_disabled_types,
+    })))
 }

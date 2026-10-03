@@ -7177,7 +7177,15 @@ async fn every_write_operation_leaves_an_answerable_change_summary() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "刷新字典缓存失败: {body}");
-    wait_for_audit_result("POST", "/api/admin/dict/refresh", "刷新字典缓存").await;
+    // v0.16.0 起这条摘要不再写"刷新字典缓存"这种无信息量的话，
+    // 而是报出实际清掉/回填的数量。所以这里除了能查到摘要，
+    // 还要确认摘要里**带得上数字**——只有动词没有数值的摘要，
+    // 事后照样回答不了"当时到底清了没有"。
+    let refresh_audit = wait_for_audit_result("POST", "/api/admin/dict/refresh", "字典缓存").await;
+    assert!(
+        refresh_audit.chars().any(|c| c.is_ascii_digit()),
+        "刷新缓存的审计摘要应报出实际数量，实际：{refresh_audit}"
+    );
 
     let (status, body) = send(
         &app,
@@ -7614,4 +7622,445 @@ async fn the_retention_endpoint_obeys_the_log_permission() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "清理测试角色失败: {body}");
+}
+
+// ──────────────────────────────────────────────
+// 字典：管理页上的开关是否真的生效
+// ──────────────────────────────────────────────
+//
+// v0.16.0 之前，字典模块 117 条集成测试里一条都没有——三个"控制"全部无效，
+// 没有任何测试会发现：
+//   1. status=disabled 的项照样出现在读取端点
+//   2. is_default 可以同时有任意多个
+//   3. 「刷新缓存」不删任何键，却返回"缓存刷新成功"
+//
+// 判据都落在**对外可观测的行为**上：读取端点返回什么、管理端还看不看得到、
+// 端点报告的数字是多少。不去断言内部调用顺序。
+
+/// 建一个字典类型，返回 (type_id, code)
+async fn create_dict_type(app: &Router, token: &str) -> (String, String) {
+    let code = unique("probe_dict");
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/dict/types",
+            Some(token),
+            Some(json!({ "code": code, "name": "探针字典" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建字典类型失败: {body}");
+    (
+        body["data"]["id"].as_str().unwrap().to_string(),
+        body["data"]["code"].as_str().unwrap().to_string(),
+    )
+}
+
+/// 往字典里加一项，返回 item_id
+async fn create_dict_item(app: &Router, token: &str, type_id: &str, value: &str) -> String {
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/dict/items",
+            Some(token),
+            Some(json!({
+                "dict_type_id": type_id,
+                "label": value,
+                "value": value,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建字典项失败: {body}");
+    body["data"]["id"].as_str().unwrap().to_string()
+}
+
+/// 读取端点返回的 value 列表（业务页面真正拿到的数据）
+async fn read_dict_values(app: &Router, token: &str, code: &str) -> Vec<String> {
+    let (status, body) = send(
+        app,
+        request("GET", &format!("/api/dict/{code}/items"), Some(token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "读取字典失败: {body}");
+    body["data"]
+        .as_array()
+        .expect("data 应为数组")
+        .iter()
+        .map(|i| i["value"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// 管理端点看到的 (value, is_default) 列表
+async fn list_dict_items_admin(app: &Router, token: &str, type_id: &str) -> Vec<(String, bool)> {
+    let (status, body) = send(
+        app,
+        request(
+            "GET",
+            &format!("/api/admin/dict/items?dict_type_id={type_id}"),
+            Some(token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "管理端读取字典项失败: {body}");
+    body["data"]
+        .as_array()
+        .expect("data 应为数组")
+        .iter()
+        .map(|i| {
+            (
+                i["value"].as_str().unwrap().to_string(),
+                i["is_default"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+async fn set_dict_item_status(
+    app: &Router,
+    token: &str,
+    item_id: &str,
+    label: &str,
+    value: &str,
+    status: &str,
+) -> (StatusCode, Value) {
+    send(
+        app,
+        request(
+            "PUT",
+            &format!("/api/admin/dict/items/{item_id}"),
+            Some(token),
+            Some(json!({ "label": label, "value": value, "status": status })),
+        ),
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn disabled_dict_items_are_hidden_from_the_read_endpoint() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (type_id, code) = create_dict_type(&app, &admin).await;
+    let kept = create_dict_item(&app, &admin, &type_id, "启用项").await;
+    let hidden = create_dict_item(&app, &admin, &type_id, "禁用项").await;
+
+    // 先确认两项都在——否则下面的断言会因为"本来就没数据"而空过
+    assert_eq!(
+        read_dict_values(&app, &admin, &code).await.len(),
+        2,
+        "前置条件：两项都应可读"
+    );
+
+    let (status, body) =
+        set_dict_item_status(&app, &admin, &hidden, "禁用项", "禁用项", "disabled").await;
+    assert_eq!(status, StatusCode::OK, "禁用字典项失败: {body}");
+
+    // 核心判据：禁用项不再出现在读取端点
+    let values = read_dict_values(&app, &admin, &code).await;
+    assert_eq!(
+        values,
+        vec!["启用项".to_string()],
+        "禁用项仍出现在读取端点，'禁用'开关没有生效"
+    );
+    assert!(
+        !values.contains(&"禁用项".to_string()),
+        "被禁用的项不应再被业务页面读到"
+    );
+
+    // 反向判据：管理页必须仍看得到它，否则管理员没法把它改回来
+    let admin_view = list_dict_items_admin(&app, &admin, &type_id).await;
+    assert_eq!(
+        admin_view.len(),
+        2,
+        "管理页不该把禁用项藏起来——管理员需要看到并改回启用"
+    );
+    assert!(admin_view.iter().any(|(v, _)| v == "禁用项"));
+
+    // 重新启用后立刻恢复，不该等缓存 TTL
+    let (status, body) =
+        set_dict_item_status(&app, &admin, &hidden, "禁用项", "禁用项", "enabled").await;
+    assert_eq!(status, StatusCode::OK, "重新启用失败: {body}");
+    let values = read_dict_values(&app, &admin, &code).await;
+    assert_eq!(values.len(), 2, "重新启用后读取端点应恢复两项");
+
+    let _ = kept;
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn disabled_dict_type_hides_every_item_it_owns() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (type_id, code) = create_dict_type(&app, &admin).await;
+    create_dict_item(&app, &admin, &type_id, "甲").await;
+    create_dict_item(&app, &admin, &type_id, "乙").await;
+    assert_eq!(read_dict_values(&app, &admin, &code).await.len(), 2);
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/dict/types/{type_id}"),
+            Some(&admin),
+            Some(json!({ "code": code, "name": "探针字典", "status": "disabled" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "禁用字典类型失败: {body}");
+
+    let values = read_dict_values(&app, &admin, &code).await;
+    assert!(
+        values.is_empty(),
+        "类型已禁用，读取端点仍返回 {values:?}——'禁用'对类型层不生效"
+    );
+
+    // 重新启用后必须立刻恢复：禁用类型的空结果**不得**被缓存住，
+    // 否则管理员刚点启用却要等 1 小时 TTL
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/dict/types/{type_id}"),
+            Some(&admin),
+            Some(json!({ "code": code, "name": "探针字典", "status": "enabled" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重新启用字典类型失败: {body}");
+    assert_eq!(
+        read_dict_values(&app, &admin, &code).await.len(),
+        2,
+        "重新启用后应立刻恢复，不该等缓存过期"
+    );
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn setting_a_new_default_item_clears_the_previous_one() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (type_id, _code) = create_dict_type(&app, &admin).await;
+    let first = create_dict_item(&app, &admin, &type_id, "第一项").await;
+    let second = create_dict_item(&app, &admin, &type_id, "第二项").await;
+
+    for item_id in [&first, &second] {
+        let label = if *item_id == first {
+            "第一项"
+        } else {
+            "第二项"
+        };
+        let (status, body) = send(
+            &app,
+            request(
+                "PUT",
+                &format!("/api/admin/dict/items/{item_id}"),
+                Some(&admin),
+                Some(json!({ "label": label, "value": label, "is_default": true })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "设为默认失败: {body}");
+    }
+
+    let items = list_dict_items_admin(&app, &admin, &type_id).await;
+    let defaults: Vec<&String> = items.iter().filter(|(_, d)| *d).map(|(v, _)| v).collect();
+    assert_eq!(
+        defaults.len(),
+        1,
+        "同一字典出现了 {defaults:?} 多个默认项——'默认'失去了唯一性"
+    );
+    assert_eq!(defaults[0], "第二项", "后设置的应成为唯一默认项");
+}
+
+/// **新建**路径的同一保证
+///
+/// 上一条只覆盖了 PUT（改）。注入"新建默认项时不再取消旧默认项"时全绿——
+/// 因为 POST 那条路径根本没有用例。两条路径是两份独立代码，
+/// 只测一条就等于把另一半放在"没人看过"的状态。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn creating_a_default_item_clears_the_previous_one() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (type_id, _code) = create_dict_type(&app, &admin).await;
+
+    for value in ["甲", "乙"] {
+        let (status, body) = send(
+            &app,
+            request(
+                "POST",
+                "/api/admin/dict/items",
+                Some(&admin),
+                Some(json!({
+                    "dict_type_id": type_id,
+                    "label": value,
+                    "value": value,
+                    "is_default": true,
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "新建默认项失败: {body}");
+    }
+
+    let items = list_dict_items_admin(&app, &admin, &type_id).await;
+    let defaults: Vec<&String> = items.iter().filter(|(_, d)| *d).map(|(v, _)| v).collect();
+    assert_eq!(
+        defaults.len(),
+        1,
+        "连续新建两个默认项后剩下 {defaults:?}——新建路径没有取消旧默认项"
+    );
+    assert_eq!(defaults[0], "乙", "后建的应成为唯一默认项");
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_disabled_dict_item_cannot_be_made_default() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (type_id, _code) = create_dict_type(&app, &admin).await;
+    let item = create_dict_item(&app, &admin, &type_id, "待禁用项").await;
+
+    let (status, _) =
+        set_dict_item_status(&app, &admin, &item, "待禁用项", "待禁用项", "disabled").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 显式要求把禁用项设为默认 → 必须说清楚，而不是静默改写输入
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/dict/items/{item}"),
+            Some(&admin),
+            Some(json!({
+                "label": "待禁用项",
+                "value": "待禁用项",
+                "status": "disabled",
+                "is_default": true,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "禁用项被设为默认项：读取端点会过滤掉它，'默认'将指向业务页面读不到的值"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("禁用"),
+        "错误消息应说明为什么不行，实际：{body}"
+    );
+
+    let items = list_dict_items_admin(&app, &admin, &type_id).await;
+    assert!(
+        !items.iter().any(|(_, d)| *d),
+        "被拒绝的写入不该留下默认标记：{items:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn refresh_dict_cache_really_deletes_stale_keys() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (type_id, code) = create_dict_type(&app, &admin).await;
+    create_dict_item(&app, &admin, &type_id, "真实项").await;
+
+    // 先让缓存热起来，确认读取端确实走缓存（否则"刷新"无从谈起）
+    assert_eq!(read_dict_values(&app, &admin, &code).await, vec!["真实项"]);
+
+    // 直接往 Redis 塞一份陈旧数据，模拟写路径失效失败后管理员面对的局面
+    let stale = json!([{
+        "id": "11111111-1111-1111-1111-111111111111",
+        "label": "陈旧项", "value": "STALE", "sort_order": 0,
+        "status": "enabled", "is_default": false, "color": Value::Null,
+    }])
+    .to_string();
+    let redis = RedisClient::new(&test_config(1_000).redis)
+        .await
+        .expect("连接 Redis 失败");
+    redis
+        .set_string(&format!("dict:{code}"), &stale, 3600)
+        .await
+        .expect("写入陈旧缓存失败");
+    assert_eq!(
+        read_dict_values(&app, &admin, &code).await,
+        vec!["STALE"],
+        "前置条件：陈旧缓存应生效"
+    );
+
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/admin/dict/refresh", Some(&admin), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "刷新缓存失败: {body}");
+
+    // 核心判据：刷新之后读到的是数据库里的真实数据
+    assert_eq!(
+        read_dict_values(&app, &admin, &code).await,
+        vec!["真实项"],
+        "刷新缓存后仍在读陈旧数据——这个按钮什么都没做"
+    );
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn refresh_dict_cache_reports_the_number_of_keys_it_deleted() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (type_id, code) = create_dict_type(&app, &admin).await;
+    create_dict_item(&app, &admin, &type_id, "甲").await;
+    let (_t2, code2) = create_dict_type(&app, &admin).await;
+    create_dict_item(&app, &admin, &_t2, "乙").await;
+
+    // 两份字典都读一次，把缓存热起来
+    read_dict_values(&app, &admin, &code).await;
+    read_dict_values(&app, &admin, &code2).await;
+
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/admin/dict/refresh", Some(&admin), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "刷新缓存失败: {body}");
+
+    let cleared = body["data"]["cleared_keys"]
+        .as_u64()
+        .expect("缺少 cleared_keys");
+    let reloaded = body["data"]["reloaded_types"]
+        .as_u64()
+        .expect("缺少 reloaded_types");
+    assert!(
+        cleared >= 2,
+        "报告只清掉了 {cleared} 个键，而本用例至少造了 2 份热缓存"
+    );
+    assert!(
+        reloaded >= 2,
+        "报告只回填了 {reloaded} 个类型，本用例至少建了 2 个"
+    );
+
+    // 再点一次。此刻缓存里正好只有上一次回填写进去的那些键，
+    // 所以"第二次清理数 == 第一次回填数"。这个等式比"报 0"更强：
+    // 它证明报出来的数字是**真数出来的**，不是固定值也不是上一轮的回显。
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/admin/dict/refresh", Some(&admin), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second = body["data"]["cleared_keys"]
+        .as_u64()
+        .expect("缺少 cleared_keys");
+    assert_eq!(
+        second, reloaded,
+        "第二次清理的键数应等于第一次回填的类型数（缓存里正好只有那批键）"
+    );
 }
