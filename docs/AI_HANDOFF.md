@@ -4806,3 +4806,83 @@ $ curl -s -w '%{http_code}' /api/admin/export/users -H "Authorization: Bearer $T
 
 - 测试库 `axum_api_test` 已累积 **270 角色 / 424 用户 / 80 字典类型 / 12175 审计**。
   上面的实测都已清理自己的探针数据，但历史累积没清
+
+---
+
+## v0.19.0 缺口扫描（2026-10-03，只读实测，未动代码）
+
+已推送 `1a2772de..00ed3ef2`。下面结论全部来自**真实 HTTP 调用**，不是读代码猜的。
+
+### 缺口一：`GET /api/admin/export/users` 自 v0.11.0 起每个调用都 500
+
+（承接上一节，此处只补一句实测确认）
+
+```
+内部错误: 查询用户失败: no column found for name: must_change_password
+```
+
+根因是 `src/controller/demo.rs:51` 的裸 SQL 显式列名，没跟上 v0.11.0 的字段新增。
+零测试覆盖，承重守卫 `every_documented_write_operation_is_covered_by_the_audit_test`
+只管**写**端点，而它是 GET——所以烂七版没人知道。
+
+### 缺口二（新发现）：用户名/邮箱不做大小写归一，而角色名做
+
+**同一次运行里的决定性对比：**
+
+```
+POST /api/auth/register  {"username":"CaseProbe",...}  → 200，username="CaseProbe"
+POST /api/auth/register  {"username":"caseprobe",...}  → 200，username="caseprobe"   ★ 两个独立账号
+
+POST /api/admin/roles    {"name":"CaseRole",...}       → 200，name="caserole"（已被归一）
+POST /api/admin/roles    {"name":"caserole",...}       → 409 角色名「caserole」已被占用
+```
+
+- 角色侧有 `normalize_role_name()`（`src/model/role.rs:41`）：trim + `to_lowercase`
+  + 长度 + 控制字符，写入前统一。
+- 用户侧**没有任何归一**：`find_by_username` / `find_by_email` 都是裸 `WHERE username = $1`，
+  写入也直接 bind 原值。`users_username_key UNIQUE (username)` 在 Postgres 里
+  **大小写敏感**，所以 `Admin` 与 `admin` 合法共存。
+- 邮箱同理：`CaseTest@Example.com` 与 `casetest@example.com` 同时创建成功，
+  且**分别登录到两个不同的 id**。
+
+**实质影响（实测）**：自助注册路径可以造出
+
+```
+注册 Admin  → 200      注册 ADMIN → 200      注册 aDmIn → 200
+库里：ADMIN / Admin / aDmIn / admin  四个账号并存
+```
+
+用户管理页里这四个**肉眼无法区分**。管理员在列表上看到 `Admin`，
+无法判断它是不是真 admin；钓鱼、社工、"给 admin 绑个角色"这类操作都可能被引到伪造账号上。
+这不是理论风险，是一次注册请求的事。
+
+### 已实测确认**不是**缺口的部分（避免下版重复排查）
+
+- **分页校验扎实**：`page_size` 超 200 → 400「每页条数必须在 1-200 之间」；
+  `page=0/-1` → 400「页码必须大于 0」；`page=99999` 返回空 items 且 total 正确
+- **SQL 注入不成立**：`sort_by=id; DROP TABLE users;--` 不报错，
+  因为 `PaginationParams::get_order_sql()` 有 `allowed_fields` 白名单，
+  非法字段回落 `created_at`，方向也只认 `asc/ASC`
+- **级联删除到位**：删字典类型会清掉其下 dict_items；删角色会清空 role_menus
+- **空白用户名被挡**：`"  spaced  "` → 400「用户名只能包含字母、数字、下划线和连字符」
+  （这是 v0.18.0 共享字符集规则的成果）
+- **并发写**：两个 PUT 同改一个角色都返回 200，后写覆盖。无乐观锁，
+  但"后写胜出"是常见可接受设计，本版不动
+
+### 环境注意
+
+轮次之间后端与 vite 进程会被重置。重启后端必须带
+`RATE_LIMIT_IP_MAX=100000` / `RATE_LIMIT_USER_MAX=100000`（见 `e2e/README.md`），
+否则整轮 e2e 会因限流假红。
+
+### 建议的 v0.19.0 范围
+
+1. 修 `export/users` 的 SELECT（并考虑 `SELECT *` 或共享列常量，避免下次加字段再烂）
+2. 给用户名/邮箱加归一（trim + 小写），照抄 `normalize_role_name` 的形状；
+   同时把唯一性检查改成归一后比较。**须处理存量脏数据**：
+   库里可能已有仅大小写不同的账号，迁移要能报出冲突而不是静默合并
+3. 把承重守卫从「写端点」扩到「全部端点」，先让它抓住当前的 `export/users`
+4. 清理 `operator_with_codes` 的 20 处泄漏（测试库已累积 270 角色/424 用户）
+
+**注意顺序**：第 2 项涉及迁移与存量数据，风险最高；1 与 3 是低风险独立项。
+若要拆，建议先做 1+3 拿一个干净版本，2 单独一版。
