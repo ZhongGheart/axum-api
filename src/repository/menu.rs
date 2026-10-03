@@ -243,6 +243,35 @@ impl MenuRepository {
         Ok(codes)
     }
 
+    /// 查询**单个角色**当前持有的全部权限码
+    ///
+    /// v0.13.0 审计用：`assign_role_menus` 是全量替换语义，
+    /// 要记下"这次授了/撤了哪些码"，只能在替换前后各取一次快照求差。
+    /// 只记提交上来的菜单 ID 答不出"撤了哪些"——
+    /// 而撤销恰恰是事后追溯最想知道的那一半。
+    ///
+    /// 过滤条件与 [`Self::find_permission_codes`] 一致
+    /// （`type = 'button'` 且 `permission` 非空）：目录/页面菜单不带码，
+    /// 计入变更只会制造没有权限含义的噪声。
+    pub async fn permission_codes_of_role(&self, role_id: Uuid) -> Result<Vec<String>, AppError> {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT DISTINCT m.permission
+            FROM menus m
+            JOIN role_menus rm ON rm.menu_id = m.id
+            WHERE rm.role_id = $1
+              AND m.type = 'button'
+              AND m.permission IS NOT NULL
+              AND m.permission <> ''
+            ORDER BY m.permission ASC
+            "#,
+        )
+        .bind(role_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询角色权限码失败: {e}")))
+    }
+
     /// 更新菜单
     ///
     /// `actor_id` 只用于权限码留痕：把某个码从按钮上清空时，

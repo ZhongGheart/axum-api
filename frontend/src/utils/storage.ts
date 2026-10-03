@@ -8,7 +8,14 @@
 /** 存储前缀，防止多应用 key 冲突 */
 const STORAGE_PREFIX = 'axum_'
 
-/** 简单的 XOR + Base64 编码（前端层防明文泄露，非安全加密） */
+/**
+ * 简单的 Base64 编码（前端层防明文泄露，**非安全加密**）
+ *
+ * 此前这条注释写着「XOR + Base64」，但实现里从来没有 XOR——
+ * 只剩 `btoa(encodeURIComponent(value))`。注释里多一个不存在的算法，
+ * 会让人以为拿到编码值还需要一把不存在的密钥才能解开。
+ * 真正的保护只能来自服务端：localStorage 里的东西任何脚本都能读。
+ */
 function encode(value: string): string {
   return btoa(encodeURIComponent(value))
 }

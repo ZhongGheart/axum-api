@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::middleware::audit_log::AuditDetail;
 use crate::middleware::permission::{
     codes_of_roles, ensure_can_grant_roles, PermRoleCreate, PermRoleDelete, PermRoleList,
     PermRoleUpdate, PermUserList, PermUserUpdate,
@@ -17,6 +18,7 @@ use crate::middleware::permission::{
 use crate::model::{normalize_role_name, ApiResponse, BUILTIN_ROLES};
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
+use crate::utils::audit;
 use crate::utils::pagination::PaginatedResponse;
 
 /// `roles.name` 的唯一约束名（`name VARCHAR(50) NOT NULL UNIQUE`）
@@ -144,6 +146,7 @@ pub async fn get_user_roles(
 pub async fn assign_user_role(
     State(state): State<AppState>,
     perm: PermUserUpdate,
+    audit: AuditDetail,
     ApiPath(user_id): ApiPath<Uuid>,
     ApiJson(req): ApiJson<AssignRoleRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
@@ -154,7 +157,7 @@ pub async fn assign_user_role(
     // 外键违例冒成 500「服务器内部错误」——与 v0.8.0 修的
     // 「声明已占用的权限码冒成 500」同源：入参错误被当成服务端故障，
     // 既污染错误监控，调用方也看不懂到底是路径错了还是系统坏了。
-    state.auth_service.user_repo.find_by_id(user_id).await?;
+    let target_user = state.auth_service.user_repo.find_by_id(user_id).await?;
     let current_roles = state
         .auth_service
         .role_repo
@@ -194,6 +197,11 @@ pub async fn assign_user_role(
             .auth_service
             .revoke_all_sessions(&state.redis_client, user_id)
             .await?;
+        // 已持有时不写：重复追加什么都没发生，记成"已授予"是假阳性
+        audit.push(format!(
+            "为用户 \"{}\" 追加角色 \"{role_name}\"（{user_id}）",
+            target_user.username
+        ));
     }
     Ok(Json(ApiResponse::success("角色分配成功")))
 }
@@ -214,6 +222,7 @@ pub async fn assign_user_role(
 pub async fn create_role(
     State(state): State<AppState>,
     _perm: PermRoleCreate,
+    audit: AuditDetail,
     ApiJson(req): ApiJson<CreateRoleReq>,
 ) -> Result<Json<ApiResponse<RoleItem>>, AppError> {
     let name = normalize_role_name(&req.name)?;
@@ -233,6 +242,7 @@ pub async fn create_role(
             }
             AppError::InternalServerError(format!("创建角色失败: {e}"))
         })?;
+    audit.push(format!("新建角色 \"{name}\"（{id}）"));
     Ok(Json(ApiResponse::success(RoleItem {
         id,
         name,
@@ -260,6 +270,7 @@ pub async fn create_role(
 pub async fn update_role(
     State(state): State<AppState>,
     _perm: PermRoleUpdate,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(req): ApiJson<CreateRoleReq>,
 ) -> Result<Json<ApiResponse<RoleItem>>, AppError> {
@@ -339,6 +350,17 @@ pub async fn update_role(
         .await
         .map_err(|e| AppError::InternalServerError(format!("事务提交失败: {e}")))?;
 
+    // 改名要**两个名字都记**：事后只看到新名字，仍然答不出
+    // "这个角色原来叫什么"——而角色名是 user_roles 之外唯一的人类可读标识
+    if row.1 != current_name {
+        audit.push(format!(
+            "角色 \"{current_name}\" 改名为 \"{}\"（{id}）",
+            row.1
+        ));
+    } else {
+        audit.push(format!("更新角色 \"{}\"（{id}）", row.1));
+    }
+
     Ok(Json(ApiResponse::success(RoleItem {
         id: row.0,
         name: row.1,
@@ -360,6 +382,7 @@ pub async fn update_role(
 pub async fn delete_role(
     State(state): State<AppState>,
     perm: PermRoleDelete,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     let mut tx = state
@@ -431,6 +454,12 @@ pub async fn delete_role(
     tx.commit()
         .await
         .map_err(|e| AppError::InternalServerError(format!("事务提交失败: {e}")))?;
+    // 名字只在 `roles` 行里，删掉就永久没有了（`role_menus` 已被外键级联清掉）
+    let revoked = audit::codes("随之撤销的权限码", &granted_codes);
+    audit.push(match revoked.is_empty() {
+        true => format!("删除角色 \"{name}\"（{id}）"),
+        false => format!("删除角色 \"{name}\"（{id}）；{revoked}"),
+    });
     Ok(Json(ApiResponse::success("角色删除成功")))
 }
 

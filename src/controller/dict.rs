@@ -4,6 +4,7 @@ use axum::{extract::State, Json};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::middleware::audit_log::AuditDetail;
 use crate::middleware::permission::{
     PermDictCreate, PermDictDelete, PermDictList, PermDictRefresh, PermDictUpdate,
 };
@@ -13,6 +14,7 @@ use crate::model::{
 };
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
+use crate::utils::audit;
 
 /// GET /api/admin/dict/types — 字典类型列表
 #[utoipa::path(
@@ -42,6 +44,7 @@ pub async fn list_types(
 pub async fn create_type(
     State(state): State<AppState>,
     _perm: PermDictCreate,
+    audit: AuditDetail,
     ApiJson(req): ApiJson<CreateDictTypeRequest>,
 ) -> Result<Json<ApiResponse<DictType>>, AppError> {
     let t = DictType {
@@ -55,6 +58,7 @@ pub async fn create_type(
         updated_at: chrono::Utc::now(),
     };
     let saved = state.dict_repo.create_type(&t).await?;
+    audit.push(format!("新建字典类型 \"{}\"（{}）", saved.code, saved.id));
     Ok(Json(ApiResponse::success(saved)))
 }
 
@@ -71,10 +75,22 @@ pub async fn create_type(
 pub async fn update_type(
     State(state): State<AppState>,
     _perm: PermDictUpdate,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(req): ApiJson<CreateDictTypeRequest>,
 ) -> Result<Json<ApiResponse<DictType>>, AppError> {
+    let before = state.dict_repo.find_type_by_id(id).await?;
     let saved = state.dict_repo.update_type(id, &req).await?;
+    // `code` 是字典的业务主键：改掉之后前端按 code 取缓存就取到另一份数据，
+    // 因此前后两个 code 都要留在审计里
+    if before.code != saved.code {
+        audit.push(format!(
+            "字典类型 \"{}\"（{id}）的 code 改为 \"{}\"",
+            before.code, saved.code
+        ));
+    } else {
+        audit.push(format!("更新字典类型 \"{}\"（{id}）", saved.code));
+    }
     Ok(Json(ApiResponse::success(saved)))
 }
 
@@ -90,9 +106,13 @@ pub async fn update_type(
 pub async fn delete_type(
     State(state): State<AppState>,
     _perm: PermDictDelete,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    // 删除会级联清掉该类型下的全部字典项，名字要在删之前取
+    let label = audit::dict_type_label(&state, id).await;
     state.dict_repo.delete_type(id).await?;
+    audit.push(format!("删除{label}（{id}），其下字典项一并删除"));
     Ok(Json(ApiResponse::success("删除成功")))
 }
 
@@ -153,6 +173,7 @@ pub struct DictItemQuery {
 pub async fn create_item(
     State(state): State<AppState>,
     _perm: PermDictCreate,
+    audit: AuditDetail,
     ApiJson(req): ApiJson<CreateDictItemRequest>,
 ) -> Result<Json<ApiResponse<DictItem>>, AppError> {
     let type_id = req
@@ -171,6 +192,10 @@ pub async fn create_item(
         updated_at: chrono::Utc::now(),
     };
     let saved = state.dict_repo.create_item(&item).await?;
+    audit.push(format!(
+        "新建字典项 \"{}={}\"（{}），属于字典类型 {}",
+        saved.label, saved.value, saved.id, saved.dict_type_id
+    ));
     Ok(Json(ApiResponse::success(saved)))
 }
 
@@ -187,10 +212,16 @@ pub async fn create_item(
 pub async fn update_item(
     State(state): State<AppState>,
     _perm: PermDictUpdate,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(req): ApiJson<CreateDictItemRequest>,
 ) -> Result<Json<ApiResponse<DictItem>>, AppError> {
+    let before = state.dict_repo.find_item_by_id(id).await?;
     let saved = state.dict_repo.update_item(id, &req).await?;
+    audit.push(format!(
+        "字典项（{id}）由 \"{}={}\" 改为 \"{}={}\"",
+        before.label, before.value, saved.label, saved.value
+    ));
     Ok(Json(ApiResponse::success(saved)))
 }
 
@@ -209,9 +240,12 @@ pub async fn update_item(
 pub async fn delete_item(
     State(state): State<AppState>,
     _perm: PermDictDelete,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
+    let label = audit::dict_item_label(&state, id).await;
     state.dict_repo.delete_item(id).await?;
+    audit.push(format!("删除{label}（{id}）"));
     Ok(Json(ApiResponse::success("删除成功")))
 }
 
@@ -242,11 +276,13 @@ pub async fn list_all_cached(
 pub async fn refresh_cache(
     State(state): State<AppState>,
     _perm: PermDictRefresh,
+    audit: AuditDetail,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     // 清除 Redis 中所有字典缓存（生产环境可用 SCAN）
     let data = state.dict_repo.list_all_with_items().await?;
     for dt in &data {
         let _ = state.dict_repo.get_dict_by_code(&dt.code).await;
     }
+    audit.push(format!("刷新字典缓存，共 {} 个类型", data.len()));
     Ok(Json(ApiResponse::success("缓存刷新成功")))
 }

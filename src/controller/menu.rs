@@ -8,6 +8,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::middleware::audit_log::AuditDetail;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::permission::{
     PermMenuCreate, PermMenuDelete, PermMenuGrant, PermMenuList, PermMenuUpdate,
@@ -17,6 +18,7 @@ use crate::model::{
 };
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
+use crate::utils::audit;
 use crate::utils::validation;
 
 /// GET /api/admin/menus — 获取菜单树
@@ -121,6 +123,7 @@ pub async fn my_permissions(
 pub async fn create_menu(
     State(state): State<AppState>,
     _perm: PermMenuCreate,
+    audit: AuditDetail,
     ApiJson(req): ApiJson<CreateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
     // 权限码必须唯一：迁移 `007` 的部分唯一索引 `idx_menus_permission_unique`
@@ -153,6 +156,15 @@ pub async fn create_menu(
         prev_permission_cleared_by: None,
     };
     let saved = state.menu_repo.create(&menu).await?;
+    audit.push(
+        match saved.permission.as_deref().filter(|p| !p.is_empty()) {
+            Some(code) => format!(
+                "新建菜单 \"{}\"（{}），声明权限码 \"{code}\"",
+                saved.name, saved.id
+            ),
+            None => format!("新建菜单 \"{}\"（{}），不携带权限码", saved.name, saved.id),
+        },
+    );
     Ok(Json(ApiResponse::success(MenuNode::from(saved))))
 }
 
@@ -170,6 +182,7 @@ pub async fn update_menu(
     State(state): State<AppState>,
     perm: PermMenuUpdate,
     auth_user: AuthenticatedUser,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(req): ApiJson<UpdateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
@@ -207,7 +220,27 @@ pub async fn update_menu(
         }
     }
 
+    // 改权限码之前先记住旧值：`menus.permission` 改写后旧码就查不到了，
+    // 而"这个码从谁手里转移到了谁手里"正是授权追溯要回答的问题
+    let before = state.menu_repo.find_by_id(id).await?;
+    let before_code = before
+        .permission
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+
     let saved = state.menu_repo.update(id, &req, auth_user.user_id).await?;
+    let after_code = saved
+        .permission
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    audit.push(audit::permission_change(
+        &audit::label("菜单", &saved.name),
+        saved.id,
+        before_code.as_deref(),
+        after_code.as_deref(),
+    ));
     Ok(Json(ApiResponse::success(MenuNode::from(saved))))
 }
 
@@ -241,6 +274,7 @@ pub async fn restore_menu_permission(
     State(state): State<AppState>,
     _perm: PermMenuUpdate,
     auth_user: AuthenticatedUser,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
     let menu = state.menu_repo.find_by_id(id).await?;
@@ -256,6 +290,10 @@ pub async fn restore_menu_permission(
         )));
     }
     let restored = state.menu_repo.restore_permission(id).await?;
+    audit.push(format!(
+        "恢复菜单 \"{}\"（{}）的权限码 \"{restorable}\"",
+        restored.name, restored.id
+    ));
     tracing::info!("管理员恢复菜单权限码: {} (码: {restorable})", restored.name);
     Ok(Json(ApiResponse::success(MenuNode::from(restored))))
 }
@@ -272,6 +310,7 @@ pub async fn restore_menu_permission(
 pub async fn delete_menu(
     State(state): State<AppState>,
     perm: PermMenuDelete,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     // 授权下界（v0.8.0 第 1 项）：删除是级联的，删掉一个**承载权限码的菜单**
@@ -292,7 +331,20 @@ pub async fn delete_menu(
         )?;
     }
 
+    // 名字要在 delete 之前取：删除是级联的（子树 + 全部 role_menus），
+    // 之后 `menus` 行已不存在，"删的是哪个菜单"就再也答不出来了
+    let name = state
+        .menu_repo
+        .find_by_id(id)
+        .await
+        .map(|m| m.name)
+        .unwrap_or_else(|_| format!("<{id}>"));
     state.menu_repo.delete(id).await?;
+    let revoked = audit::codes("随之从角色收回的权限码", &granted_codes);
+    audit.push(match revoked.is_empty() {
+        true => format!("删除菜单 \"{name}\"（{id}）"),
+        false => format!("删除菜单 \"{name}\"（{id}）；{revoked}"),
+    });
     Ok(Json(ApiResponse::success("删除成功")))
 }
 
@@ -310,6 +362,7 @@ pub async fn assign_role_menus(
     State(state): State<AppState>,
     perm: PermMenuGrant,
     auth_user: AuthenticatedUser,
+    audit: AuditDetail,
     ApiPath(role_id): ApiPath<Uuid>,
     ApiJson(req): ApiJson<AssignMenuRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
@@ -342,9 +395,27 @@ pub async fn assign_role_menus(
         }
     }
 
+    // 变更前的权限码快照。本接口是**全量替换**语义，
+    // 所以"这次变了什么"只能靠前后两个集合求差得到——
+    // 只记提交上来的 `menu_ids`，事后仍答不出"撤了哪些"。
+    // 这里查的是**权限码**而不是菜单 ID：目录/页面菜单不带码，
+    // 把它们算进变更会制造一堆没有权限含义的噪声。
+    let before_codes = state.menu_repo.permission_codes_of_role(role_id).await?;
+
     state
         .menu_repo
         .assign_role_menus(role_id, &req.menu_ids)
         .await?;
+
+    let after_codes = state.menu_repo.permission_codes_of_role(role_id).await?;
+    let role_name = target_role_name
+        .clone()
+        .unwrap_or_else(|| format!("<{role_id}>"));
+    let diff = audit::diff_summary(&before_codes, &after_codes, "授予权限码", "撤销权限码");
+    audit.push(match diff.is_empty() {
+        // 重复提交同一份集合：什么都没变，如实记成"无变化"而不是伪造一次授权
+        true => format!("角色 \"{role_name}\"（{role_id}）的权限码无变化"),
+        false => format!("角色 \"{role_name}\"（{role_id}）权限码变更：{diff}"),
+    });
     Ok(Json(ApiResponse::success("权限分配成功")))
 }

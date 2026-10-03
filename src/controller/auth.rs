@@ -6,6 +6,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Serialize;
 
 use crate::error::AppError;
+use crate::middleware::audit_log::AuditDetail;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::client_ip::ClientIp;
 use crate::model::{
@@ -96,6 +97,7 @@ pub async fn me(
 pub async fn logout(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
+    audit: AuditDetail,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     state
         .auth_service
@@ -105,6 +107,10 @@ pub async fn logout(
             auth_user.token_exp,
         )
         .await?;
+    audit.push(format!(
+        "登出：注销当前令牌（仅本次会话，其余并发会话不受影响），账号 \"{}\"",
+        auth_user.username
+    ));
     Ok(Json(ApiResponse::success("登出成功")))
 }
 
@@ -123,6 +129,7 @@ pub async fn logout(
 pub async fn change_password(
     State(state): State<AppState>,
     auth_user: AuthenticatedUser,
+    audit: AuditDetail,
     ApiJson(req): ApiJson<ChangePasswordRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     state
@@ -134,6 +141,12 @@ pub async fn change_password(
             &req.new_password,
         )
         .await?;
+    // 记"改了什么"而不记新旧口令：旧口令本身是当前的凭据，
+    // 新口令是改完后的凭据，两者写进长期表都是把当前有效的秘密再复制一份
+    audit.push(format!(
+        "自助修改口令并吊销该账号全部会话，账号 \"{}\"",
+        auth_user.username
+    ));
     Ok(Json(ApiResponse::success("密码修改成功，请重新登录")))
 }
 

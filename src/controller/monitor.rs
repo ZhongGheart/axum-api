@@ -110,8 +110,12 @@ pub async fn alerts(
 pub async fn reset_metrics(
     State(state): State<AppState>,
     _perm: PermMonitorReset,
+    audit: crate::middleware::audit_log::AuditDetail,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     state.metrics_collector.reset().await;
+    // 指标清零会抹掉"此前谁在高频调用"的证据，
+    // 因此这条本身必须是可审计的，否则清零就是一次无痕擦除
+    audit.push("重置全部接口指标（耗时与调用计数清零）");
     Ok(Json(ApiResponse::success("指标已重置")))
 }
 

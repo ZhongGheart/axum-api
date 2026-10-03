@@ -77,6 +77,33 @@ await s.shot('v010-log-empty')
 // ── 角色管理：分页 ──────────────────────────────────────
 
 s.log('\n[4] 角色管理页')
+
+// 前置数据由套件**自己**造，不能指望库里的角色够多。
+//
+// 角色列表默认每页 10 条，而干净库只有 admin / user 两个角色，
+// 压根不存在第二页——翻页断言会因为"没有第 2 页"而失败。
+// 这个套件过去能过，只是因为跑它之前刚跑过集成测试，库被污染出了足够多的角色。
+// 那是**偶然**，不是前提：换个干净库就红，而红的原因与被测的界面毫无关系。
+// 计数从库里读，按当前总数补足，重复跑也不会越堆越多。
+const PAGE_SIZE = 10
+const count0 = await s.api('GET', '/api/admin/roles?page_size=1')
+const have = count0.body?.data?.total ?? 0
+const need = Math.max(0, PAGE_SIZE + 1 - have) // 至少让第二页存在
+const fillerIds = []
+for (let i = 0; i < need; i++) {
+  const r = await s.api('POST', '/api/admin/roles', {
+    name: `${uniq}_fill${String(i).padStart(2, '0')}`,
+    description: 'v0.10.0 分页断言的前置数据',
+  })
+  if (r.status !== 200) {
+    s.check('造分页前置角色', false, `status=${r.status} body=${JSON.stringify(r.body)}`)
+    break
+  }
+  fillerIds.push(r.body?.data?.id)
+}
+s.check('分页前置角色已就绪', fillerIds.length === need,
+  `原有 ${have} 个，补造 ${fillerIds.length}/${need} 个`)
+
 await s.goto('/system/role', 1200)
 const pager = await s.evalJs(
   'const p = document.querySelector(".n-pagination");' +
@@ -86,6 +113,7 @@ const pager = await s.evalJs(
 )
 s.check('分页控件在', pager.hasPager, JSON.stringify(pager))
 s.check('默认每页 10 条，行数不超过', pager.rows > 0 && pager.rows <= 10, 'rows=' + pager.rows)
+s.check('第一页填满（总数确实超过一页）', pager.rows === PAGE_SIZE, 'rows=' + pager.rows)
 await s.shot('v010-role-pager')
 
 // 翻到第二页，行内容应当变化（而不是被钉在第一页）
@@ -106,13 +134,28 @@ s.check('翻到第二页后内容变化', firstCell !== secondCell, `${firstCell
 await s.shot('v010-role-page2')
 
 s.log('\n[5] 无残留')
-// 角色列表自 v0.10.0 起分页，临时角色按 created_at ASC 排在末尾，
-// 只读第一页查不到它——那种"查不到"会被误读成已清理。
+// 分页前置角色按 created_at ASC 排在末尾，只读第一页查不到它们——
+// 那种"查不到"会被误读成已清理。所以用 page_size=200 全量核对。
+// 清理必须真的发生，不能只靠上面那条"查不到就算干净"——
+// 那样一个"拒绝删除"的实现也能全绿。
+let removed = 0
+let removeFailed = []
+for (const id of fillerIds) {
+  const r = await s.api('DELETE', '/api/admin/roles/' + id)
+  if (r.status === 200) removed++
+  else removeFailed.push(id + '=' + r.status)
+}
+s.check('分页前置角色已逐个删除', removed === fillerIds.length,
+  `删除 ${removed}/${fillerIds.length}` + (removeFailed.length ? ' 失败: ' + removeFailed.join(',') : ''))
+
+// 核对放在删除**之后**：先查再删的话，删除动作本身从没被检验过，
+// 一个"建了不删"的实现同样能全绿。
 const leftover = await s.evalJs(
   'const r = await fetch("/api/admin/roles?page_size=200",' +
   ' { headers: { Authorization: "Bearer " + JSON.parse(decodeURIComponent(atob(localStorage.getItem("axum_token")))).value } });' +
   ' const j = await r.json();' +
-  ' return (j.data?.items || []).filter(x => x.name === ' + JSON.stringify(uniq + '_role') + ').length;',
+  ' return (j.data?.items || []).filter(x => x.name === ' + JSON.stringify(uniq + '_role') +
+  ' || x.name.startsWith(' + JSON.stringify(uniq + '_fill') + ')).length;',
 )
 s.check('临时角色没有残留', leftover === 0, '残留 ' + leftover + ' 个')
 

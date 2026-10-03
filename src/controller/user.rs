@@ -16,6 +16,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::middleware::audit_log::AuditDetail;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::permission::{
     ensure_can_grant_roles, PermUserCreate, PermUserDelete, PermUserList, PermUserUpdate,
@@ -23,6 +24,7 @@ use crate::middleware::permission::{
 use crate::model::{normalize_role_name, ApiResponse, UserInfo, ADMIN_ROLE};
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
+use crate::utils::audit;
 use crate::utils::validation;
 
 /// 用户列表查询参数
@@ -246,6 +248,7 @@ pub async fn list_users(
 pub async fn create_user(
     State(state): State<AppState>,
     perm: PermUserCreate,
+    audit: AuditDetail,
     ApiJson(req): ApiJson<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     use crate::utils::password::hash_password;
@@ -312,6 +315,13 @@ pub async fn create_user(
         .replace_user_roles(user.id, &roles)
         .await?;
 
+    // 只记用户名与角色，**绝不记口令**——哪怕是管理员代设的那一份
+    audit.push(format!(
+        "新建用户 \"{}\"（{}），角色：{}",
+        user.username,
+        user.id,
+        audit::roles_list(&roles)
+    ));
     tracing::info!(
         "管理员创建用户: {} (角色: {})",
         user.username,
@@ -336,6 +346,7 @@ pub async fn create_user(
 pub async fn update_user(
     State(state): State<AppState>,
     perm: PermUserUpdate,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(req): ApiJson<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
@@ -365,12 +376,15 @@ pub async fn update_user(
     // 先做守卫，避免"基础字段已更新但角色变更被拒绝"的半成品状态
     ensure_not_last_admin(&state, &current_roles, &new_roles).await?;
 
+    let before_active = state.auth_service.user_repo.find_by_id(id).await?.is_active;
+
     let updated = state
         .auth_service
         .user_repo
         .update(id, &req.username, &req.email, req.is_active.unwrap_or(true))
         .await?;
 
+    let mut facts: Vec<String> = Vec::new();
     if !same_role_set(&current_roles, &new_roles) {
         state
             .auth_service
@@ -382,6 +396,25 @@ pub async fn update_user(
             .auth_service
             .revoke_all_sessions(&state.redis_client, id)
             .await?;
+        let diff = audit::diff_summary(&current_roles, &new_roles, "追加角色", "移除角色");
+        facts.push(format!("角色变更（{diff}）"));
+    }
+    if updated.is_active != before_active {
+        let to = if updated.is_active {
+            "启用"
+        } else {
+            "停用"
+        };
+        facts.push(format!("状态改为{to}"));
+    }
+    if !facts.is_empty() {
+        audit.push(format!(
+            "更新用户 \"{}\"（{id}）：{}",
+            updated.username,
+            facts.join("；")
+        ));
+    } else {
+        audit.push(format!("更新用户 \"{}\"（{id}）", updated.username));
     }
 
     tracing::info!(
@@ -410,6 +443,7 @@ pub async fn delete_user(
     State(state): State<AppState>,
     perm: PermUserDelete,
     auth_user: AuthenticatedUser,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     if id == auth_user.user_id {
@@ -435,6 +469,13 @@ pub async fn delete_user(
         .revoke_all_sessions(&state.redis_client, id)
         .await?;
 
+    // 用户名与角色一起记：行删掉后 `user_roles` 也被级联清空，
+    // 只留 UUID 的话，"删掉的是哪个账号、它原本是什么权限"都答不出来
+    audit.push(format!(
+        "删除用户 \"{}\"（{id}），原角色：{}",
+        user.username,
+        audit::roles_list(&roles)
+    ));
     tracing::info!("管理员删除用户: {} ({})", user.username, id);
     Ok(Json(ApiResponse::success("删除成功")))
 }
@@ -455,6 +496,7 @@ pub async fn batch_delete_users(
     State(state): State<AppState>,
     perm: PermUserDelete,
     auth_user: AuthenticatedUser,
+    audit: AuditDetail,
     ApiJson(req): ApiJson<BatchDeleteRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     if req.ids.is_empty() {
@@ -466,8 +508,9 @@ pub async fn batch_delete_users(
 
     // 先整体校验：逐个删除时无法发现"这一批会删掉全部管理员"
     let mut admins_in_batch = 0i64;
+    let mut targets: Vec<(uuid::Uuid, String)> = Vec::with_capacity(req.ids.len());
     for id in &req.ids {
-        state.auth_service.user_repo.find_by_id(*id).await?;
+        let user = state.auth_service.user_repo.find_by_id(*id).await?;
         let roles = state
             .auth_service
             .role_repo
@@ -478,6 +521,7 @@ pub async fn batch_delete_users(
         if roles.iter().any(|r| r == ADMIN_ROLE) {
             admins_in_batch += 1;
         }
+        targets.push((*id, user.username));
     }
 
     if admins_in_batch > 0 {
@@ -502,6 +546,14 @@ pub async fn batch_delete_users(
     }
 
     tracing::info!("管理员批量删除用户: {} 个", req.ids.len());
+    // 逐个记名字而不是只记数量与 ID：批量操作的事后追溯最怕
+    // "删了 3 个人"却不知道是哪 3 个
+    let names = targets
+        .iter()
+        .map(|(id, name)| format!("\"{name}\"（{id}）"))
+        .collect::<Vec<_>>()
+        .join("、");
+    audit.push(format!("批量删除 {} 个用户：{names}", targets.len()));
     Ok(Json(ApiResponse::success("批量删除成功")))
 }
 
@@ -527,6 +579,7 @@ pub async fn toggle_user_status(
     State(state): State<AppState>,
     perm: PermUserUpdate,
     auth_user: AuthenticatedUser,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(req): ApiJson<ToggleStatusRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
@@ -565,6 +618,19 @@ pub async fn toggle_user_status(
         .role_repo
         .find_roles_by_user_id(id)
         .await?;
+    // 停用是本系统里最容易被用来"掐断某人服务"的开关，
+    // 前后状态都记，事后才分得清"刚被停用"和"本来就是停用的"
+    let was = if user.is_active { "启用" } else { "停用" };
+    let now = if updated.is_active {
+        "启用"
+    } else {
+        "停用"
+    };
+    audit.push(format!(
+        "用户 \"{}\"（{id}）状态由{was}改为{now}，角色：{}",
+        user.username,
+        audit::roles_list(&roles)
+    ));
     Ok(Json(ApiResponse::success(UserInfo::new(updated, roles))))
 }
 
@@ -589,6 +655,7 @@ pub struct ToggleStatusRequest {
 pub async fn reset_user_password(
     State(state): State<AppState>,
     perm: PermUserUpdate,
+    audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
     ApiJson(req): ApiJson<ResetPasswordRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
@@ -629,6 +696,13 @@ pub async fn reset_user_password(
         .revoke_all_sessions(&state.redis_client, id)
         .await?;
 
+    // 只记"重置了谁的口令"，**新口令一个字都不记**。
+    // 这是全库风险最高的写操作（拿到新口令即等于登录成该账号），
+    // 也正因如此审计里绝不能出现口令本身
+    audit.push(format!(
+        "重置用户 \"{}\"（{id}）的口令，已强制其下次登录改密并吊销全部会话",
+        user.username
+    ));
     tracing::info!("管理员重置用户密码并吊销会话: {}", user.username);
     Ok(Json(ApiResponse::success("密码重置成功")))
 }

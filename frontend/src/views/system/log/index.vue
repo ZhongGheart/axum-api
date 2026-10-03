@@ -101,6 +101,9 @@ const columns: DataTableColumn[] = [
   { title: '操作', key: 'action', width: 180 },
   { title: '方法', key: 'method', width: 80 },
   { title: '路径', key: 'path', width: 300, ellipsis: { tooltip: true } },
+  // v0.13.0：摘要就是"这次改了什么"。此前这一列根本不存在，
+  // 于是审计只回答了"谁调了哪个接口"，管理员看到一条 DELETE
+  // 却不知道删掉的是哪个角色——信息在库里，界面上却读不到
   { title: '状态码', key: 'status_code', width: 80,
     render(row: Record<string, unknown>) {
       const r = row as unknown as AuditLogItem
@@ -111,6 +114,19 @@ const columns: DataTableColumn[] = [
   { title: 'IP', key: 'client_ip', width: 140 },
   { title: '耗时(ms)', key: 'duration_ms', width: 80 },
   { title: '时间', key: 'created_at', width: 180 },
+  {
+    title: '变更摘要',
+    key: 'result',
+    width: 420,
+    // 摘要可能是一长串权限码，直接铺开会把表格撑到没法横向滚动
+    ellipsis: { tooltip: true },
+    render(row: Record<string, unknown>) {
+      const r = row as unknown as AuditLogItem
+      // 只读操作没有摘要，显示一个明确的破折号而不是空白：
+      // 空白分不清是"没记"还是"这一行本来就没内容"
+      return r.result?.trim() ? r.result : '—'
+    },
+  },
 ]
 
 async function fetchLogs() {

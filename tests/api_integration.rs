@@ -5538,16 +5538,29 @@ fn every_query_dto_rejects_unknown_fields() {
             }
             checked += 1;
 
-            // 属性写在结构体上一行，取紧邻的非空行即可
-            let attr = source[..abs_start]
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("")
-                .trim();
-            if attr != "#[serde(deny_unknown_fields)]" {
+            // 属性块整体在结构体之上，中间可以夹注释和别的属性
+            // （`RoleListParams` 的 `#[serde(deny_unknown_fields)]` 上面隔着
+            //  `#[derive]`、下面隔着 7 行解释 utoipa 的注释和
+            //  `#[into_params(parameter_in = Query)]`）。所以只取紧邻上一行会误报，
+            //  正确做法是向上走到**连续**的 attribute/注释块结束再判断。
+            let mut block: Vec<&str> = vec![];
+            for line in source[..abs_start].lines().rev() {
+                let t = line.trim();
+                if t.starts_with('#') || t.starts_with("//") {
+                    block.push(t);
+                    continue;
+                }
+                break;
+            }
+            if !block.contains(&"#[serde(deny_unknown_fields)]") {
+                // 报出整个块，让失败当场可读，而不是只说"少了某个属性"
+                let seen = if block.is_empty() {
+                    "（结构体上方没有任何属性）".to_string()
+                } else {
+                    block.iter().rev().cloned().collect::<Vec<_>>().join(" / ")
+                };
                 offenders.push(format!(
-                    "{file}::{name} 缺少 #[serde(deny_unknown_fields)]（紧邻的上一行是 `{attr}`）"
+                    "{file}::{name} 缺少 #[serde(deny_unknown_fields)]（属性块：{seen}）"
                 ));
             }
         }
@@ -6643,4 +6656,723 @@ async fn every_bad_input_returns_unified_error_envelope() {
         probe_total,
         violations.join("\n\n")
     );
+}
+
+// ──────────────────────────────────────────────
+// v0.13.0：审计要能回答"改了什么"
+// ──────────────────────────────────────────────
+//
+// 此前 `audit_logs.result` 对**所有写操作恒为空**，实测：
+//
+//   DELETE /api/admin/roles/<uuid>       params 空 | result 空
+//   PUT    /api/admin/roles/<uuid>/menus params 空 | result 空
+//
+// 于是事后追溯只能拿到"某时刻有人删了个 UUID"——
+// 角色名只存在 `roles` 行里，行删掉就没了；授权授予更是连"授了哪些码"都查不到。
+//
+// 本节用例**逐个走完所有写入口**并断言审计里能读到该读的事实：
+// 资源名、权限码差异、口令重置的对象。三条不可省的性质：
+//
+// 1. **删除之后名字仍在**——这是本版存在的理由
+// 2. **口令一个字都不入库**——摘要只能由 handler 显式声明，
+//    自动记录请求体会把 `password` 写进长期表
+// 3. **失败的写操作不留摘要**——否则审计会谎报"已授予/已删除"
+
+/// 轮询审计表，直到找到 `(method, path)` 下**含 marker** 的那条摘要
+///
+/// 中间件是 `tokio::spawn` 异步写的，读完响应时那一条可能还没落库。
+/// 直接查一次会偶发失败——测试自己说谎比功能缺陷更难查。
+async fn wait_for_audit_result(method: &str, path: &str, marker: &str) -> String {
+    let sql = "SELECT result FROM audit_logs \
+                WHERE method = $1 AND path = $2 AND result LIKE '%' || $3 || '%' \
+                ORDER BY created_at DESC, id DESC LIMIT 1";
+    for _ in 0..40 {
+        let found: Option<(String,)> = sqlx::query_as(sql)
+            .bind(method)
+            .bind(path)
+            .bind(marker)
+            .fetch_optional(&pool().await)
+            .await
+            .expect("查询审计摘要失败");
+        if let Some((result,)) = found {
+            return result;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("审计里查不到 {method} {path} 中含有「{marker}」的摘要");
+}
+
+/// `audit_logs` 全表中含有给定片段的行数（`params` 与 `result` 都查）
+///
+/// 用来证明**口令没有落进审计**。只查 `result` 是不够的：
+/// `params` 列存的是查询串，一旦有人改成记请求体，秘密就从这里漏出去。
+async fn audit_rows_containing(needle: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM audit_logs \
+         WHERE (params IS NOT NULL AND params LIKE '%' || $1 || '%') \
+            OR (result IS NOT NULL AND result LIKE '%' || $1 || '%')",
+    )
+    .bind(needle)
+    .fetch_one(&pool().await)
+    .await
+    .expect("统计审计行失败")
+}
+
+/// 写操作审计摘要的承重测试
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn every_write_operation_leaves_an_answerable_change_summary() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let tag = unique("audited");
+
+    // ── 1. 建角色 → 摘要里有角色名 ──────────────────────────
+    let role_name = format!("{tag}_role");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+    wait_for_audit_result("POST", "/api/admin/roles", &role_name).await;
+
+    // ── 2. 改角色名 → **新旧两个名字都要在** ─────────────────
+    // 事后只看到新名字，仍然答不出"这个角色原来叫什么"
+    let renamed = format!("{role_name}_v2");
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/roles/{role_id}"),
+            Some(&token),
+            Some(json!({ "name": renamed, "description": "改名后的描述" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "改角色名失败: {body}");
+    let summary =
+        wait_for_audit_result("PUT", &format!("/api/admin/roles/{role_id}"), &renamed).await;
+    assert!(
+        summary.contains(&role_name),
+        "改名审计必须同时含旧名，否则答不出「原来叫什么」: {summary}"
+    );
+
+    // ── 3. 授权：授予 → 审计记下授了哪些码 ────────────────────
+    let user_list = menu_id_of(axum_api::model::permission::USER_LIST).await;
+    let role_list = menu_id_of(axum_api::model::permission::ROLE_LIST).await;
+    let grant_path = format!("/api/admin/roles/{role_id}/menus");
+    let (status, body) = assign_menus(&app, &token, role_id, &[user_list, role_list]).await;
+    assert_eq!(status, StatusCode::OK, "首次授权应成功: {body}");
+    let summary =
+        wait_for_audit_result("PUT", &grant_path, axum_api::model::permission::USER_LIST).await;
+    assert!(
+        summary.contains(axum_api::model::permission::ROLE_LIST),
+        "授予审计必须列出本次授出的**全部**权限码: {summary}"
+    );
+    assert!(
+        summary.contains(&renamed),
+        "授权审计必须点名是哪个角色，否则事后无法定位: {summary}"
+    );
+
+    // ── 4. 撤权：全量替换 → 审计记下**撤了哪些**码 ─────────────
+    // 这是本版最关键的一条：撤销恰恰是事后追溯最想知道的那一半，
+    // 而只记提交上来的集合根本答不出来
+    let (status, body) = assign_menus(&app, &token, role_id, &[user_list]).await;
+    assert_eq!(status, StatusCode::OK, "重新授权应成功: {body}");
+    let summary = wait_for_audit_result("PUT", &grant_path, "撤销权限码").await;
+    assert!(
+        summary.contains(axum_api::model::permission::ROLE_LIST),
+        "撤权审计必须指名被撤销的权限码: {summary}"
+    );
+    // 全量替换语义下，留在集合里的码不是"本次变更"
+    assert!(
+        !summary.contains(&format!(
+            "撤销权限码 {}",
+            axum_api::model::permission::USER_LIST
+        )),
+        "仍在提交集合中的码不该被记成撤销: {summary}"
+    );
+
+    // ── 5. 建按钮菜单 → 摘要含声明的权限码 ────────────────────
+    let code_a = format!("{tag}:probe:a");
+    let menu_name = format!("{tag}_按钮");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(json!({
+                "name": menu_name,
+                "type": "button",
+                "permission": code_a,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "新建按钮菜单失败: {body}");
+    let menu_id = body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("新建菜单响应里没有 id: {body}"));
+    let menu_path = format!("/api/admin/menus/{menu_id}");
+    wait_for_audit_result("POST", "/api/admin/menus", &code_a).await;
+
+    // 刻意**不测** `code_a → code_b` 的改码：接口层走不通。
+    // `update_menu` 要求调用者已持有目标码，而目标码已存在时又撞唯一索引 409，
+    // 两条路互相堵死（详见 `audit::permission_change` 的说明）。
+    // 那条摘要分支由该函数的单测承重。
+
+    // ── 6. 清空权限码 → 记成"改为无"，且**旧码必须留痕** ────────
+    // 按钮清空后 `menus.permission` 就是 NULL，旧码只存在于审计与恢复槽位里。
+    // 摘要若不留旧码，事后就答不出"这个按钮刚才管的是哪个权限"
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &menu_path,
+            Some(&token),
+            Some(json!({ "permission": "" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清空权限码失败: {body}");
+    let summary = wait_for_audit_result("PUT", &menu_path, "改为 \"无\"").await;
+    assert!(
+        summary.contains(&code_a),
+        "清空审计必须保留被清掉的码: {summary}"
+    );
+
+    // ── 7. 恢复 → 摘要含恢复回来的码 ─────────────────────────
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("{menu_path}/restore-permission"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "恢复权限码失败: {body}");
+    wait_for_audit_result("POST", &format!("{menu_path}/restore-permission"), &code_a).await;
+
+    // ── 8. 删菜单 → 名字必须留存在审计里 ─────────────────────
+    let (status, body) = send(&app, request("DELETE", &menu_path, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "删除菜单失败: {body}");
+    wait_for_audit_result("DELETE", &menu_path, &menu_name).await;
+    assert!(
+        !menu_still_exists(menu_id).await,
+        "菜单应已删除（否则这条审计说明的是一次没发生的删除）"
+    );
+
+    // ── 10. 建用户 → 摘要含用户名与角色 ───────────────────────
+    let username = format!("{tag}_user");
+    let (status, body) = create_user_via_api(&app, &token, &username, &renamed).await;
+    assert_eq!(status, StatusCode::OK, "建用户失败: {body}");
+    let user_id = body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("建用户响应里没有 id: {body}"));
+    let summary = wait_for_audit_result("POST", "/api/admin/users", &username).await;
+    assert!(
+        summary.contains(&renamed),
+        "建用户审计必须记下授予了哪些角色: {summary}"
+    );
+
+    // ── 11. 改用户角色 → 审计记下追加了哪个角色 ────────────────
+    let user_update_path = format!("/api/admin/users/{user_id}");
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &user_update_path,
+            Some(&token),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "roles": [renamed.clone(), "user"],
+                "is_active": true,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "改用户失败: {body}");
+    wait_for_audit_result("PUT", &user_update_path, "追加角色 user").await;
+
+    // ── 12. 切状态 → 前后状态都要在 ───────────────────────────
+    let status_path = format!("/api/admin/users/{user_id}/status");
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &status_path,
+            Some(&token),
+            Some(json!({ "is_active": false })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "停用用户失败: {body}");
+    let summary = wait_for_audit_result("PUT", &status_path, "状态由启用改为停用").await;
+    assert!(
+        summary.contains(&username),
+        "停用审计必须点名是哪个账号: {summary}"
+    );
+    // 复位，免得下一条"追加角色"断言被自身的会话吊销影响
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &status_path,
+            Some(&token),
+            Some(json!({ "is_active": true })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "启用用户失败: {body}");
+
+    // ── 13. 追加角色 → 审计记下授给谁、授了什么 ────────────────
+    // 用一个新角色而不是 `admin`：给用户追加 admin 会凭空多出一名管理员，
+    // 后面"批量删除不能删光管理员"那条保护会被本用例自己搅乱
+    let role_b = format!("{tag}_role_b");
+    let role_b_id = create_role_via_api(&app, &token, &role_b).await;
+    let append_path = format!("/api/admin/users/{user_id}/roles");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &append_path,
+            Some(&token),
+            Some(json!({ "role_name": role_b })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "追加角色失败: {body}");
+    let summary = wait_for_audit_result("POST", &append_path, "追加角色").await;
+    assert!(
+        summary.contains(&username),
+        "追加角色审计必须点名是哪个用户: {summary}"
+    );
+    assert!(
+        summary.contains(&role_b),
+        "追加角色审计必须点名授了哪个角色: {summary}"
+    );
+
+    // ── 14. 重置口令 → 记下重置了谁，且**新口令不入库** ─────────
+    // 全库风险最高的写操作：拿到新口令即等于登录成该账号
+    let secret = format!("Pw{}", uuid::Uuid::new_v4().simple());
+    let reset_path = format!("/api/admin/users/{user_id}/reset-password");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &reset_path,
+            Some(&token),
+            Some(json!({ "password": secret })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重置口令失败: {body}");
+    wait_for_audit_result("POST", &reset_path, &username).await;
+    assert_eq!(
+        audit_rows_containing(&secret).await,
+        0,
+        "新口令「{secret}」被写进了审计表——长期表里的明文口令等于永久泄露"
+    );
+
+    // ── 15. 自助改密 → 记下改了谁，且新旧口令都不入库 ─────────
+    // 用一次性账号而不是 admin：改了 admin 的口令会让后续所有用例无法登录
+    let self_name = format!("{tag}_self");
+    let self_old = "user1234";
+    let (status, body) = create_user_via_api(&app, &token, &self_name, "user").await;
+    assert_eq!(status, StatusCode::OK, "建自助改密账号失败: {body}");
+    let self_token = activated_token(&app, &self_name, self_old).await;
+    let self_new = format!("Pw{}", uuid::Uuid::new_v4().simple());
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/password",
+            Some(&self_token),
+            Some(json!({ "old_password": self_old, "new_password": self_new })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "自助改密失败: {body}");
+    wait_for_audit_result("PUT", "/api/auth/password", &self_name).await;
+    assert_eq!(
+        audit_rows_containing(&self_new).await,
+        0,
+        "新口令被写进了审计表"
+    );
+
+    // ── 16. 登出 → 摘要说明只注销当前会话 ─────────────────────
+    // **必须重新登录**：改密刚刚吊销了该账号的全部会话，
+    // 拿改密前那个令牌打登出只会得到 401——不是登出坏了，是令牌已经作废
+    let self_token = login_token(&app, &self_name, &self_new).await;
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/auth/logout", Some(&self_token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "登出失败: {body}");
+    wait_for_audit_result("POST", "/api/auth/logout", &self_name).await;
+
+    // ── 17. 批量删除 → 逐个记名字，而不是只记"删了 1 个" ───────
+    let victim = format!("{tag}_victim");
+    let (status, body) = create_user_via_api(&app, &token, &victim, "user").await;
+    assert_eq!(status, StatusCode::OK, "建待删账号失败: {body}");
+    let victim_id = body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("建号响应里没有 id: {body}"));
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users/batch-delete",
+            Some(&token),
+            Some(json!({ "ids": [victim_id] })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "批量删除失败: {body}");
+    wait_for_audit_result("POST", "/api/admin/users/batch-delete", &victim).await;
+    assert!(!user_exists(&victim).await, "批量删除应已生效");
+
+    // ── 18. 删用户 → 名字与原角色都要留存在审计里 ───────────────
+    let (status, body) = send(
+        &app,
+        request("DELETE", &user_update_path, Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除用户失败: {body}");
+    wait_for_audit_result("DELETE", &user_update_path, &username).await;
+    assert!(!user_exists(&username).await, "删除用户应已生效");
+
+    // ── 19. 字典：类型增改删 ──────────────────────────────────
+    let dict_code = format!("{tag}_dict");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/dict/types",
+            Some(&token),
+            Some(json!({ "code": dict_code, "name": "审计探针字典" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "新建字典类型失败: {body}");
+    let dict_id = body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("新建字典响应里没有 id: {body}"));
+    let dict_path = format!("/api/admin/dict/types/{dict_id}");
+    wait_for_audit_result("POST", "/api/admin/dict/types", &dict_code).await;
+
+    let dict_code2 = format!("{tag}_dict_v2");
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &dict_path,
+            Some(&token),
+            Some(json!({ "code": dict_code2, "name": "改名后的字典" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "改字典类型失败: {body}");
+    let summary = wait_for_audit_result("PUT", &dict_path, &dict_code2).await;
+    assert!(
+        summary.contains(&dict_code),
+        "改 code 必须保留旧 code，否则按 code 取缓存的前端会静默取到另一份数据: {summary}"
+    );
+
+    // ── 20. 字典项增改删 ─────────────────────────────────────
+    let label_a = format!("{tag}_项A");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/dict/items",
+            Some(&token),
+            Some(json!({
+                "dict_type_id": dict_id,
+                "label": label_a,
+                "value": "a",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "新建字典项失败: {body}");
+    let item_id = body["data"]["id"]
+        .as_str()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .unwrap_or_else(|| panic!("新建字典项响应里没有 id: {body}"));
+    let item_path = format!("/api/admin/dict/items/{item_id}");
+    wait_for_audit_result("POST", "/api/admin/dict/items", &label_a).await;
+
+    let label_b = format!("{tag}_项B");
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &item_path,
+            Some(&token),
+            Some(json!({
+                "dict_type_id": dict_id,
+                "label": label_b,
+                "value": "b",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "改字典项失败: {body}");
+    let summary = wait_for_audit_result("PUT", &item_path, &label_b).await;
+    assert!(
+        summary.contains(&label_a),
+        "改字典项必须保留旧值: {summary}"
+    );
+
+    let (status, body) = send(&app, request("DELETE", &item_path, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "删除字典项失败: {body}");
+    wait_for_audit_result("DELETE", &item_path, &label_b).await;
+
+    // ── 21. 删字典类型 → 名字必须留存（删除是级联的） ──────────
+    let (status, body) = send(&app, request("DELETE", &dict_path, Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "删除字典类型失败: {body}");
+    wait_for_audit_result("DELETE", &dict_path, &dict_code2).await;
+
+    // ── 22. 刷新缓存与重置指标 ────────────────────────────────
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/admin/dict/refresh", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "刷新字典缓存失败: {body}");
+    wait_for_audit_result("POST", "/api/admin/dict/refresh", "刷新字典缓存").await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/monitor/metrics/reset",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重置指标失败: {body}");
+    // 指标清零会抹掉"此前谁在高频调用"的证据，这条本身必须可审计
+    wait_for_audit_result(
+        "POST",
+        "/api/admin/monitor/metrics/reset",
+        "重置全部接口指标",
+    )
+    .await;
+
+    // ── 23. 最后删角色 → **名字在行消失后仍可追溯** ────────────
+    let (status, body) = delete_role(&app, &token, role_id).await;
+    assert_eq!(status, StatusCode::OK, "删除角色失败: {body}");
+    let summary =
+        wait_for_audit_result("DELETE", &format!("/api/admin/roles/{role_id}"), &renamed).await;
+    assert!(
+        !role_still_exists(role_id).await,
+        "角色应已删除（否则这条审计说明的是一次没发生的删除）"
+    );
+    assert!(!summary.is_empty(), "角色删除审计必须是可读摘要而不是空值");
+
+    // 收尾：把第二个角色也删掉，避免留在共享测试库里
+    let _ = delete_role(&app, &token, role_b_id).await;
+}
+
+/// 失败的写操作**不得**留下摘要
+///
+/// 摘要的含义是"这次真的改了"。被拒绝的请求什么都没发生，
+/// 却记下"已授予/已删除"就是谎报——审计一旦开始说谎，
+/// 比没有审计更危险：它会让人**不再去看**其他证据。
+///
+/// **这条用例承重的是"handler 的 push 时机"，不是 2xx 门禁**：
+/// 实测把中间件里的 `is_success` 判断去掉，本用例依然全绿，
+/// 因为现有 handler 全都在副作用成功之后才 push，门禁根本用不上。
+/// 门禁本身由 `middleware::audit_log::summary_for` 的单测钉住。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_rejected_write_leaves_no_change_summary() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let tag = unique("rejected");
+
+    // 内置角色不可删除：这条路径在守卫处就被挡下，不会碰数据库
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/roles/{}", admin_role_id(&pool().await).await),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "删内置角色应被拒绝: {body}"
+    );
+
+    // 同名建角色：唯一约束冲突，同样什么都没发生
+    let name = format!("{tag}_dup");
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/roles",
+            Some(&token),
+            Some(json!({ "name": name, "description": "首次" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/roles",
+            Some(&token),
+            Some(json!({ "name": name, "description": "重名" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "重名应冲突: {body}");
+
+    // 两条被拒请求都写了一条审计记录（记录"有人试过"），
+    // 但摘要必须是空的——不能让人以为角色被建了两次
+    for (method, path) in [
+        ("POST", "/api/admin/roles".to_string()),
+        (
+            "DELETE",
+            format!("/api/admin/roles/{}", admin_role_id(&pool().await).await),
+        ),
+    ] {
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT result FROM audit_logs \
+             WHERE method = $1 AND path = $2 AND status_code >= 400 \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(method)
+        .bind(&path)
+        .fetch_optional(&pool().await)
+        .await
+        .expect("查询审计失败");
+        let (result,) = row.expect("被拒的写请求也必须留审计（否则答不出「谁试过」）");
+        assert!(
+            result.as_deref().map(str::trim).unwrap_or("").is_empty(),
+            "{method} {path} 被拒绝了却留下了变更摘要，审计在谎报: {result:?}"
+        );
+    }
+
+    // 收尾：把首次建出来的角色删掉
+    let id = role_id_by_name(&name).await;
+    let _ = delete_role(&app, &token, id).await;
+}
+
+/// 取内置 `admin` 角色的 ID
+async fn admin_role_id(pool: &sqlx::PgPool) -> uuid::Uuid {
+    sqlx::query_scalar("SELECT id FROM roles WHERE name = 'admin'")
+        .fetch_one(pool)
+        .await
+        .expect("内置 admin 角色应当存在")
+}
+
+/// 写入口清单自检：OpenAPI 里新增的写操作必须被本节的用例覆盖
+///
+/// 上一条用例靠**手写**的调用序列驱动，因此新增端点不会自动被测到——
+/// 那正是"测试自己也在说谎"的典型形态。这里从文档派生写操作集合，
+/// 与本节真正执行过的端点清单比对，新增一个写端点却没纳入审计断言时会当场变红。
+#[test]
+fn every_documented_write_operation_is_covered_by_the_audit_test() {
+    /// 本节用例实际执行过、并断言了摘要内容的写端点
+    const COVERED: &[&str] = &[
+        "POST /api/admin/roles",
+        "PUT /api/admin/roles/{id}",
+        "DELETE /api/admin/roles/{id}",
+        "PUT /api/admin/roles/{role_id}/menus",
+        "POST /api/admin/users/{user_id}/roles",
+        "POST /api/admin/menus",
+        "PUT /api/admin/menus/{id}",
+        "DELETE /api/admin/menus/{id}",
+        "POST /api/admin/menus/{id}/restore-permission",
+        "POST /api/admin/users",
+        "PUT /api/admin/users/{id}",
+        "DELETE /api/admin/users/{id}",
+        "POST /api/admin/users/batch-delete",
+        "PUT /api/admin/users/{id}/status",
+        "POST /api/admin/users/{id}/reset-password",
+        "POST /api/admin/dict/types",
+        "PUT /api/admin/dict/types/{id}",
+        "DELETE /api/admin/dict/types/{id}",
+        "POST /api/admin/dict/items",
+        "PUT /api/admin/dict/items/{id}",
+        "DELETE /api/admin/dict/items/{id}",
+        "POST /api/admin/dict/refresh",
+        "POST /api/admin/monitor/metrics/reset",
+        "PUT /api/auth/password",
+        "POST /api/auth/logout",
+    ];
+
+    /// 明确豁免的写端点：**每一条都要写出理由**，否则豁免就变成了漏测的挡箭牌
+    const EXEMPT: &[(&str, &str)] = &[
+        (
+            "POST /api/auth/login",
+            "公开路由，不在审计中间件内；由 AuthService 以语义 action \
+             (AUTH_LOGIN_SUCCESS/FAILURE) 同步写审计，且 result 已记失败原因",
+        ),
+        (
+            "POST /api/auth/register",
+            "同上：AuthService 以 AUTH_REGISTER 同步写审计",
+        ),
+        (
+            "POST /api/admin/validate",
+            "纯入参校验演示，不改任何状态；给它编一条「变更摘要」才是谎报",
+        ),
+    ];
+
+    let documented = openapi_operations()
+        .into_iter()
+        .filter(|(method, _, _)| matches!(method.as_str(), "POST" | "PUT" | "DELETE"))
+        .map(|(method, path, _)| format!("{method} {path}"))
+        .collect::<Vec<_>>();
+
+    let mut unaccounted = Vec::new();
+    for endpoint in &documented {
+        let covered = COVERED.contains(&endpoint.as_str());
+        let exempt = EXEMPT.iter().any(|(e, _)| e == endpoint);
+        if !covered && !exempt {
+            unaccounted.push(endpoint.clone());
+        }
+    }
+
+    assert!(
+        unaccounted.is_empty(),
+        "以下写端点既没有被审计断言覆盖，也没有写明豁免理由：\n  {}",
+        unaccounted.join("\n  ")
+    );
+
+    // 清单本身也要验：探针表整体失效时上面的循环空转，断言会全绿
+    assert!(
+        COVERED.len() >= 25,
+        "审计断言覆盖的写端点只有 {} 条，覆盖清单可能已失效",
+        COVERED.len()
+    );
+    for (endpoint, reason) in EXEMPT {
+        assert!(
+            !reason.trim().is_empty(),
+            "写端点 {endpoint} 被豁免却没有给出理由"
+        );
+        assert!(
+            documented.iter().any(|d| d == endpoint),
+            "豁免清单里的 {endpoint} 已不在文档里，请删掉这条豁免"
+        );
+    }
+    for endpoint in COVERED {
+        assert!(
+            documented.iter().any(|d| d == endpoint),
+            "覆盖清单里的 {endpoint} 已不在文档里，请删掉这条覆盖"
+        );
+    }
 }

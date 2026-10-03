@@ -254,6 +254,13 @@ pub async fn export_audit_logs(
             width: 40.0,
         },
         ExcelColumn {
+            // v0.13.0：`result` 此前既不在导出里也不在界面表格里，
+            // 于是"改了什么"这一整层信息存进了库却没人读得到——
+            // 审计日志是出事之后才有人看的东西，看不到就等于没记
+            header: "变更摘要".into(),
+            width: 60.0,
+        },
+        ExcelColumn {
             header: "状态码".into(),
             width: 10.0,
         },
@@ -283,6 +290,7 @@ pub async fn export_audit_logs(
                     l.action.clone(),
                     l.method.clone(),
                     l.path.clone(),
+                    l.result.clone().unwrap_or_default(),
                     l.status_code.map(|s| s.to_string()).unwrap_or_default(),
                     l.client_ip.clone().unwrap_or_default(),
                     l.duration_ms.map(|d| d.to_string()).unwrap_or_default(),

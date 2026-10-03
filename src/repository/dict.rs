@@ -89,7 +89,11 @@ impl DictRepository {
         Ok(())
     }
 
-    async fn find_type_by_id(&self, id: Uuid) -> Result<DictType, AppError> {
+    /// 按 ID 查询字典类型
+    ///
+    /// v0.13.0 起为 `pub`：删除入口需要在**删之前**查一次 `code`，
+    /// 让审计摘要能记下"删的是哪个字典"而不是只留一个 UUID。
+    pub async fn find_type_by_id(&self, id: Uuid) -> Result<DictType, AppError> {
         sqlx::query_as::<_, DictType>("SELECT * FROM dict_types WHERE id=$1")
             .bind(id)
             .fetch_optional(&self.pool)
@@ -108,6 +112,19 @@ impl DictRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("查询字典项失败: {e}")))
+    }
+
+    /// 按 ID 查询字典项
+    ///
+    /// v0.13.0 起为 `pub`：删除入口需要在**删之前**查一次 `label`/`value`，
+    /// 让审计摘要能记下"删的是哪个字典项"而不是只留一个 UUID。
+    pub async fn find_item_by_id(&self, id: Uuid) -> Result<DictItem, AppError> {
+        sqlx::query_as::<_, DictItem>("SELECT * FROM dict_items WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?
+            .ok_or_else(|| AppError::NotFound("字典项不存在".into()))
     }
 
     pub async fn create_item(&self, item: &DictItem) -> Result<DictItem, AppError> {
