@@ -2167,7 +2167,7 @@ async fn granting_several_roles_at_once_still_hits_the_superset_rule() {
     let app = app().await;
     let admin_tok = admin_token(&app).await;
     // 只给 user:create —— 能过接口级守卫，但码集远小于 admin
-    let (tok, _role_id, _uid) =
+    let (tok, op_role_id, op_uid) =
         operator_with_codes(&app, &admin_tok, "hr", &[permission::USER_CREATE]).await;
 
     let username = unique("multi_escalate");
@@ -2194,6 +2194,7 @@ async fn granting_several_roles_at_once_still_hits_the_superset_rule() {
         "多角色里藏 admin 同样应被拦: {body}"
     );
     assert!(!user_exists(&username).await, "被拒后不应留下半成品用户");
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// 契约测试：每个 `/api/admin/*` handler 都必须声明类型化权限码守卫。
@@ -2771,18 +2772,30 @@ async fn audit_log_retention_deletes_in_bounded_batches() {
         .unwrap();
 }
 
+/// [`operator_with_codes`] 造出的角色与账号一律以此开头
+///
+/// 守卫靠它圈定残留范围。**带这个前缀，而不是扫"所有 `_role_` 结尾的名字"**：
+/// `grantee_role_*`、`strong_role_*`、`tmp_holder_role_*` 都是别的夹具造的，
+/// 混进来会让守卫要么长期误报、要么被人加一条豁免——两者都等于没有守卫。
+const OPERATOR_FIXTURE_PREFIX: &str = "opf_";
+
 /// 造一个**不是 admin**、只持有指定权限码的操作员，返回 (token, role_id, user_id)
 ///
 /// 这是 PR-3 的核心夹具。撤掉 `require_role("admin")` 之后，"能进管理区"
 /// 完全由这些码决定，所以提权面**必须用持有部分码的非 admin 才能测出来**——
 /// 拿 admin 当夹具会把所有"应被拒"的断言都测成"当然通过"。
+///
+/// 造出来的角色与账号都带 [`OPERATOR_FIXTURE_PREFIX`] 前缀，理由见该常量。
+///
+/// **每个调用点都必须配一次 [`cleanup_operator]`**：这条夹具被 19 个用例共用，
+/// 漏一处就是库里多一个角色加一个账号，而共享库会被一轮轮堆肥。
 async fn operator_with_codes(
     app: &Router,
     admin_tok: &str,
     prefix: &str,
     codes: &[&str],
 ) -> (String, uuid::Uuid, uuid::Uuid) {
-    let role_name = unique(&format!("{prefix}_role"));
+    let role_name = unique(&format!("{OPERATOR_FIXTURE_PREFIX}{prefix}_role"));
     let role_id = create_role_via_api(app, admin_tok, &role_name).await;
 
     let mut menu_ids = Vec::new();
@@ -2792,7 +2805,7 @@ async fn operator_with_codes(
     let (status, body) = assign_menus(app, admin_tok, role_id, &menu_ids).await;
     assert_eq!(status, StatusCode::OK, "给测试角色授权失败: {body}");
 
-    let username = unique(&format!("{prefix}_user"));
+    let username = unique(&format!("{OPERATOR_FIXTURE_PREFIX}{prefix}_user"));
     let (status, body) = send(
         app,
         request(
@@ -2833,6 +2846,26 @@ async fn operator_with_codes(
     (token, role_id, user_id)
 }
 
+/// 收回 [`operator_with_codes`] 造出来的角色与账号
+///
+/// **顺序是先删用户、后删角色**，实测反序会被挡回：
+/// `DELETE /api/admin/roles/{id}` 在"仍有 N 个用户使用该角色"时回 400
+/// 「请先调整这些用户的角色」（`src/controller/role.rs`）。那条拒绝是**有意设计**——
+/// `user_roles` 的 `ON DELETE CASCADE` 会**静默**剥掉这些用户的角色，
+/// 让人变成"没有任何角色"的用户而不自知。所以清理要顺着它的意思来，
+/// 而不是绕开它（先 `DELETE FROM roles` 让级联生效）。
+///
+/// 这里走 API，而不像 [`cleanup_holder`] 那样走 SQL：本夹具的角色挂的是
+/// `system:user:list` 这类**真实**权限码，admin 按种子持有全部，授权下界
+/// （能授予的 ⊆ 已持有的）自然放行。`cleanup_holder` 的角色挂的是
+/// `tmp:*:priv:*` 一次性专属码，admin 按设计不持有，才只能走 SQL。
+/// 两者形态不同不是随意选择，是被各自的授权状态决定的。
+async fn cleanup_operator(app: &Router, admin_tok: &str, user_id: uuid::Uuid, role_id: uuid::Uuid) {
+    delete_user_via_api(app, admin_tok, user_id).await;
+    let (status, body) = delete_role(app, admin_tok, role_id).await;
+    assert_eq!(status, StatusCode::OK, "清理测试操作员角色失败: {body}");
+}
+
 /// **正向**：持有 `system:user:list` 的非 admin 现在能进管理区。
 ///
 /// PR-3 之前这里必然 403——`require_role("admin")` 拦在权限码之前，
@@ -2844,7 +2877,7 @@ async fn a_non_admin_holding_the_code_can_reach_the_interface() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (tok, _role_id, _uid) =
+    let (tok, op_role_id, op_uid) =
         operator_with_codes(&app, &admin_tok, "readonly_op", &[permission::USER_LIST]).await;
 
     let (status, body) = send(&app, request("GET", "/api/admin/users", Some(&tok), None)).await;
@@ -2889,6 +2922,7 @@ async fn a_non_admin_holding_the_code_can_reach_the_interface() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "admin 账号应未被误改");
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// **核心提权防线**：能建号 ≠ 能建管理员。
@@ -2903,7 +2937,7 @@ async fn creating_a_user_with_a_role_you_do_not_hold_is_denied() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (tok, _role_id, _uid) = operator_with_codes(
+    let (tok, op_role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "creator_op",
@@ -2963,6 +2997,7 @@ async fn creating_a_user_with_a_role_you_do_not_hold_is_denied() {
         StatusCode::OK,
         "授予无权限码的 user 角色不应被拦（它不授予任何能力）: {body}"
     );
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// **最直接的接管路径**：重置高权限账号的口令。
@@ -2976,7 +3011,7 @@ async fn resetting_a_stronger_account_password_is_denied() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (tok, _role_id, uid) = operator_with_codes(
+    let (tok, op_role_id, uid) = operator_with_codes(
         &app,
         &admin_tok,
         "resetter_op",
@@ -3013,6 +3048,7 @@ async fn resetting_a_stronger_account_password_is_denied() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "重置平级账号口令不应被拦: {body}");
+    cleanup_operator(&app, &admin_tok, uid, op_role_id).await;
 }
 
 /// 追加语义的角色接口曾是一条**独立**的提权路径。
@@ -3026,7 +3062,7 @@ async fn appending_a_stronger_role_to_a_user_is_denied() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (tok, _role_id, uid) = operator_with_codes(
+    let (tok, op_role_id, uid) = operator_with_codes(
         &app,
         &admin_tok,
         "appender_op",
@@ -3052,6 +3088,7 @@ async fn appending_a_stronger_role_to_a_user_is_denied() {
         StatusCode::FORBIDDEN,
         "不得给自己追加 admin 角色: {body}"
     );
+    cleanup_operator(&app, &admin_tok, uid, op_role_id).await;
 }
 
 /// `system:menu:grant` 本身就是"把权限码授予角色"的元能力。
@@ -3065,7 +3102,7 @@ async fn menu_grant_cannot_self_escalate() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (tok, role_id, _uid) =
+    let (tok, role_id, op_uid) =
         operator_with_codes(&app, &admin_tok, "granter_op", &[permission::MENU_GRANT]).await;
 
     // 试图把 user:delete 那个按钮授予自己的角色
@@ -3108,6 +3145,7 @@ async fn menu_grant_cannot_self_escalate() {
         granted_menu_ids(other_role).await.contains(&delete_btn),
         "授予必须真的写入"
     );
+    cleanup_operator(&app, &admin_tok, op_uid, role_id).await;
 }
 
 /// 改写**已授权菜单**的 `permission` 是绕过 `role_menus` 链自授权限码的旁路。
@@ -3135,7 +3173,7 @@ async fn rewriting_a_granted_menu_permission_to_an_unheld_code_is_denied() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (tok, role_id, _uid) = operator_with_codes(
+    let (tok, role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "menu_editor",
@@ -3263,6 +3301,7 @@ async fn rewriting_a_granted_menu_permission_to_an_unheld_code_is_denied() {
         !menu_still_exists(tmp_btn).await,
         "临时按钮应随父目录级联删除"
     );
+    cleanup_operator(&app, &admin_tok, op_uid, role_id).await;
 }
 
 // ──────────────────────────────────────────────
@@ -3426,33 +3465,53 @@ async fn cleanup_holder(holder: &TempCodeFixture) {
 /// 测试不检查自己留下的垃圾，就永远发现不了自己在漏：共享库会被一轮轮堆肥，
 /// 分页类断言的噪声基线也随之抬高。
 ///
-/// 范围只圈 `granted_temp_button` 这一支，不圈全部夹具：`operator_with_codes`
-/// 造的 20 处操作员角色同样没人清理（累计已 156 个角色 / 264 个账号），
-/// 那是另一笔账、另一个版本的活。这里若把范围放大到它，本条就会一直红，
-/// 而一个长期红的守卫等于没有守卫——不如先守住已经修干净的那一半。
+/// **v0.19.0 把范围补上了 `operator_with_codes` 那一支**——此前这里只圈
+/// `granted_temp_button`，注释里写着"那是另一笔账、另一个版本的活"。
+/// 那笔账现在还：19 个调用点没有一处清理，实测累积 212 个操作员角色、
+/// 424 个账号（整库 270 角色 / 424 用户，即绝大多数都是它）。
+/// 补法是给夹具加 [`OPERATOR_FIXTURE_PREFIX`] 前缀 + 19 处配 [`cleanup_operator`]，
+/// 这样本条才能在**不动别的夹具**的前提下把范围收干净。
+/// 注意顺序：先有前缀与清理，最后才把范围放大——反过来本条会长期红，
+/// 而一个长期红的守卫等于没有守卫。
 #[tokio::test]
 #[ignore = "需要真实 Postgres + Redis"]
 async fn the_permission_code_fixtures_leave_no_holder_behind() {
     let p = pool().await;
 
-    let roles: Vec<String> =
-        sqlx::query_scalar(r#"SELECT name FROM roles WHERE name LIKE 'tmp\_holder\_role\_%'"#)
-            .fetch_all(&p)
-            .await
-            .expect("扫描残留持有者角色失败");
-    let users: Vec<String> = sqlx::query_scalar(
-        r#"SELECT username FROM users WHERE username LIKE 'tmp\_holder\_user\_%'"#,
-    )
-    .fetch_all(&p)
-    .await
-    .expect("扫描残留持有者账号失败");
+    /// 每支夹具一行：`(夹具名, 角色名 LIKE, 账号名 LIKE)`
+    ///
+    /// LIKE 里的 `_` 要转义成 `\_`，否则它匹配任意单字符——
+    /// 于是 `tmp_holder_role_%` 会连 `tmpXholderYroleZ...` 一起捞进来。
+    const FIXTURES: &[(&str, &str, &str)] = &[
+        (
+            "granted_temp_button 持有者",
+            r"tmp\_holder\_role\_%",
+            r"tmp\_holder\_user\_%",
+        ),
+        ("operator_with_codes 操作员", "opf\\_%", "opf\\_%"),
+    ];
 
-    let mut leaked: Vec<String> = roles.into_iter().map(|n| format!("角色 {n}")).collect();
-    leaked.extend(users.into_iter().map(|n| format!("账号 {n}")));
+    let mut leaked: Vec<String> = Vec::new();
+    for (fixture, role_pattern, user_pattern) in FIXTURES {
+        let roles: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT name FROM roles WHERE name LIKE '{role_pattern}'"
+        ))
+        .fetch_all(&p)
+        .await
+        .unwrap_or_else(|e| panic!("扫描 {fixture} 的残留角色失败: {e}"));
+        let users: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT username FROM users WHERE username LIKE '{user_pattern}'"
+        ))
+        .fetch_all(&p)
+        .await
+        .unwrap_or_else(|e| panic!("扫描 {fixture} 的残留账号失败: {e}"));
+        leaked.extend(roles.into_iter().map(|n| format!("{fixture}: 角色 {n}")));
+        leaked.extend(users.into_iter().map(|n| format!("{fixture}: 账号 {n}")));
+    }
 
     assert!(
         leaked.is_empty(),
-        "权限码夹具留下了 {} 条持有者残留（共享库会被一轮轮堆肥）:\n  - {}",
+        "权限码夹具留下了 {} 条残留（共享库会被一轮轮堆肥）:\n  - {}",
         leaked.len(),
         leaked.join("\n  - ")
     );
@@ -3659,7 +3718,7 @@ async fn clearing_a_code_others_rely_on_requires_holding_it() {
     );
 
     // 操作员只持 menu:update，不持那个一次性码
-    let (tok, _role_id, _uid) = operator_with_codes(
+    let (tok, op_role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "clear_denied",
@@ -3690,6 +3749,7 @@ async fn clearing_a_code_others_rely_on_requires_holding_it() {
 
     cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
     cleanup_holder(&holder).await;
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// 清空一个**没授予任何角色**的码不改变任何人的权限，应放行
@@ -3748,7 +3808,7 @@ async fn clearing_a_code_no_role_relies_on_is_allowed() {
         "夹具前提：该按钮未授予任何角色"
     );
 
-    let (tok, _role_id, _uid) = operator_with_codes(
+    let (tok, op_role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "clear_harmless",
@@ -3784,6 +3844,7 @@ async fn clearing_a_code_no_role_relies_on_is_allowed() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// 恢复是"撤销我自己的误操作"，不是"接管别人的清空"
@@ -3815,7 +3876,7 @@ async fn only_the_clearing_user_can_restore_a_permission_code() {
     assert_eq!(status, StatusCode::OK, "清空应放行: {body}");
 
     // 另一个同样持 menu:update 的操作员来恢复 —— 不是他清的
-    let (tok, _role_id, _uid) = operator_with_codes(
+    let (tok, op_role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "restore_other",
@@ -3859,6 +3920,7 @@ async fn only_the_clearing_user_can_restore_a_permission_code() {
 
     cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
     cleanup_holder(&holder).await;
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// 菜单树要告诉前端"这个按钮的码可以恢复"，否则恢复入口无从发现
@@ -4029,7 +4091,7 @@ async fn deleting_a_granted_button_others_rely_on_requires_holding_it() {
     );
 
     // 操作员只持 menu:delete，不持那个一次性码，也没有 menu:grant
-    let (tok, _role_id, _uid) = operator_with_codes(
+    let (tok, op_role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "delete_denied",
@@ -4097,6 +4159,7 @@ async fn deleting_a_granted_button_others_rely_on_requires_holding_it() {
     .await;
     assert_eq!(status, StatusCode::OK, "撤销授权后应可删除: {body}");
     cleanup_holder(&holder).await;
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// 删除一个**没授予任何角色**的按钮不改变任何人的权限，应放行
@@ -4129,7 +4192,7 @@ async fn deleting_a_button_no_role_relies_on_is_allowed() {
     assert_eq!(status, StatusCode::OK, "创建未被授予的按钮失败: {body}");
     let btn_id = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
 
-    let (tok, _role_id, _uid) = operator_with_codes(
+    let (tok, op_role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "delete_allowed",
@@ -4148,6 +4211,7 @@ async fn deleting_a_button_no_role_relies_on_is_allowed() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "删除没人依赖的按钮应放行: {body}");
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// 声明一个**已被占用**的权限码应报冲突，而不是服务器内部错误
@@ -4212,7 +4276,7 @@ async fn deleting_a_directory_with_a_granted_button_below_is_denied() {
         holder.holder_tok.clone(),
     );
 
-    let (tok, _role_id, _uid) = operator_with_codes(
+    let (tok, op_role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "cascade_denied",
@@ -4262,6 +4326,7 @@ async fn deleting_a_directory_with_a_granted_button_below_is_denied() {
 
     cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
     cleanup_holder(&holder).await;
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// 非法的菜单类型应报 400，而不是服务器内部错误
@@ -4318,7 +4383,7 @@ async fn appending_a_role_to_a_stronger_account_is_denied() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (tok, _role_id, _uid) = operator_with_codes(
+    let (tok, op_role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "target_guard_op",
@@ -4400,6 +4465,7 @@ async fn appending_a_role_to_a_stronger_account_is_denied() {
     // 清理：共享测试库里的每个用例都应身后无残留
     delete_user_via_api(&app, &admin_tok, strong_id).await;
     delete_role(&app, &admin_tok, strong_role_id).await;
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// **洞 A 的镜像**：同一端点该拦的拦住了，就不该把合法路径一起拦掉。
@@ -4414,7 +4480,7 @@ async fn appending_a_weaker_role_to_yourself_is_still_allowed() {
     let app = app().await;
     let admin_tok = admin_token(&app).await;
     // 同时持 user:list 与 dict:list，追加 user 角色后两条都还在
-    let (tok, _role_id, uid) = operator_with_codes(
+    let (tok, op_role_id, uid) = operator_with_codes(
         &app,
         &admin_tok,
         "self_append_op",
@@ -4451,6 +4517,7 @@ async fn appending_a_weaker_role_to_yourself_is_still_allowed() {
         roles.len() >= 2,
         "原有角色不应被追加语义覆盖掉，实际 {roles:?}"
     );
+    cleanup_operator(&app, &admin_tok, uid, op_role_id).await;
 }
 
 /// **洞 B**：改了角色却不吊销会话，新权限要等目标用户自己重新登录才生效。
@@ -4706,7 +4773,7 @@ async fn deleting_a_role_that_carries_permissions_you_lack_is_denied() {
     assert_eq!(status, StatusCode::OK, "给目标角色授权失败: {body}");
 
     // 操作员：只有 role:delete
-    let (tok, _role_id, _uid) =
+    let (tok, op_role_id, op_uid) =
         operator_with_codes(&app, &admin_tok, "delrole_op", &[permission::ROLE_DELETE]).await;
 
     let (status, body) = delete_role(&app, &tok, strong_id).await;
@@ -4725,6 +4792,7 @@ async fn deleting_a_role_that_carries_permissions_you_lack_is_denied() {
     assert!(role_still_exists(strong_id).await, "被拒后角色必须原样保留");
 
     delete_role(&app, &admin_tok, strong_id).await;
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// **洞的镜像**：该拦的拦住之后，合法路径不能被一起堵掉。
@@ -4750,7 +4818,7 @@ async fn deleting_a_role_whose_permissions_you_cover_is_allowed() {
     assert_eq!(status, StatusCode::OK, "给目标角色授权失败: {body}");
 
     // 操作员同时持 role:delete 与 log:list —— 覆盖目标角色的全部码
-    let (tok, _role_id, _uid) = operator_with_codes(
+    let (tok, op_role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "delrole_cover_op",
@@ -4765,6 +4833,7 @@ async fn deleting_a_role_whose_permissions_you_cover_is_allowed() {
         "自己覆盖目标角色全部权限码时应当放行: {body}"
     );
     assert!(!role_still_exists(target_id).await, "角色应已被删除");
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 /// 天花板不该误伤**无码角色**：没挂任何权限码的角色删掉不改变任何人的权限。
@@ -4783,7 +4852,7 @@ async fn deleting_a_role_that_carries_no_permission_is_allowed() {
     let empty_id = create_role_via_api(&app, &admin_tok, &empty_name).await;
     // 刻意不授权任何菜单
 
-    let (tok, _role_id, _uid) = operator_with_codes(
+    let (tok, op_role_id, op_uid) = operator_with_codes(
         &app,
         &admin_tok,
         "delrole_empty_op",
@@ -4794,6 +4863,7 @@ async fn deleting_a_role_that_carries_no_permission_is_allowed() {
     let (status, body) = delete_role(&app, &tok, empty_id).await;
     assert_eq!(status, StatusCode::OK, "无码角色不应被天花板拦下: {body}");
     assert!(!role_still_exists(empty_id).await, "角色应已被删除");
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
 }
 
 // ──────────────────────────────────────────────
@@ -8023,18 +8093,7 @@ async fn the_retention_endpoint_obeys_the_log_permission() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "匿名不该看到保留策略");
 
-    delete_user_via_api(&app, &admin, uid).await;
-    let (status, body) = send(
-        &app,
-        request(
-            "DELETE",
-            &format!("/api/admin/roles/{role_id}"),
-            Some(&admin),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "清理测试角色失败: {body}");
+    cleanup_operator(&app, &admin, uid, role_id).await;
 }
 
 // ──────────────────────────────────────────────
