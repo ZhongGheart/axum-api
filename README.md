@@ -197,6 +197,9 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | `AUDIT_LOG_CLEANUP_INTERVAL_SECONDS` | 否 | `3600` | 清理任务的运行间隔（秒） |
 | `AUDIT_LOG_CLEANUP_BATCH_SIZE` | 否 | `10000` | 单批删除行数上限：把长事务切碎，避免长时间持锁与 WAL 膨胀 |
 | `AUDIT_LOG_CLEANUP_MAX_BATCHES` | 否 | `20` | 单轮清理最多执行多少批，删空即提前结束 |
+| `METRICS_FLUSH_INTERVAL_SECONDS` | 否 | `5` | 内存指标缓冲的刷写间隔（秒）。传 `0` 会被兜底成 `1`，否则定时任务会空转刷 Redis |
+| `METRICS_KEY_TTL_SECONDS` | 否 | `604800` | 指标在 Redis 里的存活时间（秒）。到期即丢弃，**调小会让监控页出现断点**，而不是只丢精度 |
+| `METRICS_MAX_BUFFERED_ENDPOINTS` | 否 | `10000` | 单次刷写最多覆盖多少个不同端点，用来给内存占用封顶 |
 
 ⚠️ **保留策略不是只写在文档里**：`GET /api/admin/audit-logs/retention` 会返回
 当前部署的真实保留天数、现存最早一条日志的时刻，以及最近一次清理的

@@ -1,6 +1,16 @@
 <template>
   <div class="login-page">
     <div class="login-card">
+      <!-- 会话失效原因：被踢回登录页时说明为什么，否则用户面对的是一个空登录框 -->
+      <n-alert
+        v-if="sessionEndedMessage"
+        type="warning"
+        :show-icon="true"
+        class="session-ended-alert"
+      >
+        {{ sessionEndedMessage }}
+      </n-alert>
+
       <!-- Logo & 标题 -->
       <div class="login-header">
         <div class="logo">
@@ -78,13 +88,14 @@
  * - 记住登录：只记忆用户名，口令不落盘
  * - 口令经 HTTPS 明文提交，后端 Argon2 校验
  */
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { PersonOutline as UserIcon, LockClosedOutline as LockIcon } from '@vicons/ionicons5'
 import type { FormInst, FormRules } from 'naive-ui'
 import { useUserStore } from '@/stores/user'
 import { showSuccess } from '@/utils/message'
 import { getStorage, setStorage, removeStorage } from '@/utils/storage'
+import { buildSessionEndedMessage, takeSessionEnded } from '@/utils/session'
 
 // ── 状态 ────────────────────────────────────────────────────────
 
@@ -92,6 +103,22 @@ const router = useRouter()
 const userStore = useUserStore()
 const formRef = ref<FormInst | null>(null)
 const submitting = ref(false)
+
+/**
+ * 为什么会落在这个页面上
+ *
+ * 会话被吊销/过期时，响应拦截器会记下**后端给的原因**（`令牌已被注销` /
+ * `登录状态已失效` / `令牌无效或已过期`），由这里取走展示。
+ *
+ * 用后端原话而不是前端另编的通用句：后端分得清是哪一种，
+ * 前端编一句"会话已失效"等于把这份区别重新抹平。
+ * 没有原因时（如主动点"退出登录"、直接访问 /login）就不显示——
+ * 常驻提示会让人以为自己的会话出了什么问题。
+ */
+const sessionEndedReason = ref<string | null>(null)
+
+/** 提示全文（拼接规则与单测见 utils/session.buildSessionEndedMessage） */
+const sessionEndedMessage = computed(() => buildSessionEndedMessage(sessionEndedReason.value))
 
 /** 记住密码标识 */
 const REMEMBER_KEY = 'remember_login'
@@ -184,6 +211,8 @@ async function handleLogin(): Promise<void> {
 
 onMounted(() => {
   loadRemembered()
+  // 取走即清除：留在 sessionStorage 里会让**下一次**正常登录也显示它
+  sessionEndedReason.value = takeSessionEnded()
 })
 </script>
 
@@ -202,6 +231,10 @@ onMounted(() => {
   background: var(--bg-card, #ffffff);
   border-radius: 12px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+}
+
+.session-ended-alert {
+  margin-bottom: 20px;
 }
 
 .login-header {

@@ -6,6 +6,7 @@
 
 import type { AxiosError } from 'axios'
 import { showError } from '@/utils/message'
+import { ApiError } from '@/api/errors'
 
 /** 重试配置 */
 export interface RetryOptions {
@@ -47,11 +48,17 @@ export function delay(ms: number): Promise<void> {
 }
 
 /**
- * 统一错误处理（显示消息 + 返回值）
+ * 统一错误处理（必要时显示消息，然后抛出）
+ *
+ * **已展示过的错误不再弹一次**。响应拦截器已经把接口错误弹过一次，
+ * store 再弹一次就是同一个失败出现两条提示——实测一次会话失效弹了 4 条，
+ * 其中一半是这么来的。与 401 无关，任何走这里的失败都会重复。
  */
 export function handleError(error: unknown): never {
   if (error instanceof Error) {
-    showError(error.message)
+    if (!(error instanceof ApiError) || !error.reported) {
+      showError(error.message)
+    }
     throw error
   }
   const fallback = new Error('未知错误')

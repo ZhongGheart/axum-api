@@ -7,6 +7,8 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import type { RouteRecordRaw } from 'vue-router'
 import { getToken } from '@/utils/storage'
+import { notifySessionEnded, registerSessionEndedHandler } from '@/utils/session'
+import { isUnauthorized } from '@/api/errors'
 import { useMenuStore } from '@/stores/menu'
 import { usePermissionsStore } from '@/stores/permissions'
 import { useUserStore } from '@/stores/user'
@@ -133,9 +135,17 @@ router.beforeEach(async (to, _from, next) => {
   const token = getToken()
 
   // Token 过期检测
+  //
+  // 走会话失效出口，而不是自己 `localStorage.clear()` 后跳转：
+  // 1. clear() 抹掉的是**整个 localStorage**，连"记住密码"的用户名一起没了；
+  // 2. 登录页需要知道"为什么被踢回来"才能给出解释；
+  // 3. 多一个旁路实现，就多一处将来会漏改的地方。
+  //
+  // 同样 next(false) 而非 next('/login')：跳转已由会话失效出口发起，
+  // 再 redirect 一次是第二次导航（多半撞上重复导航失败）。
   if (token && isTokenExpired(token)) {
-    localStorage.clear()
-    return next('/login')
+    notifySessionEnded('登录状态已过期，请重新登录')
+    return next(false)
   }
 
   // 白名单放行
@@ -172,8 +182,18 @@ router.beforeEach(async (to, _from, next) => {
     try {
       const [menus] = await Promise.all([menuStore.load(), permissionsStore.load()])
       registerMenuRoutes(menus)
-    } catch {
-      // 加载失败已由 store 弹出提示；这里放行，由 404 页面兜底，避免守卫死循环
+    } catch (error) {
+      // 401（会话已被吊销/过期）：响应拦截器已走统一出口——清令牌 + 跳登录页。
+      // 这里中止本次导航，等那个跳转接管。
+      //
+      // **必须调 next(false)，不能直接 return**：本守卫是回调式的
+      // （`guard.length === 3`），vue-router 只有在返回值风格下才会把返回值
+      // 交给 next 处理。这里不调 next 会让整条导航永远悬着，页面卡在空白。
+      //
+      // 也不能落到 404 兜底：那会显示"404 页面未找到"，是**方向性相反**的诊断
+      // ——会话没了不等于页面不存在，按 404 去排查会去找根本不存在的路由。
+      if (isUnauthorized(error)) return next(false)
+      // 其它失败（网络不通 / 500）：维持现状放行，由 404 页面兜底，避免守卫死循环
       return next()
     }
     return next({ ...to, replace: true })
@@ -185,6 +205,23 @@ router.beforeEach(async (to, _from, next) => {
   }
 
   next()
+})
+
+// ============================================
+// 会话失效出口
+// ============================================
+//
+// 跳转逻辑注册在这里，而不是让 `utils/session.ts` 直接 import 本模块：
+// 那样会形成 `router → stores → api → utils/session → router` 的循环依赖。
+// 与 `utils/message.ts` 的 `registerGlobalApis` 是同一套路。
+registerSessionEndedHandler(() => {
+  // 登出会走 clearLocalSession（不发请求，避免注定失败的往返）
+  useUserStore().clearLocalSession()
+  // replace 而非 push：会话失效不是一次"前进"，不该在历史里留一页死路。
+  // 带了 query 也不影响——登录页从 sessionStorage 取原因，不依赖地址栏。
+  void router.replace('/login').catch(() => {
+    // 已经在登录页时会抛重复导航错误，属正常情况
+  })
 })
 
 export default router

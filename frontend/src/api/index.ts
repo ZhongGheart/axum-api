@@ -11,6 +11,8 @@ import type { AxiosError, AxiosResponse, InternalAxiosRequestConfig } from 'axio
 import type { ApiResponse } from '@/api/types/response'
 import { getToken } from '@/utils/storage'
 import { showError } from '@/utils/message'
+import { notifySessionEnded } from '@/utils/session'
+import { ApiError } from '@/api/errors'
 import { requestCache } from '@/utils/cache'
 import { perfMonitor } from '@/utils/performance'
 
@@ -90,6 +92,43 @@ http.interceptors.request.use(
   },
 )
 
+/**
+ * 401 里**不**代表"会话被吊销"的端点
+ *
+ * 判据是"这个 401 有没有正常的用户语义"，而不是"是不是登录相关接口"。
+ * 登出同样要排除：用户点退出登录时，是他在结束会话，不是会话被结束。
+ */
+const SESSION_END_EXEMPT = new Set(['/auth/login', '/auth/logout'])
+
+/**
+ * 401 时**不弹提示**的端点
+ *
+ * 登出的 401 对用户没有任何可行动作：`logout()` 本来就会清本地会话并跳登录页，
+ * 再补一句"令牌已被注销，请重新登录"只会让人以为自己操作错了。
+ */
+const SILENT_ON_401 = new Set(['/auth/logout'])
+
+/**
+ * 取请求路径（去掉 baseURL 与查询串），用于上表的匹配
+ *
+ * 用**后缀**匹配而不是全等：axios 的 `config.url` 不含 baseURL，但调用点
+ * 万一写成完整路径（`/api/auth/login`）时，全等匹配会漏掉——
+ * 漏掉的后果是**输错口令被弹去"会话已失效"**，登录页从此无法正常报错。
+ * 这是安全方向的失败，宁可多匹配。
+ */
+function requestPathOf(error: AxiosError): string {
+  const url = error.config?.url || ''
+  return (url.split('?')[0] || '').replace(/\/+$/, '')
+}
+
+/** 路径是否命中给定端点集合（后缀匹配，见 requestPathOf 的说明） */
+function matchesPath(path: string, set: Set<string>): boolean {
+  for (const p of set) {
+    if (path === p || path.endsWith(p)) return true
+  }
+  return false
+}
+
 // ============================================
 // 响应拦截器
 // ============================================
@@ -154,21 +193,50 @@ http.interceptors.response.use(
     // ── 错误消息处理 ─────────────────────────────────────────
     if (error.code === 'ECONNABORTED') {
       showError('请求超时，请稍后重试')
-      return Promise.reject(new Error('请求超时'))
+      return Promise.reject(new ApiError('请求超时', 0, true))
     }
     if (!error.response) {
       showError('网络异常，请检查连接')
-      return Promise.reject(new Error('网络异常'))
+      return Promise.reject(new ApiError('网络异常', 0, true))
     }
 
     const status = error.response.status
+
+    // 后端已经分得清 401 的三种原因（口令错 / 令牌被吊销 / 令牌无效过期），
+    // 优先用它自己的话。前端此前对 401 无条件写死"未授权，请重新登录"，
+    // 于是登录页输错口令也被告知"未授权"——说的是另一件事。
+    const responseBody = error.response.data as { message?: unknown } | undefined
+    const serverMessage = typeof responseBody?.message === 'string' ? responseBody.message : ''
+
     let message = `请求失败 (${status})`
 
     switch (status) {
       case 401:
-        message = '未授权，请重新登录'
         // 会话已失效：清空缓存，避免换账号后读到上一会话的数据
         requestCache.invalidate()
+
+        // 登录与登出的 401 有**正常的用户语义**，不当作"会话被吊销"：
+        // - 登录：口令错误，用户正站在登录页上等他改，重定向只会把人弹走
+        // - 登出：点"退出登录"的人**正是**主动结束会话的人，
+        //   告诉他"会话已失效"是把因果说反了
+        if (!matchesPath(requestPathOf(error), SESSION_END_EXEMPT)) {
+          // 用后端原话，不在前端另编通用文案
+          const reason = serverMessage || '登录状态已失效，请重新登录'
+          notifySessionEnded(reason)
+          // 抛出的错误也要带这句话，而不是 `请求失败 (401)`：
+          // 监控页等界面会直接把 error.message 显示出来（见 views/monitor/*），
+          // 让"请求失败 (401)"出现在界面上，是拿状态码当解释。
+          //
+          // 不在此处弹窗：提示由登录页承接（跳转后弹窗一闪即逝），
+          // 跳转会清掉令牌并离开当前页面，再弹一句是噪音
+          return Promise.reject(new ApiError(reason, status, true))
+        }
+        if (matchesPath(requestPathOf(error), SILENT_ON_401)) {
+          return Promise.reject(
+            new ApiError(serverMessage || '登出请求未成功', status, true),
+          )
+        }
+        message = serverMessage || '未授权，请重新登录'
         break
       case 403:
         message = '权限不足'
@@ -185,7 +253,7 @@ http.interceptors.response.use(
     }
 
     showError(message)
-    return Promise.reject(new Error(message))
+    return Promise.reject(new ApiError(message, status, true))
   },
 )
 

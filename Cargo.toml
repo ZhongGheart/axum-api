@@ -1,6 +1,6 @@
 [package]
 name = "axum-api"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 description = "Production-grade Rust backend API with Axum, SQLx, JWT auth"
 authors = ["dev"]
