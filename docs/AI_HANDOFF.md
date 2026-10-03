@@ -4733,3 +4733,76 @@ FAIL  吊销会话成功（真实走 /auth/logout）  ::  status=429
 恢复 purge → `清掉了上一轮残留的 1 个 custom_type 夹具` + 24/24 绿、残留 0。
 
 11 个套件里只有 v016 用固定唯一标识符，其余都用随机后缀，这类问题仅此一处。
+
+---
+
+## v0.19.0 缺口分析（2026-10-03，只读实测，未动代码）
+
+v0.18.0 已本地提交（`81055867`，未推送）。下面结论全部来自**真实 HTTP 调用**，
+不是读代码猜的。
+
+### 主题候选：没人点过的按钮，永远不知道它是坏的
+
+**实测发现：`GET /api/admin/export/users` 每个调用都返回 500。**
+
+```
+$ curl -s -w '%{http_code}' /api/admin/export/users -H "Authorization: Bearer $TOK"
+500  {"code":500,"data":null,"message":"服务器内部错误"}
+
+后端日志: 内部错误: 查询用户失败: no column found for name: must_change_password
+```
+
+- **根因**：v0.11.0（`7d6898ff`）给 `User` 结构体加了 `must_change_password`，
+  而 `src/controller/demo.rs:51` 的导出用的是**显式列名的裸 SQL**：
+
+  ```rust
+  "SELECT id, username, email, password_hash, is_active, created_at, updated_at FROM users"
+  ```
+
+  没跟上。**整整七版，每个调用都是 500。**
+- **用户可见**：`frontend/src/views/demo/backend.vue:60` 有"导出"按钮调它，
+  失败被 `catch` 吞成 `message.error('导出失败')`——管理员只知道导出坏了，
+  不知道坏在哪，也看不出已经坏了七版
+- **零测试覆盖**：`grep -rn "export/users" tests/ e2e/` 无结果
+
+### 为什么能烂七版：承重测试只覆盖写端点
+
+`tests/api_integration.rs:7554` `every_documented_write_operation_is_covered_by_the_audit_test`
+用 `COVERED` 清单锁住了**每一个文档化的写端点**（23 条），漏一个就红。
+但它是 **write operation**——**读端点没有任何等价守卫**。
+
+`export/users` 是 `GET`，于是它天然落在守卫之外，烂了也不会有人知道。
+
+### 实测：逐个调用未覆盖端点，只有它坏
+
+对 OpenAPI 里 39 个端点做了一遍集成测试/探针覆盖扫描，再逐个真实调用：
+
+| 端点 | 状态 |
+|---|---|
+| `GET /api/admin/export/users` | **500** |
+| `GET /api/admin/monitor/system/export` | 200（真 xlsx） |
+| `GET /api/admin/monitor/alerts` | 200 |
+| `GET /api/admin/dict/cached` | 200 |
+| `GET /api/dict/{code}/items` | 200 |
+| `GET /api/admin/test` | 200（v0.5 RBAC 演示残留，暂不动） |
+| `PUT /users/{id}/status` | 200 |
+| `GET /users/{user_id}/roles` | 200 |
+
+（`POST /users/{id}/roles` 与 `/reset-password` 的 400 是**我猜错 DTO 字段名**
+——后端要 `role_name` / `password`，报的是 `missing field` 并指名，
+这符合 v0.12.0 那套统一错误格式，**不是缺陷**。）
+
+### 建议的 v0.19.0 范围
+
+1. **修 `export/users`**：SELECT 补 `must_change_password`。
+   更进一步：该用 `SELECT *` 或共享常量列表，避免下次加字段再烂一次
+2. **把守卫从"写端点"扩到"全部端点"**：新增一条承重测试，
+   要求 OpenAPI 里每个端点都被至少一条用例真实调用过。
+   这条测试本身要先能抓住当前的 `export/users`
+3. 顺带清掉 `operator_with_codes` 的 20 处调用点不清理（累计 270 角色/424 账号），
+   否则读端点的 `total` 类断言会长期被脏数据打红
+
+### 注意
+
+- 测试库 `axum_api_test` 已累积 **270 角色 / 424 用户 / 80 字典类型 / 12175 审计**。
+  上面的实测都已清理自己的探针数据，但历史累积没清
