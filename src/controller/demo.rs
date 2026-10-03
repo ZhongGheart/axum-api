@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppError;
 use crate::middleware::permission::{PermExportUser, PermLogExport, PermLogList, PermValidateTest};
 use crate::model::ApiResponse;
+use crate::repository::user::USER_COLUMNS;
 use crate::router::AppState;
 use crate::utils::api_extractor::ApiJson;
 use crate::utils::export::{ExcelColumn, ExcelExport};
@@ -46,10 +47,12 @@ pub async fn export_users(
     State(state): State<AppState>,
     _perm: PermExportUser,
 ) -> Result<axum::response::Response, AppError> {
-    // 查询所有用户（角色来自 user_roles）
-    let users = sqlx::query_as::<_, crate::model::User>(
-        "SELECT id, username, email, password_hash, is_active, created_at, updated_at          FROM users ORDER BY created_at DESC",
-    )
+    // 查询所有用户（角色来自 user_roles）。
+    // 列名走 `repository::user::USER_COLUMNS`：这处曾手写且漏掉 v0.11.0 的
+    // `must_change_password`，让本端点从 v0.11.0 起每个调用都 500（烂了七版）。
+    let users = sqlx::query_as::<_, crate::model::User>(&format!(
+        "SELECT {USER_COLUMNS} FROM users ORDER BY created_at DESC"
+    ))
     .fetch_all(state.auth_service.user_repo.pool())
     .await
     .map_err(|e| AppError::InternalServerError(format!("查询用户失败: {e}")))?;

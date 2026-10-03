@@ -6684,6 +6684,12 @@ struct BadInputProbe {
 /// 合法 UUID：路径探针要它**通过**解析，让请求能走到下一层
 const VALID_UUID: &str = "00000000-0000-0000-0000-000000000000";
 
+/// 非 UUID 路径参数的探针值（如 `GET /api/dict/{code}/items` 的 `code`）
+///
+/// 取一个一定不存在的字典码：本守卫要的是"路由和处理函数都跑到了"，
+/// 而不是"这个码真的有数据"。
+const NON_UUID_PARAM_PROBE: &str = "no_such_code_probe";
+
 /// 列出 OpenAPI 文档里的每个操作 `(method, path, operation)`
 fn openapi_operations() -> Vec<(String, String, Value)> {
     let doc = axum_api::docs::openapi_json();
@@ -6715,6 +6721,61 @@ fn uuid_path_params(op: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 该操作路径模板里**全部**路径参数的参数名（含非 uuid 的）
+///
+/// 与 [`uuid_path_params`] 互补：后者只挑 `format: uuid` 的，
+/// 剩下的（当前只有 `GET /api/dict/{code}/items` 的 `code`）要靠
+/// [`NON_UUID_PARAM_PROBE`] 填上，否则路径模板会带着 `{code}` 字面量发出去，
+/// 打到路由上得到 404 —— 一个"因为没匹配到路由而通过"的假绿。
+fn all_path_params(op: &Value) -> Vec<String> {
+    op["parameters"]
+        .as_array()
+        .map(|params| {
+            params
+                .iter()
+                .filter(|p| p["in"] == "path")
+                .filter_map(|p| p["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 该操作**必填**的 query 参数名
+///
+/// `GET /api/admin/dict/items` 的 `dict_type_id` 是必填的：不补上它，
+/// 查询提取器会先回 400，探针根本走不到处理函数，于是"这个端点能跑"
+/// 依然是句没验证过的话。判据取自文档的 `required`，不写死清单。
+fn required_query_params(op: &Value) -> Vec<String> {
+    op["parameters"]
+        .as_array()
+        .map(|params| {
+            params
+                .iter()
+                .filter(|p| p["in"] == "query" && p["required"] == true)
+                .filter_map(|p| p["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 由文档派生出一条**能走到处理函数**的具体请求路径
+///
+/// uuid 路径参数填 [`VALID_UUID`]（不存在的行，于是走 404 而不是误删真数据），
+/// 非 uuid 的填 [`NON_UUID_PARAM_PROBE`]，必填 query 参数也补上。
+fn concrete_path(path: &str, op: &Value) -> String {
+    let uuids = uuid_path_params(op);
+    let mut concrete = substitute(path, &uuids, VALID_UUID);
+    let others: Vec<String> = all_path_params(op)
+        .into_iter()
+        .filter(|n| !uuids.contains(n))
+        .collect();
+    concrete = substitute(&concrete, &others, NON_UUID_PARAM_PROBE);
+    for name in required_query_params(op) {
+        concrete.push_str(&format!("?{name}={VALID_UUID}"));
+    }
+    concrete
 }
 
 /// 把路径模板里的指定参数替换成给定值
@@ -7641,6 +7702,132 @@ fn every_documented_write_operation_is_covered_by_the_audit_test() {
             "覆盖清单里的 {endpoint} 已不在文档里，请删掉这条覆盖"
         );
     }
+}
+
+// ============================================================
+// v0.19.0：只测写端点，读端点烂七版没人知道
+// ============================================================
+
+/// 探针指向的端点
+struct EndpointProbe {
+    endpoint: String,
+    method: String,
+    /// 由文档派生出的具体路径（参数已填好）
+    concrete: String,
+    /// 该操作是否有请求体：有则发 `{}`，停在字段校验层
+    has_body: bool,
+    /// 是否是读端点（读端点额外要求 2xx，见下）
+    is_read: bool,
+}
+
+/// **每一个**文档化端点都必须能被真实调用，且绝不 5xx
+///
+/// 回归的是 v0.19.0 的起点：`GET /api/admin/export/users` 从 v0.11.0 起
+/// **每个调用都 500**（裸 SQL 漏了 `must_change_password`），却烂了七版。
+/// 根因不是这处 SQL 写错，而是**守卫生效范围只覆盖写端点**——
+/// `every_documented_write_operation_is_covered_by_the_audit_test` 从 OpenAPI
+/// 派生的是 `POST|PUT|DELETE`，一个 GET 端点从不在它的视野里。
+///
+/// 所以这里把同一套"从文档派生"的手法扩到全部方法：
+/// - **读端点（GET）必须 2xx**：它没有必填请求体，带合法令牌就该跑通。
+///   返回 4xx 同样是缺陷——路由接到了却拒绝一个本该合法的请求。
+/// - **写端点只要不是 5xx**：发 `{}` 让它停在校验层（400），
+///   这样既走到了处理函数入口，又不改动任何真实数据。
+///   `DELETE /api/admin/users/{VALID_UUID}` 之类打到不存在的行上是 404，不误删。
+///
+/// 唯一的副作用是 `POST /api/auth/logout` 会让令牌失效，探针跑完要重新登录；
+/// `metrics/reset` 会清空指标，但每个读指标的用例都自己先重置，不受影响。
+///
+/// 为什么不写成"断言 50 处都调过了"：那种清单是**自证**——
+/// 新增端点忘了登记，测试照样全绿。这里从 OpenAPI 派生，
+/// 新端点一落地就自动进探针表。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn every_documented_endpoint_is_reachable_without_a_server_error() {
+    let app = app().await;
+    let mut token = admin_token(&app).await;
+
+    // 探针要"因为到达处理函数而通过"，所以必须带合法令牌：
+    // 无令牌时鉴权中间件先回 401，那是 JSON 信封，会让断言假绿
+    let mut probes: Vec<EndpointProbe> = Vec::new();
+    let mut read_count = 0usize;
+    let mut write_count = 0usize;
+
+    for (method, path, op) in openapi_operations() {
+        let concrete = concrete_path(&path, &op);
+        let is_read = method == "GET";
+        if is_read {
+            read_count += 1;
+        } else {
+            write_count += 1;
+        }
+        probes.push(EndpointProbe {
+            endpoint: format!("{method} {path}"),
+            method,
+            concrete,
+            // 带请求体的端点发 `{}`：能过内容协商与解析（证明提取器接好了），
+            // 但会停在字段校验，不会真的建/改任何数据
+            has_body: !op["requestBody"].is_null(),
+            is_read,
+        });
+    }
+
+    // 探针表自身也要验：文档结构一变导致一条都没派生出来时，
+    // 上面的循环会空转、断言全绿——那正是本用例最怕的"因为没测到而通过"
+    assert!(
+        probes.len() >= 50,
+        "从文档派生出的端点探针只有 {} 条，探针表可能已失效",
+        probes.len()
+    );
+    assert!(
+        read_count >= 22,
+        "读端点探针只有 {read_count} 条，全局是否退化成只测写端点",
+    );
+    assert!(
+        write_count >= 28,
+        "写端点探针只有 {write_count} 条，探针表可能已失效",
+    );
+
+    let mut violations = Vec::new();
+    for probe in probes {
+        let EndpointProbe {
+            endpoint,
+            method,
+            concrete,
+            has_body,
+            is_read,
+        } = probe;
+        // 请求必须在**此刻**用当前令牌构造，不能提前批量建好：
+        // `POST /api/auth/logout` 会让令牌失效，而按 `(method, path)` 排序后
+        // 它后面还跟着 `POST /api/auth/register` 与若干 PUT。
+        // 提前构造会让这些探针带着已失效的令牌去跑，整串 401 假红。
+        let body = has_body.then(|| json!({}));
+        let (status, body) = send(&app, request(&method, &concrete, Some(&token), body)).await;
+
+        if status.is_server_error() {
+            violations.push(format!(
+                "{endpoint} 返回了 {status}：{body}\n    · 处理函数内部出错，\
+                 这正是 export/users 烂了七版的形态"
+            ));
+        } else if is_read && !status.is_success() {
+            violations.push(format!(
+                "{endpoint} 返回了 {status}：{body}\n    · 读端点无必填请求体，\
+                 带合法令牌理应 2xx"
+            ));
+        }
+
+        // logout 让当前令牌失效，下一个探针必须换新令牌
+        if endpoint == "POST /api/auth/logout" {
+            token = admin_token(&app).await;
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "以下文档化端点被真实调用时出了问题（共探测 {} 个端点）：\n  {}",
+        read_count + write_count,
+        violations.join("\n  ")
+    );
 }
 
 // ============================================================

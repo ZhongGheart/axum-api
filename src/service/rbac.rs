@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::model::{permission, User};
+use crate::repository::user::USER_COLUMNS;
 use crate::utils::password::hash_password;
 
 /// RBAC 种子数据初始化的事务级建议锁 key
@@ -123,13 +124,13 @@ impl RbacService {
             .map_err(|e| AppError::InternalServerError(format!("查询 user 角色失败: {e}")))?;
 
         // 3. 创建默认超级管理员（如不存在）
-        let admin_user = sqlx::query_as::<_, User>(
+        let admin_user = sqlx::query_as::<_, User>(&format!(
             r#"
-            SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
+            SELECT {USER_COLUMNS}
             FROM users
             WHERE username = 'admin'
-            "#,
-        )
+            "#
+        ))
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| AppError::InternalServerError(format!("查询 admin 用户失败: {e}")))?;

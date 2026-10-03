@@ -9,6 +9,19 @@ use crate::error::AppError;
 use crate::model::User;
 use sqlx::PgPool;
 
+/// `users` 表映射成 [`User`] 时必须**恰好**取到的列
+///
+/// `sqlx::FromRow` 要求结果集包含结构体的每一个字段，少一列就在**运行时**报错。
+/// 本仓库原先有 8 处手写这份列名——迁移 010 加 `must_change_password` 时，
+/// 忘了改 `controller/demo.rs` 那处，于是 `GET /api/admin/export/users`
+/// 从 v0.11.0 起**每个调用都 500**，且没有任何测试碰过它（烂了七版）。
+///
+/// 与 `repository::menu::MENU_COLUMNS` 同理：集中成常量，加列只改这一处。
+/// 守卫见 `tests/api_integration.rs` 的
+/// `every_documented_endpoint_is_called_by_a_test`：新增 SELECT 手写列名会红。
+pub const USER_COLUMNS: &str =
+    "id, username, email, password_hash, is_active, must_change_password, created_at, updated_at";
+
 /// 用户仓储
 ///
 /// 提供用户相关的数据库 CRUD 操作。
@@ -39,13 +52,13 @@ impl UserRepository {
     ///
     /// 找到返回 `User`，未找到返回 `AppError::NotFound`。
     pub async fn find_by_id(&self, id: Uuid) -> Result<User, AppError> {
-        sqlx::query_as::<_, User>(
+        sqlx::query_as::<_, User>(&format!(
             r#"
-            SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
+            SELECT {USER_COLUMNS}
             FROM users
             WHERE id = $1
-            "#,
-        )
+            "#
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await
@@ -55,13 +68,13 @@ impl UserRepository {
 
     /// 根据用户名查找用户（精确匹配）
     pub async fn find_by_username(&self, username: &str) -> Result<Option<User>, AppError> {
-        sqlx::query_as::<_, User>(
+        sqlx::query_as::<_, User>(&format!(
             r#"
-            SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
+            SELECT {USER_COLUMNS}
             FROM users
             WHERE username = $1
-            "#,
-        )
+            "#
+        ))
         .bind(username)
         .fetch_optional(&self.pool)
         .await
@@ -72,13 +85,13 @@ impl UserRepository {
     ///
     /// 支持用户名或邮箱两种方式的登录查询。
     pub async fn find_by_username_or_email(&self, input: &str) -> Result<Option<User>, AppError> {
-        sqlx::query_as::<_, User>(
+        sqlx::query_as::<_, User>(&format!(
             r#"
-            SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
+            SELECT {USER_COLUMNS}
             FROM users
             WHERE username = $1 OR email = $1
-            "#,
-        )
+            "#
+        ))
         .bind(input)
         .fetch_optional(&self.pool)
         .await
@@ -87,13 +100,13 @@ impl UserRepository {
 
     /// 根据邮箱查找用户
     pub async fn find_by_email(&self, email: &str) -> Result<Option<User>, AppError> {
-        sqlx::query_as::<_, User>(
+        sqlx::query_as::<_, User>(&format!(
             r#"
-            SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
+            SELECT {USER_COLUMNS}
             FROM users
             WHERE email = $1
-            "#,
-        )
+            "#
+        ))
         .bind(email)
         .fetch_optional(&self.pool)
         .await
@@ -123,14 +136,14 @@ impl UserRepository {
 
         let users = match keyword {
             None => {
-                sqlx::query_as::<_, User>(
+                sqlx::query_as::<_, User>(&format!(
                     r#"
-                    SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
+                    SELECT {USER_COLUMNS}
                     FROM users
                     ORDER BY created_at DESC
                     LIMIT $1 OFFSET $2
-                    "#,
-                )
+                    "#
+                ))
                 .bind(page_size)
                 .bind(offset)
                 .fetch_all(&self.pool)
@@ -138,15 +151,15 @@ impl UserRepository {
             }
             Some(k) => {
                 let pattern = format!("%{}%", crate::utils::validation::escape_like_pattern(k));
-                sqlx::query_as::<_, User>(
+                sqlx::query_as::<_, User>(&format!(
                     r#"
-                    SELECT id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
+                    SELECT {USER_COLUMNS}
                     FROM users
                     WHERE username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\'
                     ORDER BY created_at DESC
                     LIMIT $2 OFFSET $3
-                    "#,
-                )
+                    "#
+                ))
                 .bind(&pattern)
                 .bind(page_size)
                 .bind(offset)
@@ -188,14 +201,14 @@ impl UserRepository {
         email: &str,
         is_active: bool,
     ) -> Result<User, AppError> {
-        sqlx::query_as::<_, User>(
+        sqlx::query_as::<_, User>(&format!(
             r#"
             UPDATE users
             SET username = $2, email = $3, is_active = $4
             WHERE id = $1
-            RETURNING id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
-            "#,
-        )
+            RETURNING {USER_COLUMNS}
+            "#
+        ))
         .bind(id)
         .bind(username)
         .bind(email)
@@ -304,13 +317,13 @@ impl UserRepository {
         password_hash: &str,
         must_change_password: bool,
     ) -> Result<User, AppError> {
-        sqlx::query_as::<_, User>(
+        sqlx::query_as::<_, User>(&format!(
             r#"
             INSERT INTO users (id, username, email, password_hash, is_active, must_change_password)
             VALUES ($1, $2, $3, $4, true, $5)
-            RETURNING id, username, email, password_hash, is_active, must_change_password, created_at, updated_at
-            "#,
-        )
+            RETURNING {USER_COLUMNS}
+            "#
+        ))
         .bind(id)
         .bind(username)
         .bind(email)

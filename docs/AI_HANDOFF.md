@@ -4886,3 +4886,87 @@ POST /api/admin/roles    {"name":"caserole",...}       → 409 角色名「caser
 
 **注意顺序**：第 2 项涉及迁移与存量数据，风险最高；1 与 3 是低风险独立项。
 若要拆，建议先做 1+3 拿一个干净版本，2 单独一版。
+
+## v0.19.0 进行中（四项合一，用户指令「合在一起做 v0.19.0」）
+
+起始 git 状态：HEAD `9f5e05d5`，分支 `master`，工作区干净（只有 `src/repository/user.rs` 的中间态）。
+纪律：提交后**不推送**，等用户指令。
+
+### 已完成：第 1 项 — `export/users` 的 SELECT + 根治列名漂移
+
+`repository::user::USER_COLUMNS` 常量（照抄 `repository::menu::MENU_COLUMNS` 的形状），
+原先 10 处手写列名全部改用它：user.rs 8 处 + `controller/demo.rs` 1 处 + `service/rbac.rs` 1 处。
+`grep -rn "id, username, email, password_hash, is_active, must_change_password, created_at, updated_at" src/`
+现在只剩常量定义那一行。
+
+实测（真实 HTTP）：
+- 修复前旧二进制：`GET /api/admin/export/users` → **HTTP 500**
+  `{"code":500,...,"message":"服务器内部错误"}`（底层 `no column found for name: must_change_password`）
+- 修复后：→ **HTTP 200**，`23555` 字节，`content-type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`，
+  magic `504b`，解出 10 个 zip entry、含 `sheet1`（真 xlsx，不是错误信封）
+
+### 已完成：第 2 项 — 承重守卫从「写端点」扩到「全部端点」
+
+新测试 `every_documented_endpoint_is_reachable_without_a_server_error`
+（`tests/api_integration.rs`，`#[ignore]`），从 `openapi_operations()` 派生**全部 50 个**端点
+（此前写端点守卫只派生 `POST|PUT|DELETE`；文档里 GET 有 22 个，一个都不在它视野里）。
+
+判据分层：
+- **GET（读端点）必须 2xx** —— 无必填请求体，带合法令牌就该跑通；4xx 同样是缺陷
+- **非 GET 只要不是 5xx** —— 发 `{}` 让它停在校验层（400），既走到处理函数入口又不改真实数据
+  （实测：20 个带体端点全 400；`DELETE /api/admin/{users,roles,menus,dict/types,dict/items}/{NIL}` 全 404，不误删）
+- 路径参数由文档派生：uuid 填 `VALID_UUID`（不存在的行），非 uuid 的 `{code}` 填 `NON_UUID_PARAM_PROBE`
+- 必填 query 参数也补（当前只有 `dict_type_id`），否则查询提取器先回 400，探针走不到处理函数
+- 自查断言（探针表可能整体失效）：`>=50` 总数、`>=22` 读、`>=28` 写
+
+两个有副作用的端点已处理：
+- `POST /api/auth/logout` 会让令牌失效 → 探针跑完**重新登录**换新令牌
+- `POST /api/admin/monitor/metrics/reset` 清空指标 → 无影响，每个读指标的用例自己先重置
+
+**两个踩过的坑（都靠编译器/自查抓住，不是猜的）**：
+1. 我最初把 50 个 `Request` 在循环前一次性构造好，每个都持有同一个旧令牌。
+   logout 一失效，后面按 `(method, path)` 排序的 `POST /api/auth/register` 与若干 PUT 全 401 假红。
+   编译器报 `value assigned to token is never read` 暴露了它——已改成**发送时才构造**请求。
+2. 自查阈值我先写成 `write_count >= 30`，实际 28，测试当场红。已改为 22/28。
+
+缺陷注入验证（已做）：
+把 `demo.rs` 的 SQL 改回漏掉 `must_change_password` 的手写版 →
+```
+GET /api/admin/export/users 返回了 500 Internal Server Error：{"code":500,...}
+  · 处理函数内部出错，这正是 export/users 烂了七版的形态
+```
+测试红，报错直接点名端点。回滚后复跑绿。
+
+### 待做：第 3 项 — `operator_with_codes` 的 23 处泄漏
+
+`tests/api_integration.rs:2779` 的 `operator_with_codes` 返回 `(token, role_id, user_id)`，
+但 23 个调用点无一清理，测试库累积 270 角色 / 424 用户。
+需加 `cleanup_operator` 并在 23 处调用。相关注释在 `:1799`、`:3429`、`:5460`。
+
+### 待做：第 4 项 — 用户名/邮箱大小写归一 + 迁移（风险最高）
+
+缺口实测（真实 HTTP）：
+```
+注册 CaseProbe → 200 / 注册 caseprobe → 200   ★两个独立账号
+建角色 CaseRole → 200（归一成 caserole）/ 建角色 caserole → 409
+```
+Postgres `UNIQUE(username)` 大小写敏感 → `Admin`/`ADMIN`/`aDmIn` 可与真 `admin` 并存，
+自助注册即可造出，用户列表肉眼无法区分。邮箱同理。
+
+要做：
+- 归一函数照抄 `src/model/role.rs:41` 的 `normalize_role_name` 形状（trim + 小写）
+- 唯一性检查改成归一后比较
+- 迁移必须**报出冲突而非静默合并**（静默合并会丢权限）。
+  参考 `migrations/008_normalize_role_names.sql`：它用 `NOT EXISTS` 跳过冲突行而非让迁移失败
+
+### 已确认**不是**缺口（别重复排查）
+
+分页校验扎实（`page_size>200`/`page<=0` 都指名 400）；SQL 注入不成立
+（`get_order_sql()` 有 `allowed_fields` 白名单）；级联删除到位；空白用户名被字符集规则挡下；
+并发写后写胜出无乐观锁（可接受，不动）。
+
+### 环境注意
+
+轮次之间后端与 vite 进程会被重置。后端 session 用 exec 长驻方式启动（`nohup` 会被回收）。
+必须带 `RATE_LIMIT_IP_MAX=100000` / `RATE_LIMIT_USER_MAX=100000`，否则整轮 e2e 因限流假红。
+JWT 密钥在 `/tmp/axum_jwt_secret.txt`。文档端点总数是 **50**，不是早前 handoff 里写的 39。
