@@ -3,6 +3,76 @@
 本文件是跨会话的交接日志。任何非平凡改动在**动手前**先写这里，达成里程碑后更新。
 接手者必须先把它与 `git status` / `git diff` / 实际文件系统对账。
 
+## v0.20.0 规划（2026-10-03 会话 · 当前）
+
+### 当前目标
+
+**只做规划，不写实现代码。** 交付物是 `docs/ROADMAP.md`（v0.20.0 / v0.21.0 / v0.22.0 三段路线）。
+
+v0.19.0 已推送，但**发布元数据是缺的**——版号仍是 `0.18.0`，没有 v0.19.0 的 tag、
+CHANGELOG 条目或 Release。用户当时只说"推送"没说"发布"，所以没动。
+**v0.20.0 开工前要先决定**：是补齐 v0.19.0 的发布元数据，还是在 v0.20.0 里一并抬到 0.20.0。
+这不是小事——tag 缺失会让 `git describe` 失效，CI 的版本注入也会继续报 0.18.0。
+
+### 当前计划
+
+| 步骤 | 内容 | 状态 |
+|---|---|---|
+| 0 | 接手 v0.19.0 推送后的会话，对账 git / 交接 / 文件系统 | ✅ |
+| 1 | 复核缺口证据（跳过 v0.19.0 已排查项） | ✅ |
+| 2 | 写 `docs/ROADMAP.md` 三段路线 + 每条线的风险与依赖 | ✅ |
+| 3 | 在 `NEXT_VERSION_SCOPE.md` 顶部加失效指引（保留 v0.2.0 历史，不删） | ✅ |
+| 4 | **等指令后才动手写实现** | ⏸ |
+
+### 起始 git 状态
+
+- 分支 `master`，工作区干净，`HEAD == origin/master == 7f4d5dbb`
+- tag 最高是 `v0.16.0`（v0.9.0–v0.16.0 有 tag，v0.17.0 起没有）
+- `Cargo.toml` / `frontend/package.json` 都是 `0.18.0`
+- 规模：src 12,221 行 / frontend 10,417 行 / 集成测试 227 个函数
+
+### 本轮复核过的证据（可直接引用，别重排）
+
+| 结论 | 证据 |
+|---|---|
+| 用户**不能自助改资料** | `/api/auth/*` 只有 `password` 是 PUT（router/mod.rs:152），**无 profile 端点**；`profile/index.vue` 只有三个改密字段；`users` 表无 nickname/avatar/display_name |
+| 文件上传是**悬空 affordance** | 前端 `BaseUpload.vue` 完整可用且已导出（components/common/index.ts:11），但**无人使用**；后端 `axum` 只开 `features=["macros"]` **没开 multipart**，无上传端点，`tower-http` 只开 cors/trace/set-header **没开 fs**；`demo/index.vue:60` 自己写着"BaseUpload 暂时不在这里演示" |
+| **无在线会话登记** | 登录成功后**不写**任何会话记录，jti 只在登出时进黑名单（`service/auth.rs:366`）。Redis 有 `revoke_user_sessions`（按 user 整体吊销）与 `delete_by_prefix`，但没有"列出谁在线"的数据 |
+| **锁定后管理员无法解锁** | `clear_login_failures(scope)` 唯一调用点在登录成功分支（`service/auth.rs:331`），无 admin 解锁入口。锁 TTL = `LOGIN_FAILURE_WINDOW` 默认 300s，自过期 |
+| 用户列表筛选维度窄 | `list_users` 只收 `page/page_size/keyword`，keyword 同时匹配 username+email（`controller/user.rs` utoipa 参数表）。无按角色/状态筛选 |
+| 权限码需新增 | `model/permission.rs` 29 个 const，用户域只有 `system:user:{list,create,update,delete}`。解锁/会话管理都要新码，且会被 `every_admin_handler_declares_a_permission_guard` 自动纳入守卫检查 |
+
+新增 admin handler 会被 `every_admin_handler_declares_a_permission_guard`（tests/api_integration.rs:2657）自动覆盖；
+新端点会被 `every_documented_endpoint_is_reachable_without_a_server_error`（从 openapi 派生 50 端点）自动纳入。
+**写新端点时不要绕过这两条测试。**
+
+### 本轮确认**不是**缺口（v0.19.0 已闭环，别再写进计划）
+
+前端 GET 缓存无用户维度（`requestCache.invalidate()` 在登录成功 / 401 / 任何非 GET 后都调了）；
+审计只记写操作（middleware 对所有方法都写）；"记住密码"存明文（只存 `{ username }`）。
+
+### 里程碑：规划交付完成（未写任何实现代码）
+
+**改了什么**：`docs/ROADMAP.md` 新建（156 行）；`NEXT_VERSION_SCOPE.md` 顶部加封存指引（**历史内容保留未删**）；
+本文件头部加本节。
+
+**v0.20.0 结论**：主题定为「账号自持 + 管理可应急」，6 项 = A 线自助（profile 端点 / 列表按角色状态筛选 /
+头像上传）+ B 线应急（管理员解锁 / 在线会话列举与单吊销 / CSV 批量导入）。
+顺序 M0 发布元数据 → M1 迁移 014 → M2+M3 并行 → M4 会话 → M5 头像上传（放最后，动基础设施）→ M6 前端与门禁。
+
+**两处需要用户拍板的**：
+1. v0.19.0 的 tag / CHANGELOG / 版号要不要补。倾向补到 0.20.0 一起抬。
+2. 头像存储选型。本计划建议本版走**本地磁盘 + `tower-http` ServeDir**，对象存储抽象推到 v0.22.0。
+
+**下一步**：等指令。未获指令前不写实现代码。按用户既有规矩，本地提交后**不推送**。
+
+### 长驻进程（轮次间会被重置，需要时重新起）
+
+- 后端 `127.0.0.1:8080` 跑 `axum_api_manual` 演示库，env 在 `/tmp/v019/demo.env`
+- 前端 vite `127.0.0.1:3000` 代理到 8080；账号 `admin/admin123`
+- PG 55432 / Redis 56379。必须带 `RATE_LIMIT_IP_MAX=100000` / `RATE_LIMIT_USER_MAX=100000`，否则整轮 e2e 因限流假红
+- 集成测试须 `--test-threads=1`
+
 ## 当前目标
 
 发布 **v0.4.0：把 `menus.permission` 从元数据变成真正的权限码**。

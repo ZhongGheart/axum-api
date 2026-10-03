@@ -1,3 +1,7 @@
+> **⚠ 本文件已封存（2026-10-03）**
+> 这是 v0.2.0 的历史执行记录，内容与当前代码（v0.19.0）已完全脱节，**不要再当作现状参考**。
+> 前瞻性开发计划已迁移到 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
+
 # Axum Admin 下一版本（v0.2.0）最优改进范围评估
 
 > 评估对象：https://github.com/ZhongGheart/axum-api.git
