@@ -81,6 +81,7 @@ node e2e/probe-write-guards.mjs
 | `v010-ui-truth.mjs` | 新增筛选控件与分页必须真的生效（v0.10.0） |
 | `v011-audit-and-password.mjs` | 登录审计在日志页看得见、受限令牌被界面拦住、界面表单改密（v0.11.0） |
 | `v013-audit-change-summary.mjs` | 「变更摘要」列在界面与导出 xlsx 里都读得到、口令不入库（v0.13.0） |
+| `v014-retention-honesty.mjs` | 日志页如实说明保留天数与现存最早一条、筛到已清理区间时提示（v0.14.0） |
 
 ## 加新套件
 

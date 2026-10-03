@@ -275,7 +275,7 @@ impl AuditLogRepository {
         Ok((rows, truncated))
     }
 
-    /// 删除 `cutoff` 之前的日志，返回实际删除行数
+    /// 删除 `cutoff` 之前的日志，返回删除行数与是否因上限提前收手
     ///
     /// **分批**删除，而不是一条 `DELETE FROM audit_logs WHERE created_at < $1`：
     /// 一次性删几十万行会长时间持锁并把 WAL 撑爆，期间其他事务只能干等。
@@ -283,14 +283,20 @@ impl AuditLogRepository {
     ///
     /// 子查询按 `created_at` 升序取最旧的一批，
     /// 正好反向扫描 `idx_audit_logs_created`，不必全表排序。
+    ///
+    /// `hit_batch_limit` 区分"清干净了"与"撞上限收手"：撞上限时
+    /// `cutoff_at` **之后**可能还有过期行留在库里。不报这个区别，
+    /// 就会把"还有更多过期数据没清"当成"已经清干净了"，
+    /// 而这正是保留策略最需要如实告知的那件事。
     pub async fn delete_older_than(
         &self,
         cutoff: DateTime<Utc>,
         batch_size: i64,
         max_batches: u32,
-    ) -> Result<u64, AppError> {
+    ) -> Result<PurgeOutcome, AppError> {
         let batch_size = batch_size.max(1);
         let mut total_deleted: u64 = 0;
+        let mut hit_batch_limit = false;
 
         for _ in 0..max_batches {
             let deleted = sqlx::query(
@@ -312,10 +318,104 @@ impl AuditLogRepository {
 
             total_deleted += deleted;
             if deleted < batch_size as u64 {
+                // 没删满说明已删到 cutoff 附近，属于清干净了
                 break;
             }
+            // 每一批都恰好删满，且循环还有下一轮 —— 说明还有过期行没轮到
+            hit_batch_limit = true;
         }
 
-        Ok(total_deleted)
+        Ok(PurgeOutcome {
+            deleted: total_deleted,
+            hit_batch_limit,
+        })
     }
+
+    /// 把一轮清理记进 `audit_log_purges`，让"日志被清掉了"这件事本身可查
+    pub async fn record_purge(
+        &self,
+        cutoff_at: DateTime<Utc>,
+        outcome: &PurgeOutcome,
+        duration_ms: i32,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            r#"
+            INSERT INTO audit_log_purges
+                (cutoff_at, deleted_rows, duration_ms, hit_batch_limit)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(cutoff_at)
+        .bind(outcome.deleted as i64)
+        .bind(duration_ms)
+        .bind(outcome.hit_batch_limit)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("记录审计清理动作失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 最近一次清理记录（`None` 表示启用保留策略后一次都还没删过）
+    pub async fn latest_purge(&self) -> Result<Option<AuditLogPurge>, AppError> {
+        let row = sqlx::query_as::<_, (DateTime<Utc>, i64, DateTime<Utc>, Option<i32>, bool)>(
+            r#"
+            SELECT cutoff_at, deleted_rows, ran_at, duration_ms, hit_batch_limit
+            FROM audit_log_purges
+            ORDER BY ran_at DESC
+            LIMIT 1
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询最近清理记录失败: {e}")))?;
+
+        Ok(row.map(
+            |(cutoff_at, deleted_rows, ran_at, duration_ms, hit_batch_limit)| AuditLogPurge {
+                cutoff_at,
+                deleted_rows,
+                ran_at,
+                duration_ms,
+                hit_batch_limit,
+            },
+        ))
+    }
+
+    /// 现存日志里最老一条的时刻
+    ///
+    /// 这是"还能查到多早的数据"的真实答案。返回 `None` 表示表是空的——
+    /// 此时界面不能说"数据早到 X"，也不能说"数据都是最新的"，
+    /// 只能如实显示"暂无日志"。
+    pub async fn oldest_log_at(&self) -> Result<Option<DateTime<Utc>>, AppError> {
+        // `query_scalar` 而非 `query_as`：单值的可空结果用标量读更直白
+        let oldest: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT MIN(created_at) FROM audit_logs")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| AppError::InternalServerError(format!("查询最旧日志时刻失败: {e}")))?;
+        Ok(oldest)
+    }
+}
+
+/// 一轮清理的结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeOutcome {
+    /// 实际删除行数
+    pub deleted: u64,
+    /// 是否因达到单轮批数上限而提前收手
+    pub hit_batch_limit: bool,
+}
+
+/// `audit_log_purges` 的读出行
+#[derive(Debug, Clone)]
+pub struct AuditLogPurge {
+    /// 本轮删掉的行都早于该时刻
+    pub cutoff_at: DateTime<Utc>,
+    /// 删掉的行数
+    pub deleted_rows: i64,
+    /// 本轮执行时刻
+    pub ran_at: DateTime<Utc>,
+    /// 耗时（毫秒）
+    pub duration_ms: Option<i32>,
+    /// 是否因上限提前收手
+    pub hit_batch_limit: bool,
 }

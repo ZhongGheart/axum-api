@@ -616,6 +616,17 @@ async fn every_documented_route_is_implemented() {
 // ──────────────────────────────────────────────
 
 /// 测试库连接（直接操作数据，验证授权变更的效果）
+/// 确保迁移已应用，再让测试直接操作表
+///
+/// 迁移是由 `create_router` 触发的，所以**只有建过 app 的用例**才保证库里有表。
+/// 直接 `INSERT audit_logs` 的用例此前只在全量跑时成立——
+/// 字母序靠前的用例已经把库迁移过了。单跑其中一条就会撞
+/// `relation "audit_logs" does not exist`。
+/// 这类"靠别的用例先跑过"的前置依赖最难发现：全量绿，单独红。
+async fn ensure_schema() {
+    let _ = app().await;
+}
+
 async fn pool() -> sqlx::PgPool {
     sqlx::PgPool::connect(&test_database_url())
         .await
@@ -2622,6 +2633,7 @@ async fn snapshot_includes_deltas_that_have_not_been_flushed_yet() {
 #[tokio::test]
 #[ignore]
 async fn one_endpoint_stays_one_row_when_it_is_partly_flushed_and_partly_pending() {
+    ensure_schema().await;
     let probe = replica_collector().await;
     probe.reset().await;
 
@@ -2672,6 +2684,7 @@ async fn audit_log_exists(id: uuid::Uuid) -> bool {
 #[tokio::test]
 #[ignore]
 async fn audit_log_retention_removes_only_expired_rows() {
+    ensure_schema().await;
     let repo = AuditLogRepository::new(pool().await);
     let now = chrono::Utc::now();
     let cutoff = now - chrono::Duration::days(30);
@@ -2685,8 +2698,13 @@ async fn audit_log_retention_removes_only_expired_rows() {
         kept.push(insert_audit_log(now - chrono::Duration::days(10)).await);
     }
 
-    let deleted = repo.delete_older_than(cutoff, 10, 5).await.unwrap();
-    assert_eq!(deleted, 3, "只应删掉 3 条过期日志");
+    let outcome = repo.delete_older_than(cutoff, 10, 5).await.unwrap();
+    assert_eq!(outcome.deleted, 3, "只应删掉 3 条过期日志");
+    // 3 < 批大小 10，说明这一批就把过期行删尽了：不是"撞上限收手"
+    assert!(
+        !outcome.hit_batch_limit,
+        "删到不足一批即说明清干净了，不该报撞上限"
+    );
 
     for id in &expired {
         assert!(!audit_log_exists(*id).await, "过期日志 {id} 应已被删除");
@@ -2711,6 +2729,7 @@ async fn audit_log_retention_removes_only_expired_rows() {
 #[tokio::test]
 #[ignore]
 async fn audit_log_retention_deletes_in_bounded_batches() {
+    ensure_schema().await;
     let repo = AuditLogRepository::new(pool().await);
     let now = chrono::Utc::now();
     let cutoff = now - chrono::Duration::days(1);
@@ -2720,8 +2739,17 @@ async fn audit_log_retention_deletes_in_bounded_batches() {
         ids.push(insert_audit_log(now - chrono::Duration::days(5)).await);
     }
 
-    let deleted = repo.delete_older_than(cutoff, 10, 2).await.unwrap();
-    assert_eq!(deleted, 20, "两批 × 每批 10 条，不应超出 max_batches");
+    let outcome = repo.delete_older_than(cutoff, 10, 2).await.unwrap();
+    assert_eq!(
+        outcome.deleted, 20,
+        "两批 × 每批 10 条，不应超出 max_batches"
+    );
+    // 每一批都恰好删满 10 且用完了 2 批预算 —— 说明还有 5 条没轮到。
+    // 这个区别必须报出来，否则"还有更多过期数据没清"会被当成"已经清干净"。
+    assert!(
+        outcome.hit_batch_limit,
+        "两批都删满且预算用尽，应报撞上限提前收手"
+    );
 
     let p = pool().await;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE id = ANY($1)")
@@ -2732,8 +2760,12 @@ async fn audit_log_retention_deletes_in_bounded_batches() {
     assert_eq!(count, 5, "应正好剩 5 条待下一轮清理");
 
     // 放开批次上限后应能删干净
-    let deleted = repo.delete_older_than(cutoff, 10, 5).await.unwrap();
-    assert_eq!(deleted, 5);
+    let outcome = repo.delete_older_than(cutoff, 10, 5).await.unwrap();
+    assert_eq!(outcome.deleted, 5);
+    assert!(
+        !outcome.hit_batch_limit,
+        "最后一批只剩 5 条、不满批，说明这次是真删干净了"
+    );
     assert!(!audit_log_exists(ids[0]).await, "清理完后不应有残留");
 
     sqlx::query("DELETE FROM audit_logs WHERE id = ANY($1)")
@@ -7375,4 +7407,211 @@ fn every_documented_write_operation_is_covered_by_the_audit_test() {
             "覆盖清单里的 {endpoint} 已不在文档里，请删掉这条覆盖"
         );
     }
+}
+
+// ============================================================
+// v0.14.0：审计会过期，但没人被告知
+// ============================================================
+
+/// 保留策略接口必须报告**当前部署的真实配置**，而不是一个写死的默认值
+///
+/// 回归的是 v0.14.0 的起点：`AUDIT_LOG_RETENTION_DAYS`（默认 90）会
+/// 无条件删除过期审计行，而这件事此前只有进程 stdout 的一行
+/// `tracing::info!`。界面查不到、接口查不到、README 也没写——
+/// 于是"日志从某天起就查不到了"与"那天什么都没发生过"在管理员眼里
+/// 完全一样，这个歧义本身就是审计的失效。
+#[tokio::test]
+#[ignore]
+async fn the_retention_endpoint_reports_the_deployed_policy() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/audit-logs/retention", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+
+    let d = &body["data"];
+    // enabled 与 retention_days 必须自洽：不能一边说启用一边报 0 天
+    let days = d["retention_days"]
+        .as_i64()
+        .expect("retention_days 必须是数字");
+    assert_eq!(
+        d["enabled"].as_bool(),
+        Some(days > 0),
+        "enabled 与 retention_days 互相矛盾：enabled={} days={days}",
+        d["enabled"]
+    );
+    assert!(days > 0, "测试配置默认 90 天保留，不该为 0");
+    assert!(
+        d["oldest_log_at"].is_string(),
+        "库里有日志，最老时刻应为字符串"
+    );
+    assert_eq!(
+        d["cleanup_interval_seconds"].as_u64(),
+        Some(3600),
+        "清理间隔应当来自配置而不是写死"
+    );
+}
+
+/// 一轮清理必须**自己留痕**，否则"日志为什么少了"只能在服务器日志里找
+///
+/// 判据是数据侧：清理跑完后 `audit_log_purges` 里真的有那一行，
+/// 且接口能把 `cutoff_at` 与 `deleted_rows` 报出来。
+/// 只断言"日志确实被删了"是不够的——删对了但不记，
+/// 与本版之前的行为完全一样（那正是缺陷本身）。
+#[tokio::test]
+#[ignore]
+async fn a_purge_is_recorded_so_the_deletion_can_be_found() {
+    ensure_schema().await;
+    let repo = AuditLogRepository::new(pool().await);
+    let now = chrono::Utc::now();
+    let cutoff = now - chrono::Duration::days(30);
+
+    // 记录清理前的 purge 数量，便于结束时判定"确实是新写的这一行"
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log_purges")
+        .fetch_one(&pool().await)
+        .await
+        .unwrap();
+
+    let mut expired = Vec::new();
+    for _ in 0..4 {
+        expired.push(insert_audit_log(now - chrono::Duration::days(40)).await);
+    }
+    let kept = insert_audit_log(now - chrono::Duration::days(5)).await;
+
+    let outcome = repo.delete_older_than(cutoff, 10, 5).await.unwrap();
+    assert_eq!(outcome.deleted, 4, "应删掉 4 条过期日志");
+    repo.record_purge(cutoff, &outcome, 7).await.unwrap();
+
+    for id in &expired {
+        assert!(!audit_log_exists(*id).await, "过期日志 {id} 应已被删除");
+    }
+    assert!(audit_log_exists(kept).await, "保留期内的日志不该被删");
+
+    // 留痕本身可查：接口要能报出刚发生的那一轮
+    let latest = repo
+        .latest_purge()
+        .await
+        .unwrap()
+        .expect("清理后应有 purge 记录");
+    assert_eq!(latest.deleted_rows, 4);
+    assert!(
+        !latest.hit_batch_limit,
+        "4 < 批大小 10，属清干净，不该报撞上限"
+    );
+    // cutoff 必须与实际删除用的是同一个值——否则界面显示的"从哪天起没了"是假的
+    let trimmed: chrono::DateTime<chrono::Utc> = cutoff;
+    assert_eq!(
+        latest.cutoff_at.timestamp(),
+        trimmed.timestamp(),
+        "留痕的 cutoff 必须与删除用的是同一个时刻"
+    );
+
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log_purges")
+        .fetch_one(&pool().await)
+        .await
+        .unwrap();
+    assert_eq!(after, before + 1, "应恰好新增一行清理记录");
+
+    sqlx::query("DELETE FROM audit_logs WHERE id = $1")
+        .bind(kept)
+        .execute(&pool().await)
+        .await
+        .unwrap();
+}
+
+/// 撞上单轮批数上限时必须**如实报告**，不能让人以为已经清干净
+///
+/// 这是本版最容易说谎的一处：删了 20 条、还剩 5 条过期数据时，
+/// 若只报"删了 20 条"，管理员会认为"清理已经完成"，
+/// 而下一轮之前那 5 条其实一直躺在库里。
+#[tokio::test]
+#[ignore]
+async fn a_purge_that_stops_at_the_batch_limit_says_so() {
+    ensure_schema().await;
+    let repo = AuditLogRepository::new(pool().await);
+    let now = chrono::Utc::now();
+    let cutoff = now - chrono::Duration::days(1);
+
+    let mut ids = Vec::new();
+    for _ in 0..12 {
+        ids.push(insert_audit_log(now - chrono::Duration::days(5)).await);
+    }
+
+    // 批大小 10、上限 1 批 → 删满 10 条且预算用尽
+    let outcome = repo.delete_older_than(cutoff, 10, 1).await.unwrap();
+    assert_eq!(outcome.deleted, 10);
+    assert!(
+        outcome.hit_batch_limit,
+        "删满一批且预算耗尽，必须报撞上限——否则 2 条残留会被当成已清干净"
+    );
+    repo.record_purge(cutoff, &outcome, 5).await.unwrap();
+
+    let latest = repo.latest_purge().await.unwrap().unwrap();
+    assert!(latest.hit_batch_limit, "接口层也必须把这个事实透出去");
+
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_logs WHERE id = ANY($1)")
+        .bind(&ids)
+        .fetch_one(&pool().await)
+        .await
+        .unwrap();
+    assert_eq!(left, 2, "确实还有 2 条过期数据留在库里");
+
+    sqlx::query("DELETE FROM audit_logs WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(&pool().await)
+        .await
+        .unwrap();
+}
+
+/// 保留策略接口不得越权，且要真放行持码者
+///
+/// 复用 `system:log:list` 而不是新增权限码，因此必须验证
+/// "有码能看、没码看不到"两侧都成立。只测拒绝侧的话，
+/// 一个"把端点整个禁掉"的实现也能全绿。
+#[tokio::test]
+#[ignore]
+async fn the_retention_endpoint_obeys_the_log_permission() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    // 放行侧：只持 system:log:list 的操作员能看，且真的拿到数据
+    let (tok, role_id, uid) =
+        operator_with_codes(&app, &admin, "retention_ok", &[permission::LOG_LIST]).await;
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/audit-logs/retention", Some(&tok), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "持 log:list 应放行，body={body}");
+    assert!(
+        body["data"]["retention_days"].is_number(),
+        "放行侧要真的拿到数据：200 但 body 里没有策略也算坏"
+    );
+
+    // 拒绝侧：匿名看不到
+    let (status, _) = send(
+        &app,
+        request("GET", "/api/admin/audit-logs/retention", None, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "匿名不该看到保留策略");
+
+    delete_user_via_api(&app, &admin, uid).await;
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/roles/{role_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理测试角色失败: {body}");
 }

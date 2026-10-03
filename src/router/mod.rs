@@ -13,7 +13,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 // Swagger UI 通过前端 iframe + CDN 渲染
 
-use crate::config::Config;
+use crate::config::{AuditLogConfig, Config};
 use crate::controller::{auth, demo, dict, menu, monitor, rbac, role, user};
 use crate::docs::swagger_ui_handler;
 use crate::error::AppError;
@@ -44,6 +44,12 @@ pub struct AppState {
     pub audit_log_repo: AuditLogRepository,
     pub db_pool: DatabasePool,
     pub metrics_collector: Arc<MetricsCollector>,
+    /// 审计日志保留策略（v0.14.0）
+    ///
+    /// 必须放在 `AppState` 而不是让控制器去读环境变量：接口要**如实报告**
+    /// 当前部署的真实保留天数，而重新读一次环境变量在测试里可能被改过、
+    /// 或在多副本部署下与实际跑的清理任务不一致。
+    pub audit_log_config: AuditLogConfig,
 }
 
 /// 构建应用路由
@@ -104,6 +110,7 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         audit_log_repo,
         db_pool,
         metrics_collector: metrics_collector.clone(),
+        audit_log_config: config.audit_log.clone(),
     };
 
     // ── 配置 CORS ──────────────────────────────────────────────
@@ -278,6 +285,12 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         .route(
             "/api/admin/audit-logs",
             axum::routing::get(demo::list_audit_logs),
+        )
+        // 必须排在 `/api/admin/audit-logs` 之后、且两者路径不冲突：
+        // axum 0.8 的 `{id}` 语法已不支持通配尾段，这里的路径是静态的
+        .route(
+            "/api/admin/audit-logs/retention",
+            axum::routing::get(demo::audit_log_retention),
         )
         .route(
             "/api/admin/logs/audit/export",

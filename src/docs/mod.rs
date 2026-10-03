@@ -67,6 +67,7 @@ use utoipa::OpenApi as _;
         crate::controller::demo::export_users,
         crate::controller::demo::validate_test,
         crate::controller::demo::list_audit_logs,
+        crate::controller::demo::audit_log_retention,
         crate::controller::demo::export_audit_logs,
         crate::controller::monitor::system_info,
         crate::controller::monitor::api_metrics,

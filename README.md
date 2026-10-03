@@ -193,6 +193,17 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | `TRUST_PROXY_HEADERS` | 否 | `false` | 是否信任 `X-Forwarded-For`（仅置于可信代理后时开启） |
 | `LOGIN_MAX_FAILURES` | 否 | `10` | 登录失败锁定阈值 |
 | `LOGIN_FAILURE_WINDOW` | 否 | `300` | 登录失败计数窗口（秒） |
+| `AUDIT_LOG_RETENTION_DAYS` | 否 | `90` | 操作日志保留天数。**超期行会被后台任务无条件删除**，设为 `0` 关闭自动清理（改由运维自行处理） |
+| `AUDIT_LOG_CLEANUP_INTERVAL_SECONDS` | 否 | `3600` | 清理任务的运行间隔（秒） |
+| `AUDIT_LOG_CLEANUP_BATCH_SIZE` | 否 | `10000` | 单批删除行数上限：把长事务切碎，避免长时间持锁与 WAL 膨胀 |
+| `AUDIT_LOG_CLEANUP_MAX_BATCHES` | 否 | `20` | 单轮清理最多执行多少批，删空即提前结束 |
+
+⚠️ **保留策略不是只写在文档里**：`GET /api/admin/audit-logs/retention` 会返回
+当前部署的真实保留天数、现存最早一条日志的时刻，以及最近一次清理的
+`cutoff_at` / 删除行数 / 是否撞上批数上限。系统日志页顶部也如实展示这些。
+原因是 v0.13.0 起「改了什么」这一层**只存在 `audit_logs.result`**，
+删掉的不只是流水，而是复盘能力本身——而"日志为什么从某天起就查不到了"
+与"那天什么都没发生过"在管理员眼里必须能被区分开。
 
 前端（`frontend/.env.*`）：
 
@@ -299,7 +310,11 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 # 后端集成测试（真实 Postgres + Redis，无需 Docker）
 scripts/test_env.sh start
 eval "$(scripts/test_env.sh env)"
-cargo test --test api_integration -- --ignored --test-threads=1
+# ⚠️ 两组都要跑。只跑 `--ignored` 那组会漏掉 8 条——v0.12.0 的门禁正是这么漏的，
+#    当时"集成 103 全绿"里含一条实际为红的用例。--test-threads=1 不可省：
+#    这些用例共用同一个测试库，并发跑会互相污染。
+cargo test --test api_integration -- --test-threads=1              # 非 ignored 组
+cargo test --test api_integration -- --ignored --test-threads=1   # 需要真实依赖的组
 scripts/test_env.sh stop
 
 # 前端

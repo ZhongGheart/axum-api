@@ -6,6 +6,39 @@
       </template>
     </n-page-header>
 
+    <!--
+      保留策略如实说明（v0.14.0）。
+      此前"日志会被定期清理"这件事只存在于服务端 stdout 的一行日志里，
+      界面上一个字都没有：筛一个 3 个月前的日期范围，什么都查不到，
+      而管理员无从判断这是"那天什么都没发生"还是"发生过但被清了"。
+      两种解释导向完全相反的处置，这个歧义本身就是审计的失效。
+    -->
+    <n-alert
+      v-if="retention"
+      type="info"
+      :bordered="false"
+      style="margin-bottom:12px"
+    >
+      <div class="retention-line">
+        <span>{{ retentionText }}</span>
+        <span v-if="purgeText" class="retention-sub">{{ purgeText }}</span>
+      </div>
+    </n-alert>
+
+    <!--
+      筛到的范围早于现存最老一条时必须说清：空结果不代表"没发生过"，
+      很可能只是那段数据已被清理掉。这个提示只在**真的会遮住数据**时出现。
+    -->
+    <n-alert
+      v-if="rangeBelowRetention"
+      type="warning"
+      :bordered="false"
+      style="margin-bottom:12px"
+    >
+      所选时间范围早于现存最老一条日志（{{ formatTime(retention!.oldest_log_at) }}），
+      该区间内的日志可能已被保留策略清理，空结果不代表那段时间没有操作。
+    </n-alert>
+
     <n-card>
       <!-- 筛选栏 -->
       <n-space style="margin-bottom:12px" align="center" wrap>
@@ -44,11 +77,17 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, h } from 'vue'
+import { computed, ref, reactive, onMounted, h } from 'vue'
 import { NTag } from 'naive-ui'
 import type { DataTableColumn } from 'naive-ui'
 import { auditApi } from '@/api/audit'
-import type { AuditLogItem, AuditLogListParams } from '@/api/audit'
+import type { AuditLogItem, AuditLogListParams, AuditRetentionInfo } from '@/api/audit'
+import {
+  describePurge,
+  describeRetention,
+  formatTime,
+  rangeStartsBeforeOldest,
+} from '@/utils/auditRetention'
 import { showSuccess, showError, showWarning } from '@/utils/message'
 import { PERM } from '@/constants/permission'
 
@@ -64,6 +103,11 @@ const filters = reactive({
   status_code: null as number | null,
   range: null as [number, number] | null,
 })
+
+// 保留策略。取不到时保持 `null`，界面**不显示任何说明**——
+// 宁可不说，也不能显示一个猜出来的"保留 90 天"：
+// 那正是本版要消灭的"界面说谎"。
+const retention = ref<AuditRetentionInfo | null>(null)
 
 const statusOptions = [
   { label: '200 成功', value: 200 },
@@ -129,6 +173,31 @@ const columns: DataTableColumn[] = [
   },
 ]
 
+// 文案与判定都在 `utils/auditRetention` 里：这两件事很容易在边界情况下
+// 说错话，而放在 SFC 里就只能靠截图验——截图看不出措辞对不对
+const retentionText = computed(() => describeRetention(retention.value))
+const purgeText = computed(() => describePurge(retention.value))
+
+/**
+ * 所选范围是否早于现存最老一条
+ *
+ * 按**范围起点**判定，而不是"结果为空时才提示"：
+ * 范围 [3 个月前, 今天] 在只剩 1 个月日志时仍会返回非空结果，
+ * 但那 2 个月的数据一样是缺的。只在空结果时才提示的话，
+ * 用户会拿到一份"看起来查到了"的子集，而这正是最难发现的漏查。
+ */
+const rangeBelowRetention = computed(() =>
+  rangeStartsBeforeOldest(filters.range, retention.value?.oldest_log_at ?? null))
+
+async function fetchRetention() {
+  try {
+    retention.value = await auditApi.retention()
+  } catch {
+    // 拿不到就不显示：宁可少说一句，不可说错
+    retention.value = null
+  }
+}
+
 async function fetchLogs() {
   loading.value = true
   try {
@@ -167,5 +236,22 @@ async function handleExport() {
   } catch { showError('导出失败') }
 }
 
-onMounted(fetchLogs)
+onMounted(() => {
+  fetchRetention()
+  fetchLogs()
+})
 </script>
+
+<style scoped>
+.retention-line {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* 次要那行用次要颜色，不与主信息抢注意力，但也不能弱到读不清 */
+.retention-sub {
+  opacity: 0.75;
+  font-size: 12px;
+}
+</style>

@@ -41,6 +41,42 @@ export interface AuditLogListParams {
   end_time?: string
 }
 
+/**
+ * 保留策略的一轮清理（v0.14.0）
+ *
+ * 此前这个信息只存在于服务端 stdout 的一行 `tracing::info!`：
+ * 界面查不到、接口查不到。于是"日志从某天起就查不到了"与
+ * "那天什么都没发生过"在管理员眼里完全一样——这个歧义本身就是审计的失效。
+ */
+export interface AuditPurgeInfo {
+  /** 本轮删掉的行都早于该时刻 */
+  cutoff_at: string
+  deleted_rows: number
+  ran_at: string
+  duration_ms: number | null
+  /**
+   * 是否因达到单轮批数上限而提前收手
+   *
+   * 为 true 表示**仍有过期行留在库里**，下一轮才会继续删。
+   * 不报这个区别，"还有更多过期数据没清"就会被当成"已经清干净了"。
+   */
+  hit_batch_limit: boolean
+}
+
+/** 审计日志保留策略（v0.14.0） */
+export interface AuditRetentionInfo {
+  /** 是否启用自动清理 */
+  enabled: boolean
+  /** 保留天数；0 表示不自动清理 */
+  retention_days: number
+  /** 清理任务运行间隔（秒） */
+  cleanup_interval_seconds: number
+  /** 现存日志中最老一条的时刻；null 表示表为空 */
+  oldest_log_at: string | null
+  /** 最近一次清理记录；null 表示启用以来一次都没删过 */
+  latest_purge: AuditPurgeInfo | null
+}
+
 /** 导出结果：除了文件本身，还带回截断状态 */
 export interface AuditExportResult {
   blob: Blob
@@ -59,6 +95,16 @@ export const auditApi = {
     // 仍然是 AxiosResponse<T>。这里把类型和运行时对齐，
     // 免得每个调用点各写一遍 `as unknown as`——那种写法正是"类型在撒谎"的温床。
     return http.get('/admin/audit-logs', { params }) as unknown as Promise<PageResult<AuditLogItem>>
+  },
+
+  /**
+   * GET /api/admin/audit-logs/retention
+   *
+   * 界面据此如实说明"还能查到多早的数据"，而不是让人自己撞上
+   * 一个查不到任何结果的日期范围、去怀疑那天是不是真的什么都没发生。
+   */
+  retention(): Promise<AuditRetentionInfo> {
+    return http.get('/admin/audit-logs/retention') as unknown as Promise<AuditRetentionInfo>
   },
 
   /**

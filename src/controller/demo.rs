@@ -328,7 +328,88 @@ pub async fn export_audit_logs(
 /// 所以截断状态随响应头返回（见 handler 里的 `x-export-truncated`）。
 pub const EXPORT_MAX_ROWS: i64 = 10_000;
 
-/// GET /api/admin/audit-logs — 查询操作日志（分页）
+/// 保留策略的对外说明（v0.14.0）
+///
+/// 每一项都刻意取**当前部署的真实值**，不让调用方去猜：
+/// - `enabled=false` 时 `retention_days` 就是 0，界面必须显示"不自动清理"
+///   而不是显示一个 0 天然后让人以为"日志随时都会被清光"
+/// - `oldest_log_at` 是"还能查到多早的数据"的真实答案；
+///   `None` 表示表是空的，界面此时不能说"数据早到 X"，也不能说"都是最新的"
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct AuditRetentionInfo {
+    /// 是否启用自动清理
+    pub enabled: bool,
+    /// 保留天数；`0` 表示不自动清理
+    pub retention_days: u32,
+    /// 清理任务运行间隔（秒）
+    pub cleanup_interval_seconds: u64,
+    /// 现存日志中最老一条的时刻；`null` 表示表为空
+    pub oldest_log_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 最近一次清理记录；`null` 表示启用以来一次都没删过
+    pub latest_purge: Option<AuditPurgeInfo>,
+}
+
+/// 一轮清理的对外说明
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct AuditPurgeInfo {
+    /// 本轮删掉的行都早于该时刻
+    pub cutoff_at: chrono::DateTime<chrono::Utc>,
+    /// 删掉的行数
+    pub deleted_rows: i64,
+    /// 本轮执行时刻
+    pub ran_at: chrono::DateTime<chrono::Utc>,
+    /// 耗时（毫秒）
+    pub duration_ms: Option<i32>,
+    /// 是否因达到单轮批数上限而提前收手
+    ///
+    /// 为 `true` 表示**仍有过期行留在库里**，下一轮才会继续删。
+    /// 不报这个区别，"还有更多过期数据没清"就会被当成"已经清干净了"。
+    pub hit_batch_limit: bool,
+}
+
+/// GET /api/admin/audit-logs/retention — 审计日志保留策略
+///
+/// 此前这个信息**只存在于进程 stdout 的一行 `tracing::info!`**：
+/// 界面查不到、接口查不到、README 也没写。于是"日志从某天起就查不到了"
+/// 与"那天什么都没发生过"在管理员眼里完全一样——这个歧义本身就是审计的失效。
+///
+/// 复用 `system:log:list` 权限码而不是新增一个：看清"还能查到多早的数据"
+/// 所需的信息量与看日志列表相同，不该因为多一个只读端点就多授一个码。
+#[utoipa::path(
+    get,
+    path = "/api/admin/audit-logs/retention",
+    tag = "操作日志",
+    security(("bearer_auth" = [])),
+    responses((status = 200, description = "审计日志保留策略与最近一次清理", body = ApiResponse<AuditRetentionInfo>))
+)]
+pub async fn audit_log_retention(
+    State(state): State<AppState>,
+    _perm: PermLogList,
+) -> Result<Json<ApiResponse<AuditRetentionInfo>>, AppError> {
+    let cfg = &state.audit_log_config;
+    let oldest_log_at = state.audit_log_repo.oldest_log_at().await?;
+    let latest_purge = state
+        .audit_log_repo
+        .latest_purge()
+        .await?
+        .map(|p| AuditPurgeInfo {
+            cutoff_at: p.cutoff_at,
+            deleted_rows: p.deleted_rows,
+            ran_at: p.ran_at,
+            duration_ms: p.duration_ms,
+            hit_batch_limit: p.hit_batch_limit,
+        });
+
+    Ok(Json(ApiResponse::success(AuditRetentionInfo {
+        enabled: cfg.retention_days > 0,
+        retention_days: cfg.retention_days,
+        cleanup_interval_seconds: cfg.cleanup_interval_seconds,
+        oldest_log_at,
+        latest_purge,
+    })))
+}
+
+// GET /api/admin/audit-logs — 查询操作日志（分页）
 #[utoipa::path(
     get,
     path = "/api/admin/audit-logs",

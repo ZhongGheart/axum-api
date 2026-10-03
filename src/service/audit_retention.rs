@@ -61,23 +61,50 @@ pub fn spawn_audit_retention(pool: PgPool, cfg: AuditLogConfig) -> Option<AuditR
 }
 
 /// 执行一轮清理
+///
+/// **删了行就必须留痕**。删除动作本身要写进 `audit_log_purges`：
+/// 只有 `tracing::info!` 的话，"日志为什么从某个时间点起就查不到了"
+/// 这个问题管理员在界面上与接口上都答不出来，只能去翻进程 stdout。
+/// 而 v0.13.0 之后 `result` 是"改了什么"的唯一副本，
+/// 删掉的不只是流水，是复盘能力本身。
+///
+/// 留痕失败**不掩盖**删除已经发生的事实：`tracing::error!` 之后照常返回，
+/// 让运维从服务日志里看到"清理成功了但没记上"这个组合异常。
 async fn run_once(
     repo: &AuditLogRepository,
     cfg: &AuditLogConfig,
 ) -> Result<u64, crate::error::AppError> {
+    let started = std::time::Instant::now();
     let cutoff = Utc::now() - Duration::days(i64::from(cfg.retention_days));
-    let deleted = repo
+    let outcome = repo
         .delete_older_than(cutoff, cfg.cleanup_batch_size, cfg.cleanup_max_batches)
         .await?;
 
-    if deleted > 0 {
-        tracing::info!(
+    if outcome.deleted == 0 {
+        // 一行没删就不记：每轮都记只会把表变成噪声，
+        // 而"有清理发生过"才是需要被看见的事实
+        return Ok(0);
+    }
+
+    let duration_ms = i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
+    if let Err(e) = repo.record_purge(cutoff, &outcome, duration_ms).await {
+        // 删除已经提交，回滚不了；只能把异常暴露到服务日志
+        tracing::error!(
+            error = %e,
             截止时间 = %cutoff.to_rfc3339(),
-            删除行数 = deleted,
-            "已清理过期操作日志"
+            删除行数 = outcome.deleted,
+            "审计日志清理已生效，但留痕失败——该轮删除无法在界面上查到"
         );
     }
-    Ok(deleted)
+
+    tracing::info!(
+        截止时间 = %cutoff.to_rfc3339(),
+        删除行数 = outcome.deleted,
+        撞上限提前收手 = outcome.hit_batch_limit,
+        耗时毫秒 = duration_ms,
+        "已清理过期操作日志"
+    );
+    Ok(outcome.deleted)
 }
 
 /// 清理任务的句柄
