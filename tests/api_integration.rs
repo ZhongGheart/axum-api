@@ -6395,3 +6395,252 @@ fn password_length_bounds_match_the_frontend_copy() {
         "前端 PASSWORD_MAX_LEN 与后端不一致"
     );
 }
+
+// ──────────────────────────────────────────────
+// 错误响应格式统一（v0.12.0）
+// ──────────────────────────────────────────────
+
+/// 一个端点上要打的坏输入探针
+struct BadInputProbe {
+    /// 探针指向的端点，形如 `POST /api/admin/users`（用于失败信息）
+    endpoint: String,
+    /// 造出来的请求
+    req: Request<Body>,
+    /// 这条探针想证明什么
+    intent: &'static str,
+}
+
+/// 合法 UUID：路径探针要它**通过**解析，让请求能走到下一层
+const VALID_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// 列出 OpenAPI 文档里的每个操作 `(method, path, operation)`
+fn openapi_operations() -> Vec<(String, String, Value)> {
+    let doc = axum_api::docs::openapi_json();
+    let mut ops = Vec::new();
+    for (path, item) in doc["paths"].as_object().expect("OpenAPI 的 paths 应为对象") {
+        for (method, op) in item.as_object().expect("每个 path 应为操作表") {
+            ops.push((method.to_uppercase(), path.clone(), op.clone()));
+        }
+    }
+    // 只按 `(method, path)` 排：第三个元素是 `Value`，没有 `Ord`，
+    // 用 `sort()` 会在编译期要求整个三元组可比较
+    ops.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    ops
+}
+
+/// 该操作路径模板里 `format: uuid` 的参数名
+///
+/// 只认 uuid 是有意的：`{code}` 这类 `String` 参数传什么都解析得出来，
+/// 用非 UUID 去探它只会得到 200/404，测不到提取器。判据来自文档里的
+/// `schema.format`，不靠手写清单。
+fn uuid_path_params(op: &Value) -> Vec<String> {
+    op["parameters"]
+        .as_array()
+        .map(|params| {
+            params
+                .iter()
+                .filter(|p| p["in"] == "path" && p["schema"]["format"] == "uuid")
+                .filter_map(|p| p["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 把路径模板里的指定参数替换成给定值
+fn substitute(template: &str, names: &[String], value: &str) -> String {
+    names.iter().fold(template.to_string(), |acc, name| {
+        acc.replace(&format!("{{{name}}}"), value)
+    })
+}
+
+/// 构造带原始文本响应体的请求
+///
+/// 现有的 `request()` 收 `Value`，只能发合法 JSON；
+/// 而这里要故意发**解析不了的**字节（`{bad json`）和**错的** Content-Type，
+/// 所以另建一个入口。
+fn raw_request(
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    content_type: Option<&str>,
+    body: &str,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(Body::from(body.to_string()))
+        .expect("构造请求失败")
+}
+
+/// 发送并把响应的 **Content-Type 原文** 与解析后的 body 一起带回
+///
+/// Content-Type 是本用例的核心判据之一：`{bad json` 在迁移前会得到
+/// `text/plain`，而 JSON 信封是 `application/json`。只回解析后的
+/// `Value` 会把这个差别抹掉（纯文本解析失败会退化成 `Value::Null`）。
+async fn send_raw(app: &Router, req: Request<Body>) -> (StatusCode, String, Value) {
+    let response = app.clone().oneshot(req).await.expect("请求执行失败");
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("读取响应体失败");
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, content_type, value)
+}
+
+/// 判定"这个响应是统一错误信封"，把不满足的地方说清楚
+fn envelope_violation(
+    endpoint: &str,
+    intent: &str,
+    status: StatusCode,
+    content_type: &str,
+    body: &Value,
+) -> Option<String> {
+    let mut problems = Vec::new();
+    if status != StatusCode::BAD_REQUEST {
+        problems.push(format!("状态码是 {status}，期望 400"));
+    }
+    if !content_type.starts_with("application/json") {
+        problems.push(format!(
+            "Content-Type 是 {content_type:?}，期望 application/json"
+        ));
+    }
+    if !body.is_object() {
+        problems.push(format!("响应体不是 JSON 对象: {body}"));
+    } else {
+        if !body["code"].is_number() {
+            problems.push("响应体缺少数值型 code".to_string());
+        }
+        if !body["message"].is_string() {
+            problems.push("响应体缺少字符串型 message".to_string());
+        }
+    }
+    if problems.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}（{}）\n    · {}\n    · 实际: {status} {content_type} {body}",
+        endpoint,
+        intent,
+        problems.join("\n    · "),
+    ))
+}
+
+/// **任何入参不合法，都必须回统一信封**
+///
+/// 判据落在**可观测的响应形状**上：遍历 OpenAPI 文档里的每个操作，
+/// 对带请求体的发一个解析不了的 body、对带 uuid 路径参数的发一个非 UUID，
+/// 两者都必须得到 `400` + `application/json` + `{code, message}`。
+///
+/// 为什么不写成"断言 36 处都改了"：那种断言是**自证**——
+/// 漏掉的那一处根本不在清单里，测试照样全绿。而这里新增端点只要带了
+/// 请求体或 uuid 路径参数，就自动进探针表；它若忘了用 `ApiJson` / `ApiPath`，
+/// 响应会退回 `text/plain`，当场变红。
+///
+/// 三类探针分别对应 `map_rejection` 的不同分支：
+/// - 坏 JSON → `JsonSyntaxError`
+/// - 错的 Content-Type → `MissingJsonContentType`（即"415 并入 400"那条决定）
+/// - 非 UUID 路径 → `FailedToDeserializePathParams`
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn every_bad_input_returns_unified_error_envelope() {
+    let app = app().await;
+    // **必须带合法令牌**：鉴权中间件先于提取器跑，无令牌时会拿到 401——
+    // 那也是 JSON 信封，会让断言"因为错误的原因而通过"，等于没测提取器
+    let token = admin_token(&app).await;
+
+    let mut probes: Vec<BadInputProbe> = Vec::new();
+    let mut body_probe_count = 0usize;
+    let mut content_type_probe_count = 0usize;
+    let mut path_probe_count = 0usize;
+
+    for (method, path, op) in openapi_operations() {
+        let uuids = uuid_path_params(&op);
+        let concrete = substitute(&path, &uuids, VALID_UUID);
+        let endpoint = format!("{method} {path}");
+
+        // 探针一：带请求体的操作发解析不了的 JSON
+        if !op["requestBody"].is_null() {
+            body_probe_count += 1;
+            probes.push(BadInputProbe {
+                endpoint: endpoint.clone(),
+                req: raw_request(
+                    &method,
+                    &concrete,
+                    Some(&token),
+                    Some("application/json"),
+                    "{bad json",
+                ),
+                intent: "请求体解析失败",
+            });
+            // 探针二：带请求体的操作发对的 JSON 但错的 Content-Type
+            //（原 axum 行为是 415 + text/plain，本版并入 400 + JSON）
+            content_type_probe_count += 1;
+            probes.push(BadInputProbe {
+                endpoint: endpoint.clone(),
+                req: raw_request(&method, &concrete, Some(&token), Some("text/plain"), "{}"),
+                intent: "Content-Type 不是 application/json",
+            });
+        }
+
+        // 探针三：带 uuid 路径参数的操作发非 UUID
+        if !uuids.is_empty() {
+            path_probe_count += 1;
+            let broken = substitute(&path, &uuids, "not-a-uuid");
+            probes.push(BadInputProbe {
+                endpoint: endpoint.clone(),
+                req: raw_request(&method, &broken, Some(&token), None, ""),
+                intent: "路径参数不是 uuid",
+            });
+        }
+    }
+
+    // 探针表本身也要验：若 OpenAPI 结构变化导致一条都没解析出来，
+    // 上面的循环会空转，断言全绿——那正是本用例最怕的"因为没测到而通过"
+    assert!(
+        body_probe_count >= 19,
+        "从文档解析出的请求体探针只有 {body_probe_count} 条，探针表可能已失效"
+    );
+    assert!(
+        content_type_probe_count >= 19,
+        "从文档解析出的 Content-Type 探针只有 {content_type_probe_count} 条，探针表可能已失效"
+    );
+    assert!(
+        path_probe_count >= 15,
+        "从文档解析出的路径探针只有 {path_probe_count} 条，探针表可能已失效"
+    );
+
+    let mut violations = Vec::new();
+    let probe_total = probes.len();
+    for probe in probes {
+        let BadInputProbe {
+            endpoint,
+            intent,
+            req,
+        } = probe;
+        // `Request` 不是 `Clone`，所以探针按值消费；违规信息已提前取好，
+        // 不需要把请求本身留在探针里
+        let (status, content_type, body) = send_raw(&app, req).await;
+        if let Some(violation) = envelope_violation(&endpoint, intent, status, &content_type, &body)
+        {
+            violations.push(violation);
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "以下端点的入参错误没有走统一格式（共 {} 条探针）：\n\n{}",
+        probe_total,
+        violations.join("\n\n")
+    );
+}

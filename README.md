@@ -4,6 +4,14 @@
 
 基于 **Rust Axum** 后端 + **Vue 3** 前端的企业级全栈管理平台。
 
+> v0.12.0 让"入参不合法"在任何端点都长一个样：此前 19 处 `Json<T>` 与 17 处 `Path<T>`
+> 绕过 `AppError`，直接回 `400`/`415` + `text/plain`，而前端拦截器按 `message` 取文案——
+> 纯文本那一种取不到，用户只看到一个空错误框。现全站改用 `ApiJson` / `ApiPath`，
+> 统一为 `400` + `{code, message, data}`。
+> 承重测试由 **OpenAPI 文档驱动**、遍历全路由实测响应形状：新增端点忘了迁移会当场变红。
+> 顺带修掉一处实测发现的文档缺陷——`GET /api/admin/roles` 的 `page`/`page_size`
+> 被 utoipa 标成了必填**路径**参数（它的 `ParameterIn::default()` 是 `Path`），
+> 可路径模板里根本没有 `{page}`。
 > v0.11.0 补上了安全追溯的基本盘：`/api/auth/login` 与 `/api/auth/register`
 > 在 `public_routes` 里，此前**没有挂审计中间件**，因此登录成功、登录失败、
 > 注册全部不进 `audit_logs`。这不是忘了挂——中间件依赖已认证用户，
@@ -60,6 +68,7 @@
 | 系统监控 | ✅ | CPU/内存/磁盘、DB/Redis 状态、接口耗时统计（进程内，重启丢失） |
 | Excel 导出 | ✅ | 用户列表、操作日志、系统信息；导出走与列表同一套筛选条件，超上限时**明示截断**而非静默砍数据 |
 | 未知参数处理 | ✅ | 所有 query DTO 一律 `deny_unknown_fields`：拼错的参数直接 400 并指名字段，**不再静默丢弃**（v0.10.0 起） |
+| 错误响应格式 | ✅ | **任何端点**的入参错误都是 `400` + `{code, message, data}`，含请求体与路径参数（v0.12.0 起）；原先 19 处 `Json` + 17 处 `Path` 会退回 `text/plain`，前端拦截器取不到 `message`，用户只看到一个空错误框 |
 | OpenAPI 文档 | ✅ | utoipa 从 handler 注解与 DTO 派生生成；双向覆盖测试保证文档与路由同步 |
 | 接口级权限码 | ⚠️ | 仅 admin 路由细化到权限码；非 admin 角色仍被 `require_role("admin")` 整体挡住 |
 

@@ -2,7 +2,7 @@
 
 use axum::{
     extract::rejection::QueryRejection,
-    extract::{Path, Query, State},
+    extract::{Query, State},
     Json,
 };
 use uuid::Uuid;
@@ -16,6 +16,7 @@ use crate::model::{
     ApiResponse, AssignMenuRequest, CreateMenuRequest, Menu, MenuNode, UpdateMenuRequest,
 };
 use crate::router::AppState;
+use crate::utils::api_extractor::{ApiJson, ApiPath};
 use crate::utils::validation;
 
 /// GET /api/admin/menus — 获取菜单树
@@ -120,7 +121,7 @@ pub async fn my_permissions(
 pub async fn create_menu(
     State(state): State<AppState>,
     _perm: PermMenuCreate,
-    Json(req): Json<CreateMenuRequest>,
+    ApiJson(req): ApiJson<CreateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
     // 权限码必须唯一：迁移 `007` 的部分唯一索引 `idx_menus_permission_unique`
     // 会挡住重复声明，但索引抛出来的是 500 "服务器内部错误"——
@@ -169,8 +170,8 @@ pub async fn update_menu(
     State(state): State<AppState>,
     perm: PermMenuUpdate,
     auth_user: AuthenticatedUser,
-    Path(id): Path<Uuid>,
-    Json(req): Json<UpdateMenuRequest>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(req): ApiJson<UpdateMenuRequest>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
     // 授权下界（v0.5.0 PR-3）：`menus.permission` 是权限码本身。
     // 把一个**已授权给调用者的**按钮菜单的 permission 改掉，
@@ -240,7 +241,7 @@ pub async fn restore_menu_permission(
     State(state): State<AppState>,
     _perm: PermMenuUpdate,
     auth_user: AuthenticatedUser,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<MenuNode>>, AppError> {
     let menu = state.menu_repo.find_by_id(id).await?;
     let Some(restorable) = menu.prev_permission.as_deref() else {
@@ -271,7 +272,7 @@ pub async fn restore_menu_permission(
 pub async fn delete_menu(
     State(state): State<AppState>,
     perm: PermMenuDelete,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     // 授权下界（v0.8.0 第 1 项）：删除是级联的，删掉一个**承载权限码的菜单**
     // 等价于把那个码从所有依赖它的角色身上剥掉，与 `update_menu` 清空该码的
@@ -309,8 +310,8 @@ pub async fn assign_role_menus(
     State(state): State<AppState>,
     perm: PermMenuGrant,
     auth_user: AuthenticatedUser,
-    Path(role_id): Path<Uuid>,
-    Json(req): Json<AssignMenuRequest>,
+    ApiPath(role_id): ApiPath<Uuid>,
+    ApiJson(req): ApiJson<AssignMenuRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     // 授权下界（v0.5.0 PR-3）：`system:menu:grant` 是"把权限码授予角色"的元能力，
     // 持有它就能把全部按钮菜单授予某个角色，因此**自授**必须拦住。

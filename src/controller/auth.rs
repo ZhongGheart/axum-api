@@ -12,7 +12,7 @@ use crate::model::{
     ApiResponse, ChangePasswordRequest, LoginRequest, LoginResponse, RegisterRequest, UserInfo,
 };
 use crate::router::AppState;
-use crate::utils::json_extractor::ApiJson;
+use crate::utils::api_extractor::ApiJson;
 
 /// POST /api/auth/register — 用户注册
 #[utoipa::path(
@@ -29,7 +29,7 @@ use crate::utils::json_extractor::ApiJson;
 pub async fn register(
     State(state): State<AppState>,
     client_ip: ClientIp,
-    Json(req): Json<RegisterRequest>,
+    ApiJson(req): ApiJson<RegisterRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     let user_info = state.auth_service.register(req, &client_ip.0).await?;
     Ok(Json(ApiResponse::success(user_info)))
@@ -50,7 +50,7 @@ pub async fn register(
 pub async fn login(
     State(state): State<AppState>,
     client_ip: ClientIp,
-    Json(req): Json<LoginRequest>,
+    ApiJson(req): ApiJson<LoginRequest>,
 ) -> Result<Json<ApiResponse<LoginResponse>>, AppError> {
     let login_resp = state
         .auth_service

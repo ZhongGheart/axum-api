@@ -2,6 +2,110 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.12.0] - 2026-10-03
+
+主题：**入参不合法，任何端点都得长一个样。**
+
+v0.10.0 修的是「界面不许说谎」，v0.11.0 补的是「出事之后能查」。
+这一版收掉同族的另一半：项目对外承诺统一响应格式 `{ code, message, data }`，
+前端拦截器也按 `message` 取文案（`frontend/src/api/index.ts`），
+但**框架的默认入参路径绕过了这个承诺**。
+
+### 修复一：请求体与路径参数的错误不再绕过 `AppError`
+
+实测（起真实后端逐个打一遍，不是照文档推测）：
+
+```
+POST /api/admin/roles   body='{bad json'
+  → 400  text/plain  "Failed to parse the request body as JSON: key must be a string at line 1 column 2"
+PUT  /api/auth/password body='{bad json'
+  → 400  application/json  {"code":400,"message":"错误的请求: 请求体不合法: Failed to parse..."}
+```
+
+同一个「入参不合法」，因为走的是不同提取器，响应形状就不同：
+
+| 入口 | 迁移前 | 迁移后 |
+|---|---|---|
+| 19 处 `Json<T>` | 400/422 + `text/plain` | 400 + `application/json` |
+| 17 处 `Path<T>` | 400 + `text/plain` | 400 + `application/json` |
+| Content-Type 非 JSON | **415** + `text/plain` | 400 + `application/json` |
+
+纯文本那一种在拦截器里取不到 `message`，用户只能看到一个空错误框——
+这正是「承诺了格式却没兑现」的具体后果。
+
+新增 `utils::api_extractor`（由 `json_extractor` 更名，装了两个提取器后旧名已不准）：
+
+- `ApiJson<T>`：`JsonRejection` 四个变体**逐个翻译**，
+  因此多传字段时消息里会指名是哪个字段不认
+- `ApiPath<T>`：`PathRejection` 两个变体，保留 serde 原文，
+  `/api/admin/users/not-a-uuid` 会指名参数而非只说「解析失败」
+- 两者各自独立、**不合并**成泛型 `Api<T>`：合并只是把 `match` 分支藏得更深，
+  而 `JsonRejection` 的四变体确实需要分别给文案
+- 两个 `Rejection` 枚举都是 `#[non_exhaustive]`，兜底分支让 axum 小版本
+  新增变体时不会直接把构建打挂
+
+### 决定：415 并入 400
+
+HTTP 语义上 415 更准确，但 v0.11.0 的改密端点**已经发布**并返回 400。
+同一个逻辑错误因端点不同而返回不同状态码，正是本版要消灭的问题；
+要改就得连同已发布行为一起改，那是破坏性变更，不该顺手做。
+消息文本里已说明「必须带 Content-Type: application/json」，调用方仍能分辨。
+
+### 承重测试：遍历 OpenAPI 全路由实测响应形状
+
+36 处机械迁移最容易出的错就是漏一处，而**漏一处不会有任何编译错误**。
+因此判据不写成「断言 36 处都改了」（那是自证），而是
+`every_bad_input_returns_unified_error_envelope`：
+
+- 探针表由 `docs::openapi_json()` **驱动**，不手写端点清单。
+  漏改的那一处也在文档里，逃不掉；将来新增端点忘了迁移同样会进探针表
+- 三类探针各对应 `map_rejection` 的不同分支：
+  坏 JSON（`JsonSyntaxError`）、错 Content-Type（`MissingJsonContentType`）、
+  非 UUID 路径（`FailedToDeserializePathParams`）
+- 探针必须带**合法令牌**：鉴权中间件先于提取器跑，无令牌时会拿到 401——
+  那也是 JSON 信封，会让断言「因为错误的原因而通过」，等于没测提取器
+- 断言要求 `400` + `application/json` + 同时含 `code` 与 `message`，
+  失败时打印出问题的端点与三种不合格原因
+- 另有三条**探针表自检**（条数下限）：若 OpenAPI 结构变化导致一条都没解析出来，
+  循环会空转、断言全绿——那正是本用例最怕的「因为没测到而通过」
+
+共 54 条探针。缺陷注入验证：摘掉一处 `ApiJson` → 用例红（报出该端点的
+`400 text/plain` 与 `415 text/plain`）；摘掉一处 `ApiPath` → 用例红
+（报出该端点的 `400 text/plain`）；恢复后转绿。
+
+### 顺带修复：角色列表的分页参数在文档里被标成了路径参数
+
+实测 OpenAPI JSON 时发现的**真实文档缺陷**，与本版同族（文档说的和代码做的不一致）：
+
+```
+GET /api/admin/roles  →  "page"/"page_size" 的 in 是 "path"、required 是 true
+```
+
+但路径模板 `/api/admin/roles` 里根本没有 `{page}`——Swagger UI 会把它们
+渲染成路径输入框，按 OpenAPI 规范校验也是无效文档。
+
+根因：utoipa 的 `axum_extras` 本该从 handler 参数推断 `parameter_in`，
+但 `list_roles` 显式接住拒绝，签名是 `Result<Query<RoleListParams>, QueryRejection>`
+而不是裸 `Query<...>`，推断不出来 → 回落到 `ParameterIn::default()`，
+而**那个默认值是 `Path`**（见 utoipa `openapi/path.rs` 的
+`impl Default for ParameterIn`）。
+
+显式钉 `#[into_params(parameter_in = Query)]`，不依赖这个默认值。
+
+### 其他
+
+- `src/utils/json_extractor.rs` → `src/utils/api_extractor.rs`（`git mv`，保留历史）
+- 版本号 0.11.0 → 0.12.0（Cargo.toml / Cargo.lock / frontend/package.json）
+- `middleware/permission.rs` 与 `controller/role.rs` 里两处提到「422」的注释已过时
+  （本版起入参错误统一是 400），一并更正
+
+### 未改动
+
+- **成功响应体**一律不动。导出的 Excel/CSV、二进制响应天然不是 JSON，
+  那不是「错误格式不统一」；承重测试只针对**入参**错误
+- `docs/mod.rs` 里 `swagger_ui_handler` 的 `Path<String>` 保持 axum 原生：
+  它是 SPA 静态资源回退路由，失败时该回 HTML/404，不是 JSON 信封
+
 ## [0.11.0] - 2026-10-03
 
 主题：**补上安全追溯的基本盘，并给用户一条不依赖管理员的改密路径。**

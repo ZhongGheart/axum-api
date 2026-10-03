@@ -1,9 +1,6 @@
 //! 数据字典控制器
 
-use axum::{
-    extract::{Path, State},
-    Json,
-};
+use axum::{extract::State, Json};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -15,6 +12,7 @@ use crate::model::{
     DictType, DictTypeWithItems,
 };
 use crate::router::AppState;
+use crate::utils::api_extractor::{ApiJson, ApiPath};
 
 /// GET /api/admin/dict/types — 字典类型列表
 #[utoipa::path(
@@ -44,7 +42,7 @@ pub async fn list_types(
 pub async fn create_type(
     State(state): State<AppState>,
     _perm: PermDictCreate,
-    Json(req): Json<CreateDictTypeRequest>,
+    ApiJson(req): ApiJson<CreateDictTypeRequest>,
 ) -> Result<Json<ApiResponse<DictType>>, AppError> {
     let t = DictType {
         id: Uuid::new_v4(),
@@ -73,8 +71,8 @@ pub async fn create_type(
 pub async fn update_type(
     State(state): State<AppState>,
     _perm: PermDictUpdate,
-    Path(id): Path<Uuid>,
-    Json(req): Json<CreateDictTypeRequest>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(req): ApiJson<CreateDictTypeRequest>,
 ) -> Result<Json<ApiResponse<DictType>>, AppError> {
     let saved = state.dict_repo.update_type(id, &req).await?;
     Ok(Json(ApiResponse::success(saved)))
@@ -92,7 +90,7 @@ pub async fn update_type(
 pub async fn delete_type(
     State(state): State<AppState>,
     _perm: PermDictDelete,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     state.dict_repo.delete_type(id).await?;
     Ok(Json(ApiResponse::success("删除成功")))
@@ -109,7 +107,7 @@ pub async fn delete_type(
 )]
 pub async fn get_items_by_code(
     State(state): State<AppState>,
-    Path(code): Path<String>,
+    ApiPath(code): ApiPath<String>,
 ) -> Result<Json<ApiResponse<Vec<DictItemResponse>>>, AppError> {
     // 刻意不做权限码校验：这是任意已登录用户可读的通用展示数据，
     // 普通页面的 DictSelect 也依赖它。加权限码会让非管理员的字典下拉全部失效。
@@ -155,7 +153,7 @@ pub struct DictItemQuery {
 pub async fn create_item(
     State(state): State<AppState>,
     _perm: PermDictCreate,
-    Json(req): Json<CreateDictItemRequest>,
+    ApiJson(req): ApiJson<CreateDictItemRequest>,
 ) -> Result<Json<ApiResponse<DictItem>>, AppError> {
     let type_id = req
         .dict_type_id
@@ -189,8 +187,8 @@ pub async fn create_item(
 pub async fn update_item(
     State(state): State<AppState>,
     _perm: PermDictUpdate,
-    Path(id): Path<Uuid>,
-    Json(req): Json<CreateDictItemRequest>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(req): ApiJson<CreateDictItemRequest>,
 ) -> Result<Json<ApiResponse<DictItem>>, AppError> {
     let saved = state.dict_repo.update_item(id, &req).await?;
     Ok(Json(ApiResponse::success(saved)))
@@ -211,7 +209,7 @@ pub async fn update_item(
 pub async fn delete_item(
     State(state): State<AppState>,
     _perm: PermDictDelete,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     state.dict_repo.delete_item(id).await?;
     Ok(Json(ApiResponse::success("删除成功")))

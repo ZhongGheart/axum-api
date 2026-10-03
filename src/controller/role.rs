@@ -16,6 +16,7 @@ use crate::middleware::permission::{
 };
 use crate::model::{normalize_role_name, ApiResponse, BUILTIN_ROLES};
 use crate::router::AppState;
+use crate::utils::api_extractor::{ApiJson, ApiPath};
 use crate::utils::pagination::PaginatedResponse;
 
 /// `roles.name` 的唯一约束名（`name VARCHAR(50) NOT NULL UNIQUE`）
@@ -34,6 +35,14 @@ pub struct RoleItem {
 /// GET /api/admin/roles 的查询参数
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+// utoipa 的 `axum_extras` 本该从 handler 参数推断 `parameter_in`，
+// 但 `list_roles` 显式接住拒绝，签名是 `Result<Query<RoleListParams>, QueryRejection>`
+// 而不是裸 `Query<...>`，推断不出来 → 回落到 `ParameterIn::default()`，
+// 而那个默认值是 **Path**（见 utoipa `openapi/path.rs` 的 `impl Default for ParameterIn`）。
+// 结果文档里 `page`/`page_size` 被标成必填**路径**参数，可路径模板里根本没有 `{page}`——
+// Swagger UI 会把它们渲染成路径输入框，按规范校验也是无效文档。
+// 显式钉死 Query，才不依赖这个默认值。
+#[into_params(parameter_in = Query)]
 pub struct RoleListParams {
     /// 页码（从 1 开始）
     pub page: Option<i64>,
@@ -46,7 +55,7 @@ pub struct RoleListParams {
 pub struct AssignRoleRequest {
     /// 与路径参数 `user_id` 重复，服务端一律以**路径**为准。
     ///
-    /// 刻意是可选的：它曾是必填，于是漏传时 `Json` 提取器先失败、返回 422，
+    /// 刻意是可选的：它曾是必填，于是漏传时 `Json` 提取器先失败、返回 400，
     /// 无权限调用者因此拿到了本不该看到的入参结构反馈——正是
     /// `middleware::permission` 开头那条"鉴权必须早于入参校验"要避免的事。
     /// 保留字段只为兼容既有客户端（含前端 `api/role.ts`）。
@@ -108,7 +117,7 @@ pub async fn list_roles(
 pub async fn get_user_roles(
     State(state): State<AppState>,
     _perm: PermUserList,
-    axum::extract::Path(user_id): axum::extract::Path<Uuid>,
+    ApiPath(user_id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, AppError> {
     let roles = state
         .auth_service
@@ -135,8 +144,8 @@ pub async fn get_user_roles(
 pub async fn assign_user_role(
     State(state): State<AppState>,
     perm: PermUserUpdate,
-    axum::extract::Path(user_id): axum::extract::Path<Uuid>,
-    Json(req): Json<AssignRoleRequest>,
+    ApiPath(user_id): ApiPath<Uuid>,
+    ApiJson(req): ApiJson<AssignRoleRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     // 与用户表单的 role 字段走同一套归一化，否则同一个角色
     // 经本接口提交 "Admin" 会 404、经表单提交 "admin" 却成功
@@ -205,7 +214,7 @@ pub async fn assign_user_role(
 pub async fn create_role(
     State(state): State<AppState>,
     _perm: PermRoleCreate,
-    Json(req): Json<CreateRoleReq>,
+    ApiJson(req): ApiJson<CreateRoleReq>,
 ) -> Result<Json<ApiResponse<RoleItem>>, AppError> {
     let name = normalize_role_name(&req.name)?;
     let id = Uuid::new_v4();
@@ -251,8 +260,8 @@ pub async fn create_role(
 pub async fn update_role(
     State(state): State<AppState>,
     _perm: PermRoleUpdate,
-    axum::extract::Path(id): axum::extract::Path<Uuid>,
-    Json(req): Json<CreateRoleReq>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(req): ApiJson<CreateRoleReq>,
 ) -> Result<Json<ApiResponse<RoleItem>>, AppError> {
     let name = normalize_role_name(&req.name)?;
 
@@ -351,7 +360,7 @@ pub async fn update_role(
 pub async fn delete_role(
     State(state): State<AppState>,
     perm: PermRoleDelete,
-    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     let mut tx = state
         .auth_service

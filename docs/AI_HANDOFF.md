@@ -3004,3 +3004,203 @@ v011 改密后用固定 `sleep(2500)` 等跳转。单跑够用，全量跑时机
    做法：在 `router/index.ts` 的 `MainLayout` children 里**静态注册**，
    与 `/login` `/register` 同样的白名单式处理。
 
+---
+
+# v0.12.0 —— 错误响应格式统一（入参不合法，任何端点都得长一个样）
+
+## 当前目标
+
+同一个"入参不合法"，走 `Query` 得到 400 + JSON，走 `Json` 得到 422 + `text/plain`，
+走 `Path` 得到 400 + `text/plain`。**同一类错误因端点不同而形状不同**，
+而前端响应拦截器按 `message` 取文案（`frontend/src/api/index.ts`），
+纯文本那一种取不到 `message`，用户只能看到一个空错误框。
+
+这是 v0.10.0「界面不许说谎」的后端侧同族问题：**对外承诺了统一格式，
+但框架默认路径绕过了它**。v0.11.0 记下这个遗留，本版收掉。
+
+## 当前计划
+
+| 步骤 | 内容 | 状态 |
+|---|---|---|
+| 0 | 记录目标、关键决定与起始 git 状态 | ✅ 已完成 |
+| 1 | `ApiPath<T>` 提取器（与 `ApiJson<T>` 同构） | ✅ 已完成 |
+| 2 | 19 处 `Json<T>` → `ApiJson<T>` | ✅ 已完成 |
+| 3 | 17 处 `Path<T>` → `ApiPath<T>` | ✅ 已完成 |
+| 4 | 承重测试：遍历 OpenAPI 全路由，坏输入必须回统一信封 | ✅ 已完成（54 条探针） |
+| 5 | 缺陷注入 | ✅ 已完成（两处注入均被抓） |
+| 6 | 文档：CHANGELOG / README / 版本号 | ✅ 已完成 |
+| 7 | 全量质量门禁 | ✅ 全绿 |
+| 8 | 提交（**不推送**） | ✅ 已完成 |
+
+## 起始 git 状态
+
+- 分支 `master`；HEAD = `7d6898ff feat(v0.11.0): 登录可审计 + 自助改密……`
+- 工作区干净（仅本文档改动）
+- 待推送：v0.10.0 (`a0ac25ce`) + v0.11.0 (`7d6898ff`)，**均未推送**
+- 版本号：Rust / frontend 均 `0.11.0`
+
+## 缺口清单（本轮**实测**得到，不是照文档推测）
+
+起真实后端逐个打了一遍：
+
+| 入口 | 现状 | 坏输入的实际响应 |
+|---|---|---|
+| 19 处 `Json<T>` | 绕过 `AppError` | `400`/`422` + `text/plain` |
+| 17 处 `Path<T>`（16 × `Path<Uuid>` + 1 × `Path<String>`） | 绕过 `AppError` | `400` + `text/plain` |
+| Content-Type 不是 JSON | 绕过 `AppError` | `415` + `text/plain` |
+| 5 处 `Query`（已有 `From<QueryRejection>`） | ✅ 已统一 | `400` + `application/json` |
+| 1 处 `ApiJson`（v0.11.0 改密端点） | ✅ 已统一 | `400` + `application/json` |
+
+原始响应示例（v0.11.0 前后对照）：
+```
+POST /api/admin/roles  body='{bad json'
+  → 400 text/plain  "Failed to parse the request body as JSON: key must be a string at line 1 column 2"
+PUT /api/auth/password  body='{bad json'
+  → 400 application/json  {"code":400,"message":"错误的请求: 请求体不合法: Failed to parse..."}
+```
+
+## 关键决定（动手前先定）
+
+1. **承重测试必须能抓出"漏改的第 37 处"**。
+   36 处机械迁移最容易出的错就是漏一处，而漏一处不会有任何编译错误。
+   因此测试不写成"断言这 36 处都改了"（那是自证），
+   而是**遍历 OpenAPI 全部路由**，对每个写端点发一个坏请求体、
+   对每个含 `{id}` 的路径发一个非 UUID 参数，断言响应一定是
+   `application/json` 且含 `code`/`message`。这样以后新增端点忘了用
+   `ApiJson`，测试当场变红。判据落在**可观测的响应形状**上，不是源码文本。
+
+2. **415 并入 400，不保留 415**。
+   HTTP 语义上 415 更准确，但 v0.11.0 的改密端点**已经发布**并返回 400。
+   同一个逻辑错误因端点不同而返回不同状态码，正是本版要消灭的问题；
+   要改就得连同已发布行为一起改，那是破坏性变更，不该顺手做。
+   消息文本里已说明"必须带 Content-Type: application/json"，足够调用方分辨。
+
+3. **`ApiPath<T>` 与 `ApiJson<T>` 同构，不合并成一个泛型包装器**。
+   `JsonRejection` 有 4 个变体需要分别翻译（尤其 415 要给专门文案），
+   `PathRejection` 只是一条消息。强行合并成一个 `Api<T>` 泛型，
+   内部仍然要 `match` 分派，只是把分支藏得更深，收益不抵可读性损失。
+
+4. **只迁移，不改业务语义**。
+   状态码从 422 变 400 是本版唯一的语义变化，且是**修正**：
+   422 在本项目里只可能来自 `Json` 的反序列化失败（`Query` 已是 400），
+   同一个"入参不合法"给两个码没有信息量。
+
+5. **不碰 `GET` 的响应体**。
+   导出的 Excel/CSV、二进制响应天然不是 JSON，那不是"错误格式不统一"。
+   承重测试只针对**入参**错误，不针对成功响应。
+
+
+
+## v0.12.0 实施记录（步骤 1–6 已完成，门禁进行中）
+
+### 实际改动
+
+| 文件 | 改动 |
+|---|---|
+| `src/utils/json_extractor.rs` → `src/utils/api_extractor.rs` | `git mv` 更名；新增 `ApiPath<T>` + `map_path_rejection` |
+| `src/controller/{auth,demo,dict,menu,role,user}.rs` | 19 处 `Json<T>` → `ApiJson<T>`，17 处 `Path<T>` → `ApiPath<T>` |
+| `src/controller/role.rs` | 顺带修 `RoleListParams` 的 `parameter_in`（见下） |
+| `src/middleware/permission.rs`、`src/controller/role.rs` | 两处提到「422」的注释更正为 400 |
+| `tests/api_integration.rs` | 新增 `every_bad_input_returns_unified_error_envelope` + 6 个辅助函数/结构 |
+| `Cargo.toml` / `Cargo.lock` / `frontend/package.json` | 0.11.0 → 0.12.0 |
+| `CHANGELOG.md` / `README.md` | 新增 v0.12.0 条目与能力清单行 |
+
+### 踩到的坑（都已在源码注释里留痕）
+
+1. **`Path<T>` 实现的是 `FromRequestParts` 不是 `FromRequest`**。
+   所以 `ApiPath` 的签名是 `from_request_parts(parts: &mut Parts, state: &S)`，
+   `use` 里要的是 `http::request::Parts`，不是 `http::Request`。
+
+2. **`#[utoipa::into_params(...)]` 不存在**。`into_params` 是 `IntoParams` derive
+   的 **helper attribute**，要写裸的 `#[into_params(parameter_in = Query)]`。
+   写成 `#[utoipa::into_params(...)]` 报 `could not find into_params in utoipa`。
+
+3. **`PathRejection` 与 `JsonRejection` 都是 `#[non_exhaustive]`**，
+   `match` 必须留 `other =>` 兜底分支，否则 axum 小版本加变体就直接编译不过。
+   本项目的选择是显式承认"未知形态"并回统一格式，而不是让升级失败。
+
+4. **`ops.sort()` 在 `(String, String, Value)` 元组上报 `JsonValue: Ord` 不满足**。
+   `sort()` 要求整个元组可比较，必须改用 `sort_by(|a, b| a.0.cmp(&b.0).then(...))`。
+
+5. **`Request<Body>` 不是 `Clone`**，探针表不能复用同一个请求两遍；
+   现在探针按值消费。
+
+### 承重测试设计（为什么它抓得到"漏改的那一处"）
+
+- 探针表由 `docs::openapi_json()` **驱动**：遍历 `paths` → 每个操作，
+  读 `requestBody` 是否存在、`parameters` 里 `in: path` 且 `schema.format == uuid` 的参数名。
+  **不手写端点清单**——手写清单只能证明清单里那几处迁移了。
+- 三类探针 → 19（坏 JSON）+ 19（错 Content-Type）+ 16（非 UUID 路径）= **54 条**
+- **必须带合法 admin 令牌**：鉴权中间件先于提取器跑，无令牌拿到 401，
+  而 401 也是 JSON 信封 → 断言会"因为错误的原因而通过"
+- 三条**探针表自检**（`>= 19` / `>= 19` / `>= 15`）：防止 OpenAPI 结构变化导致
+  一条都没解析出来、循环空转、断言全绿
+- 探针三只在**带 uuid 参数**时打：`{code}` 是 `String`，塞什么都能解析出来，
+  拿它探只会得到 200/404，测不到提取器
+
+### 缺陷注入（两条都承重）
+
+| 注入 | 结果 |
+|---|---|
+| `user.rs` 的 `batch_delete` 退回裸 `Json<BatchDeleteRequest>` | 用例红：报出该端点 `400 text/plain` + `415 text/plain` |
+| `dict.rs` 的 `update_item` 退回裸 `Path<Uuid>` | 用例红：报出该端点 `400 text/plain` |
+| 恢复两处 | 用例绿 |
+
+失败信息会指出是哪个端点、哪种探针、三条不合格原因分别是什么
+（状态码 / Content-Type / 响应体结构），不用回去翻代码定位。
+
+### 顺带发现的真实文档缺陷（已修）
+
+`GET /api/admin/roles` 的 `page` / `page_size` 在 OpenAPI 里是
+`in: "path"`、`required: true`，但路径模板 `/api/admin/roles` 里没有 `{page}`。
+
+根因链：utoipa 的 `axum_extras` 本该从 handler 参数推断 `parameter_in`，
+但 `list_roles` 的签名是 `Result<Query<RoleListParams>, QueryRejection>`
+（显式接住拒绝，为了走 `From<QueryRejection>`），utoipa 认不出裸 `Query<...>`，
+于是回落到 `ParameterIn::default()`——**而那个默认值是 `Path`**
+（`utoipa-5.5.0/src/openapi/path.rs` 的 `impl Default for ParameterIn`）。
+
+修法：`#[into_params(parameter_in = Query)]`。全项目只有这一处 `IntoParams` derive，
+所以影响面就这一个端点。**教训**：utoipa 的默认值不能当"正确的默认值"用，
+凡靠推断的地方都要在生成结果里核对一眼。
+
+
+## v0.12.0 门禁结论（全绿）
+
+| 项 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | ✅ |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | ✅ 零警告 |
+| `cargo test --locked --lib` | ✅ 61 |
+| 集成测试（fresh DB + `--test-threads=1`） | ✅ **103**（v0.11.0 为 102，+1 即新增承重测试） |
+| 前端 lint / typecheck / Vitest / build | ✅ / ✅ / ✅ 93 / ✅（lint 1 个既有 warning 在 `env.d.ts`，与本版无关） |
+| e2e 真实 Chrome | ✅ 5/5 套件 |
+| 授权探针 | ✅ 41/41 |
+
+**真实服务上复核**（起 8080 连测试库，逐条 curl 确认非仅测试环境）：
+
+```
+POST /api/admin/roles  body='{bad json'
+  → 400 application/json {"code":400,"message":"错误的请求: 请求体不合法: Failed to parse the request body as JSON: key must be a string at line 1 column 2"}
+POST /api/admin/roles  Content-Type: text/plain
+  → 400 application/json {"code":400,"message":"错误的请求: 请求体不合法: 请求必须带 Content-Type: application/json"}
+GET  /api/admin/users/not-a-uuid/roles
+  → 400 application/json {"code":400,"message":"错误的请求: 路径参数不合法: Invalid URL: Cannot parse `user_id` with value `not-a-uuid`: UUID parsing failed..."}
+```
+
+`/api/openapi.json` 的 `info.version` 已随 Cargo 派生为 `0.12.0`（无需手写同步）。
+
+### 提交
+
+`feat(v0.12.0): 错误响应格式统一——入参不合法，任何端点长得一样`，
+17 个文件、+730/-134。**未推送**。
+
+## 待推送队列（累计 3 个提交）
+
+| 提交 | 版本 |
+|---|---|
+| `a0ac25ce` | v0.10.0 |
+| `7d6898ff` | v0.11.0 |
+| 本次 | v0.12.0 |
+
+按指令：本地跑门禁 + 提交，**全部工作完成或收到指令才统一推送**。

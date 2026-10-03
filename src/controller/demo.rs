@@ -13,6 +13,7 @@ use crate::error::AppError;
 use crate::middleware::permission::{PermExportUser, PermLogExport, PermLogList, PermValidateTest};
 use crate::model::ApiResponse;
 use crate::router::AppState;
+use crate::utils::api_extractor::ApiJson;
 use crate::utils::export::{ExcelColumn, ExcelExport};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 use crate::utils::validation;
@@ -127,7 +128,7 @@ pub async fn export_users(
 )]
 pub async fn validate_test(
     _perm: PermValidateTest,
-    Json(req): Json<ValidateTestRequest>,
+    ApiJson(req): ApiJson<ValidateTestRequest>,
 ) -> Result<Json<ApiResponse<ValidateTestResponse>>, AppError> {
     let mut resp = ValidateTestResponse {
         username_valid: true,

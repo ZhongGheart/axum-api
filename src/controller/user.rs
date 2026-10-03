@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -22,6 +22,7 @@ use crate::middleware::permission::{
 };
 use crate::model::{normalize_role_name, ApiResponse, UserInfo, ADMIN_ROLE};
 use crate::router::AppState;
+use crate::utils::api_extractor::{ApiJson, ApiPath};
 use crate::utils::validation;
 
 /// 用户列表查询参数
@@ -245,7 +246,7 @@ pub async fn list_users(
 pub async fn create_user(
     State(state): State<AppState>,
     perm: PermUserCreate,
-    Json(req): Json<UserManageRequest>,
+    ApiJson(req): ApiJson<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     use crate::utils::password::hash_password;
 
@@ -335,8 +336,8 @@ pub async fn create_user(
 pub async fn update_user(
     State(state): State<AppState>,
     perm: PermUserUpdate,
-    Path(id): Path<Uuid>,
-    Json(req): Json<UserManageRequest>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(req): ApiJson<UserManageRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     validation::validate_username(&req.username)?;
     validation::validate_email(&req.email)?;
@@ -409,7 +410,7 @@ pub async fn delete_user(
     State(state): State<AppState>,
     perm: PermUserDelete,
     auth_user: AuthenticatedUser,
-    Path(id): Path<Uuid>,
+    ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     if id == auth_user.user_id {
         return Err(AppError::BadRequest("不能删除当前登录账号".to_string()));
@@ -454,7 +455,7 @@ pub async fn batch_delete_users(
     State(state): State<AppState>,
     perm: PermUserDelete,
     auth_user: AuthenticatedUser,
-    Json(req): Json<BatchDeleteRequest>,
+    ApiJson(req): ApiJson<BatchDeleteRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     if req.ids.is_empty() {
         return Err(AppError::BadRequest("请至少选择一个用户".to_string()));
@@ -526,8 +527,8 @@ pub async fn toggle_user_status(
     State(state): State<AppState>,
     perm: PermUserUpdate,
     auth_user: AuthenticatedUser,
-    Path(id): Path<Uuid>,
-    Json(req): Json<ToggleStatusRequest>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(req): ApiJson<ToggleStatusRequest>,
 ) -> Result<Json<ApiResponse<UserInfo>>, AppError> {
     if id == auth_user.user_id && !req.is_active {
         return Err(AppError::BadRequest("不能停用当前登录账号".to_string()));
@@ -588,8 +589,8 @@ pub struct ToggleStatusRequest {
 pub async fn reset_user_password(
     State(state): State<AppState>,
     perm: PermUserUpdate,
-    Path(id): Path<Uuid>,
-    Json(req): Json<ResetPasswordRequest>,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(req): ApiJson<ResetPasswordRequest>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     use crate::utils::password::hash_password;
 
