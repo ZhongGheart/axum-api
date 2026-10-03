@@ -1,10 +1,12 @@
 //! 菜单数据访问层
 
+use std::collections::{HashMap, HashSet};
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::model::{Menu, MenuNode};
+use crate::model::{Menu, MenuNode, UnreachableMenu};
 
 /// 菜单仓储
 #[derive(Debug, Clone)]
@@ -133,8 +135,123 @@ impl MenuRepository {
         Ok(build_tree(&menus))
     }
 
+    /// 校验「把 `moving` 挂到 `parent` 下」在**结构上**是否合法
+    ///
+    /// `menus.parent_id` 的外键只能挡住"指向不存在的菜单"，
+    /// **挡不住成环**——而环的后果实测是三级放大：
+    ///
+    /// 1. `build_tree` 判根看"父节点是否在集合内"，环上无一为根 → **整支被剪掉**，
+    ///    菜单从侧栏和管理页同时消失，管理员在界面上看不见它，也就无法点开改回来
+    /// 2. `granted_codes_in_subtree` 的递归 CTE 遇到环**永不收敛** →
+    ///    `DELETE /api/admin/menus/:id` 永久挂起，连"删掉它"这条自救路也堵死
+    /// 3. 挂起的请求不归还连接，占满连接池后**与菜单无关的端点也全部 500**
+    ///
+    /// `moving = None` 表示新建菜单（新节点不可能是任何节点的祖先，只需父级存在）。
+    pub async fn ensure_attachable(
+        &self,
+        moving: Option<Uuid>,
+        parent: Uuid,
+    ) -> Result<(), AppError> {
+        let all = self.find_all().await?;
+
+        // 先给父级一个能照着改的消息，而不是让 FK 抛 500「服务器内部错误」
+        let Some(parent_menu) = all.iter().find(|m| m.id == parent) else {
+            return Err(AppError::BadRequest(
+                "上级菜单不存在，请刷新菜单列表后重新选择".into(),
+            ));
+        };
+
+        let Some(moving_id) = moving else {
+            return Ok(());
+        };
+
+        if moving_id == parent {
+            return Err(AppError::BadRequest("上级菜单不能是它自己".into()));
+        }
+
+        // 沿 parent 向上走祖先链：只要经过 moving_id，就会成环。
+        //
+        // **刻意在 Rust 侧走而不用 SQL 递归**：库里可能**已经**存在环
+        // （历史脏数据，或运维直连 DB 写入）。任何不带 visited 的向上遍历
+        // 在那种数据上自己就会死循环——用 `WITH RECURSIVE` 同样躲不掉，
+        // 那正是 [`Self::granted_codes_in_subtree`] 曾经挂起的原因。
+        let parent_of: HashMap<Uuid, Option<Uuid>> =
+            all.iter().map(|m| (m.id, m.parent_id)).collect();
+        let mut seen = HashSet::from([moving_id]);
+        let mut cursor = parent_menu.parent_id;
+
+        while let Some(id) = cursor {
+            if id == moving_id {
+                return Err(AppError::BadRequest(
+                    "不能把菜单挪到它自己的下级里：那会让菜单树成环，整棵子树会从界面上消失".into(),
+                ));
+            }
+            // 祖先链上已有环（与本次操作无关的脏数据）：到此为止，不要跟着转圈
+            if !seen.insert(id) {
+                break;
+            }
+            cursor = parent_of.get(&id).copied().flatten();
+        }
+
+        Ok(())
+    }
+
+    /// 查询**从根节点出发走不到**的菜单（结构已损坏、但仍留在库里）
+    ///
+    /// `build_tree` 会把这类节点静默剪掉，所以管理员在菜单页看不到它们——
+    /// 这正是 v0.16.0 之前"成环后无法自救"的由来：本接口让它们**被看见**。
+    ///
+    /// 损坏来源有两个，修复动作相同（挂到根下），所以合并成一类：
+    /// - **成环**：FK 挡不住，`update_menu` 曾经也不校验
+    /// - **孤儿**：`parent_id` 指向不存在的菜单（FK 已堵住，此处兜底）
+    pub async fn find_unreachable(&self) -> Result<Vec<UnreachableMenu>, AppError> {
+        let all = self.find_all().await?;
+        let exists: HashSet<Uuid> = all.iter().map(|m| m.id).collect();
+
+        // 从根（parent_id IS NULL）出发做前沿扩展，标记可达集合。
+        // 用 HashSet 去重：即便库里已经有环，也不会转圈停不下来。
+        let mut reachable: HashSet<Uuid> = HashSet::new();
+        let mut frontier: Vec<Uuid> = all
+            .iter()
+            .filter(|m| m.parent_id.is_none())
+            .map(|m| m.id)
+            .collect();
+        reachable.extend(frontier.iter().copied());
+
+        while let Some(id) = frontier.pop() {
+            for m in all.iter().filter(|m| m.parent_id == Some(id)) {
+                if reachable.insert(m.id) {
+                    frontier.push(m.id);
+                }
+            }
+        }
+
+        Ok(all
+            .iter()
+            .filter(|m| !reachable.contains(&m.id))
+            .map(|m| UnreachableMenu {
+                id: m.id,
+                name: m.name.clone(),
+                parent_id: m.parent_id,
+                reason: match m.parent_id {
+                    // 有父级且父级存在却仍不可达 ⇒ 只可能是成环
+                    Some(pid) if exists.contains(&pid) => "菜单树成环，无法从根节点到达",
+                    _ => "上级菜单不存在（悬空引用）",
+                }
+                .to_string(),
+                sort_order: m.sort_order,
+            })
+            .collect())
+    }
+
     /// 新增菜单
     pub async fn create(&self, menu: &Menu) -> Result<Menu, AppError> {
+        // 新建节点不可能是任何节点的祖先（id 全新），但父级存在性仍要自己查：
+        // FK 抛出来的是 500「服务器内部错误」，入参问题不该伪装成服务端故障。
+        if let Some(parent) = menu.parent_id {
+            self.ensure_attachable(None, parent).await?;
+        }
+
         sqlx::query_as::<_, Menu>(
             &format!(
                 r#"
@@ -283,7 +400,23 @@ impl MenuRepository {
         actor_id: Uuid,
     ) -> Result<Menu, AppError> {
         let menu = self.find_by_id(id).await?;
-        let parent_id = fields.parent_id.or(menu.parent_id);
+        // `parent_id` 是三态的（见 `UpdateMenuRequest`）：
+        // 没传 → 保持原样；`Some(None)` → 摘成根；`Some(Some(pid))` → 挂到 pid 下。
+        //
+        // 只在父级**真的变更**时校验"挂得上去吗"——FK 挡不住成环，
+        // 而成环会让整棵子树静默消失、删除永久挂起（见 `ensure_attachable`）。
+        //
+        // 刻意**不**校验"父级没变"的情况：那种数据本来就已经在库里了，
+        // 拒绝这次写入既救不了它，还会顺带把改名、改图标这类无害操作也堵死——
+        // 包括"把环上的节点摘成根"这条唯一的自救操作（它走 `Some(None)`，
+        // 本就不该被拦）。
+        let parent_id = match &fields.parent_id {
+            Some(new_parent) => *new_parent,
+            None => menu.parent_id,
+        };
+        if let Some(parent) = parent_id {
+            self.ensure_attachable(Some(id), parent).await?;
+        }
         let name = fields.name.as_deref().unwrap_or(&menu.name);
         let path = fields.path.as_deref().or(menu.path.as_deref());
         let component = fields.component.as_deref().or(menu.component.as_deref());
@@ -401,12 +534,18 @@ impl MenuRepository {
     ///
     /// 只返回**已授予**的码：没人依赖的码删掉不改变任何人的权限，
     /// 不该计入守卫要求（否则"整理菜单结构"这类无害操作会全线报错）。
+    ///
+    /// 递归项用 **`UNION` 而非 `UNION ALL`**：`UNION ALL` 不去重，
+    /// 遇到成环数据会**永不收敛**，这个查询不返回 → `DELETE /api/admin/menus/:id`
+    /// 永久挂起且连接不归还 → 占满连接池后全站 500（v0.17.0 实测复现）。
+    /// `UNION` 按 `id` 去重，环上转一圈就停，语义在无环数据上与 `UNION ALL` 完全一致。
+    /// [`Self::ensure_attachable`] 负责让环**进不来**，这里是第二道防线。
     pub async fn granted_codes_in_subtree(&self, id: Uuid) -> Result<Vec<String>, AppError> {
         sqlx::query_scalar(
             r#"
             WITH RECURSIVE subtree AS (
                 SELECT id FROM menus WHERE id = $1
-                UNION ALL
+                UNION
                 SELECT m.id FROM menus m JOIN subtree s ON m.parent_id = s.id
             )
             SELECT DISTINCT m.permission

@@ -209,6 +209,9 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
             "/api/admin/menus",
             get(menu::list_menus).post(menu::create_menu),
         )
+        // 静态段优先于 `{id}`：matchit 会先匹配字面量，`diagnostics` 不会被
+        // 当成菜单 id 去喂给 `update_menu`/`delete_menu`。
+        .route("/api/admin/menus/diagnostics", get(menu::menu_diagnostics))
         .route(
             "/api/admin/menus/{id}",
             axum::routing::put(menu::update_menu).delete(menu::delete_menu),

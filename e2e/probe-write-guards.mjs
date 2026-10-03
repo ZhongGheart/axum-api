@@ -50,12 +50,22 @@ const REGISTRY = {
     kind: 'grant-ceiling',
     minCodes: ['system:user:create'],
     note: '建号时授予的角色不得超出调用方已持有的权限码',
-    arm: async (ctx) => ({
-      req: { method: 'POST', path: '/api/admin/users',
-             body: { username: ctx.name(), email: ctx.name() + '@example.com',
-                     password: PW, roles: [ctx.strongRole.name] } },
-      username: ctx.pending(),
-    }),
+    arm: async (ctx) => {
+      // 名字只取一次，且 body 与 verify 必须用**同一个**名字。
+      // 原先这里 body 用 ctx.name()、verify 查 ctx.pending()，是两个值：
+      // verify 检查的是一个从未被创建过的账号，于是"数据侧未变"恒真——
+      // 哪怕拒绝侧真的越权建出了号，这条断言也照样绿。
+      const u = ctx.name()
+      // admin 那次（放行侧）会真的建出这个号，它不在 created.users 里，
+      // 于是每跑一轮就在库里留一个孤儿账号。登记名字，清理时按名字兜底删。
+      created.namedUsers.push(u)
+      return {
+        req: { method: 'POST', path: '/api/admin/users',
+               body: { username: u, email: u + '@example.com',
+                       password: PW, roles: [ctx.strongRole.name] } },
+        username: u,
+      }
+    },
     verify: async (s, ctx, t) => {
       const r = await api('GET', '/api/admin/users?page=1&page_size=200')
       const hit = (r.body?.data?.items || []).some((u) => u.username === t.username)
@@ -296,7 +306,10 @@ s.check('登记表里没有已下线的入口（否则探测静默失效）',
 
 // ──────────────────────────────────────────────
 s.log('\n[2] 造共享夹具与清理账本')
-const created = { users: [], roles: [], menus: [] }
+// `namedUsers` 记的是**只知其名不知其 id**的账号：放行侧那条
+// `POST /api/admin/users` 是裸请求，不经 mkUser，拿不到返回值里的 id。
+// 少了这一栏，那条路径建出来的账号就永远不进清理账本。
+const created = { users: [], roles: [], menus: [], namedUsers: [] }
 let seq = 0
 const name = () => uniq + '_x' + (seq++)
 
@@ -336,6 +349,69 @@ async function roleExistsByName(name) {
     if (items.length < pageSize) return false
   }
   return false
+}
+
+/** 按名字找账号 id（找不到返回 null）。
+ *
+ *  与 roleExistsByName 同理：`GET /api/admin/users` 自 v0.10.0 起是分页对象，
+ *  探针刚建的账号一定落在最后一页，只读第一页会把"账号还在"误判成已删。
+ */
+async function userIdByName(username) {
+  const pageSize = 200
+  for (let page = 1; page <= 50; page++) {
+    const r = await api('GET', `/api/admin/users?page=${page}&page_size=${pageSize}`)
+    const items = r.body?.data?.items || []
+    const hit = items.find((x) => x.username === username)
+    if (hit) return hit.id
+    if (items.length < pageSize) return null
+  }
+  return null
+}
+
+/**
+ * 按前缀扫库找残留，返回人类可读的清单
+ *
+ * 三张表都要查，且菜单只能顺着**树**查：探针造的按钮没有上级，直接挂在
+ * 树根上（`GET /api/admin/menus` 返回的 data 就是根数组）。查不到不等于
+ * 已删除——成环节点在树上永远不可见，这是 v0.17.0 刚踩过的坑，
+ * 所以这里宁可多报也不漏报：菜单侧查不到时补一次 diagnostics。
+ */
+async function findResidue(prefix) {
+  const out = []
+  // 必须翻到最后一页：这个库是共享的，别人留下的残留可能把探针的夹具
+  // 挤出第一页。只扫第一页会把"残留还在"报成"无残留"——比不查更糟。
+  const scan = async (path, field, label) => {
+    const pageSize = 200
+    for (let page = 1; page <= 50; page++) {
+      const r = await api('GET', `${path}?page=${page}&page_size=${pageSize}`)
+      const items = r.body?.data?.items || []
+      for (const it of items) {
+        if ((it[field] || '').startsWith(prefix)) out.push(label + ' ' + it[field])
+      }
+      if (items.length < pageSize) return
+    }
+    out.push(label + ' 扫描超过 50 页仍未到末页，结果不可信')
+  }
+  await scan('/api/admin/users', 'username', '用户')
+  await scan('/api/admin/roles', 'name', '角色')
+  const tree = await api('GET', '/api/admin/menus')
+  const walk = (nodes) => {
+    for (const n of nodes || []) {
+      if ((n.name || '').startsWith(prefix)) {
+        out.push('菜单 ' + n.name + (n.permission ? '（码 ' + n.permission + '）' : ''))
+      }
+      walk(n.children)
+    }
+  }
+  walk(tree.body?.data)
+  // 树上看不见的节点只能靠 diagnostics 找：成环或深度异常时它不会出现在树上。
+  // 该端点返回的是裸数组（ApiResponse<Vec<UnreachableMenu>>），不是对象。
+  const diag = await api('GET', '/api/admin/menus/diagnostics')
+  const broken = Array.isArray(diag.body?.data) ? diag.body.data : []
+  for (const u of broken) {
+    if ((u.name || '').startsWith(prefix)) out.push('不可达菜单 ' + u.name)
+  }
+  return out
 }
 
 const menuIdCache = new Map()
@@ -390,11 +466,9 @@ async function mkCodeButton(code) {
 const strongRole = await mkRole(uniq + '_strong', ['system:log:list', 'system:role:delete'])
 s.check('建强角色（持 log:list / role:delete）', true)
 
-const pendingNames = []
 const ctx = {
   strongRole,
   name,
-  pending: () => { const n = name() + '_pending'; pendingNames.push(n); return n },
   freshStrongUser: async () => mkUser(name() + '_strongu', [strongRole.name]),
   freshCodeRole: async (codes) => mkRole(name() + '_coderole', codes),
   freshCodeButton: (code) => mkCodeButton(code || ('probe:' + uniq + ':' + (seq++))),
@@ -478,11 +552,31 @@ for (const [entry, def] of entries) {
 
 // ──────────────────────────────────────────────
 s.log('\n[4] 清理')
-// 先删用户再删角色再删菜单：user_roles/role_menus 是 CASCADE，顺序反了会被守卫挡
+// 顺序不是随意排的，每一步都在绕开一道守卫：
+//
+//   1. 先删用户。删角色时若仍有人持有它会被 400 挡回——user_roles 虽是
+//      CASCADE，守卫却要求"请先调整这些用户的角色"，不会自动解绑。
+//   2. 再把每个角色的授权收回空集。**这一步是本轮补上的关键**：探针自己
+//      造的 `probe:<uniq>:<n>` 是全新权限码，admin 从未持有过它；而
+//      v0.8.0/v0.9.0 的授权下界规定"删除承载权限码的角色/菜单 = 剥夺那个码"，
+//      要求调用者自己持有该码。于是删这些角色/菜单必然 403。降权方向（收回
+//      授权）不设这道限，所以"先收回、再删"是唯一走得通的路。
+//      原先直接删，探针每跑一轮就在库里留一批谁也删不掉的角色与按钮，
+//      而它自己还报告"探针夹具已全部清理"。
+//   3. 最后删菜单。此时 role_menus 已空，`granted_codes_in_subtree` 返回空，
+//      守卫不触发。
+//
 // 清理同样走限流包装：这里若撞上 429 就会留下垃圾数据，
 // 而"共享环境里身后无残留"是这个工具能反复运行的前提
+for (const uname of created.namedUsers) {
+  const found = await userIdByName(uname)
+  if (found) await callApi(() => s.api('DELETE', '/api/admin/users/' + found))
+}
 for (const id of created.users) {
   await callApi(() => s.api('DELETE', '/api/admin/users/' + id))
+}
+for (const id of created.roles) {
+  await callApi(() => s.api('PUT', '/api/admin/roles/' + id + '/menus', { menu_ids: [] }))
 }
 for (const id of created.roles) {
   await callApi(() => s.api('DELETE', '/api/admin/roles/' + id))
@@ -490,10 +584,15 @@ for (const id of created.roles) {
 for (const id of created.menus) {
   await callApi(() => s.api('DELETE', '/api/admin/menus/' + id))
 }
-s.check('探针夹具已全部清理',
-  created.users.length + created.roles.length + created.menus.length > 0,
-  '用户 ' + created.users.length + ' / 角色 ' + created.roles.length
-  + ' / 菜单 ' + created.menus.length)
+
+// 断言"清理干净"必须查库，不能查账本：账本只能证明"我打算删的都发了请求"，
+// 证明不了删除真的成功（403/400 都会被 callApi 静静吞掉）。
+// 原先那句 `created.*.length > 0` 判的是"我建过东西"，标签却写着"已全部清理"
+// ——方向正好反了，于是残留永远无人察觉。
+const residue = await findResidue(uniq)
+s.check('探针夹具已全部清理（按名字复查库，不看账本）',
+  residue.length === 0,
+  residue.length ? '仍有残留：' + residue.join(' | ') : '无残留')
 
 s.log('\n[5] 落盘报告')
 mkdirSync(ARTIFACTS, { recursive: true })

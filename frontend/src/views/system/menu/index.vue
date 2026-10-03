@@ -7,6 +7,33 @@
     </n-page-header>
 
     <n-card>
+      <!--
+        结构损坏的菜单被 build_tree 静默剪掉，在下面的树里根本看不到。
+        这里把它们显出来，否则管理员只知道"少了菜单"，不知道被剪掉的是哪些、
+        更不知道它们还留在库里。
+      -->
+      <n-alert
+        v-if="unreachable.length > 0"
+        type="error"
+        :show-icon="true"
+        class="broken-menu-alert"
+      >
+        <div class="broken-menu-title">
+          有 {{ unreachable.length }} 个菜单不在菜单树里：它们无法从根节点到达，因此不会出现在侧栏和管理页中
+        </div>
+        <n-list>
+          <n-list-item v-for="m in unreachable" :key="m.id">
+            <div class="broken-menu-row">
+              <span>{{ m.name }}</span>
+              <n-tag size="small" type="error" :bordered="false">{{ m.reason }}</n-tag>
+              <n-button size="tiny" type="warning" @click="handleDetach(m.id, m.name)">
+                摘成根菜单
+              </n-button>
+            </div>
+          </n-list-item>
+        </n-list>
+      </n-alert>
+
       <n-tree
         :data="treeData"
         :default-expand-all="true"
@@ -22,6 +49,20 @@
       <n-form ref="formRef" :model="formData" :rules="rules" label-placement="left" label-width="80px">
         <n-form-item label="菜单名称" path="name">
           <n-input v-model:value="formData.name" />
+        </n-form-item>
+        <!--
+          此前弹窗里根本没有上级字段，而提交时却会带上 `parentId` 的**上次残留值**：
+          先在 A 节点点"新增子菜单"、再点 B 节点"编辑"保存，B 就被静默挂到 A 下，
+          而界面上没有任何东西提示这件事。
+        -->
+        <n-form-item label="上级菜单" path="parent_id">
+          <n-tree-select
+            v-model:value="parentId"
+            :options="parentOptions"
+            :clearable="true"
+            placeholder="不选则为顶级菜单"
+            check-strategy="child"
+          />
         </n-form-item>
         <n-form-item label="类型" path="type">
           <n-select v-model:value="formData.type" :options="typeOptions" />
@@ -58,7 +99,8 @@ import { NSpace, NIcon, NTooltip, NTag } from 'naive-ui'
 import { AddOutline as AddIcon, CreateOutline as EditIcon, TrashOutline as DelIcon, RefreshOutline as RestoreIcon } from '@vicons/ionicons5'
 import type { FormInst, FormRules, TreeOption } from 'naive-ui'
 import { menuApi } from '@/api/menu'
-import type { MenuNode, CreateMenuReq } from '@/api/menu'
+import type { MenuNode, CreateMenuReq, UnreachableMenu } from '@/api/menu'
+import { buildParentOptions } from '@/utils/menu'
 import { PERM } from '@/constants/permission'
 import { showConfirm, showSuccess } from '@/utils/message'
 import PermissionButton from '@/components/common/PermissionButton.vue'
@@ -78,6 +120,25 @@ const treeData = ref<TreeOption[]>([])
  * 否则管理员看到的就是一个"这个按钮怎么没权限了"的按钮，无从找回。
  */
 const restorableById = ref<Record<string, string>>({})
+
+/**
+ * 走不到根、因而不在任何菜单树里的菜单
+ *
+ * 树本身看不见它们（后端静默剪掉了），所以只能单独查诊断接口。
+ * 没有这一条时，成环的菜单会一直"人间蒸发"：管理员既找不到它，也就没法修。
+ */
+const unreachable = ref<UnreachableMenu[]>([])
+
+/** 上级菜单候选项：编辑时排除自身与自身整棵子树 */
+const parentOptions = ref<TreeOption[]>([])
+
+/**
+ * 后端返回的原始菜单树
+ *
+ * 单独留一份而不是从 `treeData`（`TreeOption[]`）反推：
+ * 上级候选项要按 id 找父节点、按子树排除，两处都依赖 `MenuNode` 的原始形状。
+ */
+const rawTree = ref<MenuNode[]>([])
 
 const typeOptions = [
   { label: '目录', value: 'directory' },
@@ -113,9 +174,13 @@ async function fetchTree() {
       if (n.children?.length) collect(n.children)
     }
   }
-  collect(res as unknown as MenuNode[])
+  rawTree.value = res as unknown as MenuNode[]
+  collect(rawTree.value)
   restorableById.value = restorable
-  treeData.value = buildTreeOptions(res as unknown as MenuNode[])
+  treeData.value = buildTreeOptions(rawTree.value)
+  // 响应拦截器已在运行时解包 `data`，但泛型签名仍标成 AxiosResponse<T>；
+  // 本文件对 `list()` 用的是同一套处理方式。
+  unreachable.value = (await menuApi.diagnostics()) as unknown as UnreachableMenu[]
 }
 
 function buildTreeOptions(nodes: MenuNode[]): TreeOption[] {
@@ -161,6 +226,8 @@ async function openCreate(pid: string | null) {
   isEditing.value = false
   editingId.value = ''
   parentId.value = pid
+  // 上级候选项此时不该排除任何节点：新建的菜单还不存在
+  parentOptions.value = buildParentOptions(rawTree.value)
   formData.value = { name: '', type: 'menu', path: '', icon: '', sort_order: 0, permission: '', is_visible: true }
   showModal.value = true
 }
@@ -168,6 +235,21 @@ async function openCreate(pid: string | null) {
 async function openEdit(id: string) {
   isEditing.value = true
   editingId.value = id
+  // 必须**重置** parentId：它是跨弹窗共享的 ref，
+  // 留着上一次的"新增子菜单"目标就会在保存时静默把当前菜单挂过去。
+  // 顺带把上级候选项算出来：排除自身与自身子树（挂到下级里会成环）。
+  const flat = rawTree.value
+  const findNode = (list: MenuNode[]): MenuNode | undefined => {
+    for (const n of list) {
+      if (n.id === id) return n
+      const hit = findNode(n.children ?? [])
+      if (hit) return hit
+    }
+    return undefined
+  }
+  const current = findNode(flat)
+  parentId.value = current?.parent_id ?? null
+  parentOptions.value = buildParentOptions(flat, id)
   showModal.value = true
 }
 
@@ -175,7 +257,9 @@ async function handleSubmit() {
   try {
     await formRef.value?.validate()
     submitting.value = true
-    const data: CreateMenuReq = { ...formData.value, parent_id: parentId.value || undefined }
+    // `parent_id` 必须显式发出去（含 `null`）：不传是"本次不改父级"，
+    // 传 `null` 才是"摘成根"。用 `|| undefined` 会把两者混成前者。
+    const data: CreateMenuReq = { ...formData.value, parent_id: parentId.value || null }
     if (isEditing.value) {
       await menuApi.update(editingId.value, data)
       showSuccess('更新成功')
@@ -186,6 +270,19 @@ async function handleSubmit() {
     showModal.value = false
     fetchTree()
   } catch { /* handled */ } finally { submitting.value = false }
+}
+
+/** 把不在树上的菜单摘成根，让它重新可见（诊断条上的修复入口） */
+async function handleDetach(id: string, name: string) {
+  const ok = await showConfirm({
+    content: `把「${name}」摘成顶级菜单？它会立刻重新出现在菜单树里。`,
+  })
+  if (!ok) return
+  try {
+    await menuApi.update(id, { parent_id: null })
+    showSuccess('已摘成顶级菜单')
+    await fetchTree()
+  } catch { /* handled */ }
 }
 
 async function handleDelete(id: string) {
@@ -209,3 +306,20 @@ async function handleRestore(id: string) {
 
 onMounted(fetchTree)
 </script>
+
+<style scoped>
+.broken-menu-alert {
+  margin-bottom: 12px;
+}
+
+.broken-menu-title {
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.broken-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+</style>

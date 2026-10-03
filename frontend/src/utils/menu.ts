@@ -84,3 +84,43 @@ export function filterKnownMenuIds(checked: Array<string | number>, tree: TreeOp
     .map((key) => String(key))
     .filter((key) => known.has(key))
 }
+
+/** 收集 `nodes` 里 id 为 `rootId` 的节点及其**整棵子树**的 ID */
+export function collectSubtreeIds(nodes: MenuNode[], rootId: string): Set<string> {
+  const ids = new Set<string>()
+  const walk = (list: MenuNode[], inside: boolean) => {
+    for (const node of list) {
+      const hit = inside || node.id === rootId
+      if (hit) ids.add(node.id)
+      if (node.children?.length) walk(node.children, hit)
+    }
+  }
+  walk(nodes, false)
+  return ids
+}
+
+/**
+ * 编辑菜单时的"上级菜单"候选项
+ *
+ * **排除自身与自身整棵子树**：把一个目录挂到它自己的下级里会让菜单树成环，
+ * 后果是整棵子树从侧栏与管理页同时消失、且删除请求永久挂起（v0.17.0 修掉的缺陷）。
+ * 这里只是把明显的非法选项藏起来以减少误操作——**真正拦住成环的是后端校验**，
+ * 不依赖前端（前端过滤在数据陈旧时必然有漏网之鱼）。
+ *
+ * 顺带排除按钮型菜单：按钮不参与导航层级，挂在按钮下没有任何意义。
+ */
+export function buildParentOptions(nodes: MenuNode[], excludeSubtreeOf?: string | null): TreeOption[] {
+  const excluded = excludeSubtreeOf ? collectSubtreeIds(nodes, excludeSubtreeOf) : new Set<string>()
+  const walk = (list: MenuNode[]): TreeOption[] =>
+    list
+      .filter((node) => !excluded.has(node.id) && node.type !== 'button')
+      .map((node) => {
+        const children = walk(node.children ?? [])
+        return {
+          key: node.id,
+          label: node.name,
+          children: children.length ? children : undefined,
+        }
+      })
+  return walk(nodes)
+}

@@ -58,12 +58,23 @@ await s.shot('v014-retention-banner')
 
 s.log('\n[4] 筛到已被清理的时间范围时提示')
 
+// 判定"范围提示"必须锚定它自己的文案，**不能**只找"早于"两个字。
+//
+// 页面上有两条 alert，两条都会含"早于"：
+//   - 范围提示：「所选时间范围早于现存最老一条日志…」
+//   - 清理横幅：「删除 N 条（早于 <cutoff> 的数据…）」← 只在跑过清理后出现
+// 用宽匹配的话，清理横幅一旦存在，下面那条"未设范围时不该出现"就会假红，
+// 且这个假红只在**清理任务跑过之后**才出现——典型的状态依赖型 flaky。
+// （v0.17.0 门禁实测撞到：v0.16.0 当时是绿的，库里有了清理记录就变红。）
+const RANGE_WARN_MARK = 'const m = (t) => t.includes("所选时间范围早于") || t.includes("空结果不代表");';
+
 // 反向判据：还没设范围时**不该**出现该提示。
 // 只断言"出现了"的话，一个常驻的提示条也能让这条绿——
 // 而常驻提示会天天在眼前喊"数据可能丢了"，直到没人再读它为止。
 const warnBefore = await s.evalJs(
   'const texts = [...document.querySelectorAll(".n-alert")].map(a => a.innerText);'
-  + ' return texts.some(t => t.includes("早于") || t.includes("已被保留策略清理"));'
+  + RANGE_WARN_MARK
+  + ' return texts.some(m);'
 )
 s.check('未设范围时不出现该提示（提示不是常驻的）', warnBefore === false,
   warnBefore ? '没设范围却已出现提示' : '未出现')
@@ -99,7 +110,8 @@ await wait(1500)
 
 const warned = await s.evalJs(
   'const texts = [...document.querySelectorAll(".n-alert")].map(a => a.innerText);'
-  + ' return texts.some(t => t.includes("早于") || t.includes("已被保留策略清理"));'
+  + RANGE_WARN_MARK
+  + ' return texts.some(m);'
 )
 s.check('页面上提示了"所选范围早于现存最早一条"', warned,
   warned ? '' : '未出现提示：筛一个已被清理的区间却毫无说明')

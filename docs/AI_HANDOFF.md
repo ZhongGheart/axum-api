@@ -4037,3 +4037,371 @@ CHANGELOG 新增 `[0.16.0]`；README 第 62 行字典能力描述改为如实描
 ### 尚未提交
 
 全部改动仍在工作区，**未提交、未推送**（按用户指令：全部完成或收到指令才统一推送）。
+
+## v0.17.0 缺口分析（2026-10-03，本轮只读分析，未动代码）
+
+### 起始 git 状态
+
+- 分支 `master`，HEAD = `472d60c1 feat(v0.16.0): 字典的三个开关都是摆设`
+- 工作区干净。v0.16.0 已发布：master 已推送，
+  v0.10.0–v0.16.0 七个 annotated tag + GitHub Release 全部创建并推送完毕。
+- 本轮唯一写操作：往本文件追加本节，以及清理 dev 库探针夹具。
+
+### 主题：菜单树能成环 → 整棵子树静默消失 → 递归查询永不收敛 → 全站瘫
+
+与 v0.10–v0.16 同一根因族：**写入返回 200，但对实际行为毫无影响，甚至有害。**
+
+上一轮 checkpoint 只测到"成环后菜单静默消失"。本轮把它往下挖了两层，
+破坏等级从"一个功能坏"升级为"整个服务不可用且界面无法自救"。
+
+### 根因（代码位置）
+
+`src/repository/menu.rs:286`
+
+```rust
+let parent_id = fields.parent_id.or(menu.parent_id);
+```
+
+`update()` 对 `parent_id` **不做任何校验**，直接进 `UPDATE menus SET parent_id=$2`：
+
+- 不校验 `parent_id != 自身 id`（自引用）
+- 不做环检测（把父节点挂到自己的子孙下面）
+- 控制器层 `src/controller/menu.rs:181 update_menu` 只防了 `permission` 改写旁路，
+  `parent_id` 一路裸奔到 SQL
+- 数据库 `menus_parent_id_fkey` 只能挡住"指向不存在的菜单"（所以**孤儿节点不可能出现**，
+  上一轮那个孤儿假设已被 FK 证伪），**挡不住环**
+
+`create()` 路径同样直接 `.bind(menu.parent_id)`，无校验。
+
+### 破坏链（三级，全部实测）
+
+**第一级：菜单及其整棵子树静默消失，且管理页看不见它**
+
+`build_tree`（`menu.rs:535`）判定根节点看"父节点是否在集合内"。
+成环后环上每个节点的父都在集合内，于是**没有一个被判定为根 → 整支被剪掉**。
+不报错、不超时，只是消失。
+
+实测（真实种子菜单「用户管理」`7f000000-...-0007`，父「系统管理」`...-0006`）：
+
+```
+PUT /api/admin/menus/{用户管理}  parent_id={用户管理}   -> 200
+修改前侧栏含「用户管理」: True    修改后: False
+GET /api/admin/menus 侧栏字节数 4531 -> 4201
+```
+
+关键：`GET /api/auth/menus`（侧栏，所有用户）和 `GET /api/admin/menus`（管理页数据源）
+**是同一棵树、同一个 `build_tree`**，所以菜单在管理页**也消失**。
+管理员在界面上看不到它 → 也就无法点开改回来 → 只能直连数据库救。
+审计把这次操作记为一次**正常成功**的更新。
+
+**第二级：删除守卫永久挂起**
+
+`granted_codes_in_subtree`（`menu.rs:404`）用 `WITH RECURSIVE ... UNION ALL` 走子树。
+`UNION ALL` 不去重 → **环上永不收敛**。实测（`statement_timeout='5s'` 兜底才停下来）：
+
+```
+ERROR:  canceling statement due to statement timeout
+```
+
+实际服务路径 `DELETE /api/admin/menus/{环上任意节点}`
+（经 `controller/menu.rs:326` 调用）：客户端 10s 超时，**无响应，连接不归还**。
+
+也就是说：环一旦形成，**连"删掉它"这条自救路也同时被堵死**。
+
+**第三级：连接池被占满 → 整个 API 服务不可用**
+
+连接池上限默认 20（`src/config/mod.rs:168` `DB_POOL_MAX_SIZE`，无默认覆盖），
+代码里**没有 `statement_timeout`**。构造 28 节点大环后并发 22 个 DELETE：
+
+```
+19 个请求挂起（客户端 25s 超时，http=000）
+ 3 个请求 500（等不到连接，10s acquire_timeout）
+库内状态：active x21，最长已跑 41s 且持续增长
+```
+
+此时一个与菜单**毫无关系**的端点：
+
+```
+GET /api/admin/users -> 500 (10.003s)   # 池被占满，acquire 超时
+```
+
+**这不是菜单功能坏了，是全站 500。** 且恢复手段只有两条：
+直连 DB 手改，或重启后端——而界面上一个入口都没有。
+
+### 同族第二处缺陷（前端，静默改结构）
+
+`frontend/src/views/system/menu/index.vue`
+
+- `openEdit(id)`（约 L160）只设 `isEditing/editingId/showModal`，**不重置 `parentId`**
+- `handleSubmit()`（约 L178）统一发 `parent_id: parentId.value || undefined`
+- 弹窗模板（L21–L54）**根本没有父级选择字段**，管理员无从设置、也无从察觉
+
+后果：先点某个节点的「新增子菜单」（`openCreate(pid)` 把 `parentId` 设成该节点），
+再点任意节点的「编辑」并保存 → 被编辑的菜单**被静默挂到上一次那个父节点下**，
+弹窗里没有任何东西提示这件事。菜单层级在管理员不知情的情况下被改了。
+
+（这解释了为什么第一级缺陷必须用 curl 复现：走 UI 编辑路径不会带上 `parent_id`，
+是上面这条"脏状态泄漏"路径才会。）
+
+### 附带纠正一个错误判断（写下来免得下次再踩）
+
+"菜单在树上找不到 ⇒ 已删除"是**错的**。成环节点在树上永远不可见，
+所以上轮以为已删净的 A/B 探针其实还留在库里（本轮查库才发现，
+`DELETE` 因第二级挂起根本没生效）。删除是否成功**只能查 DB 确认**。
+
+### 本轮探针清理结果
+
+- 删 `池探针*` 26 条、`环探针*` 2 条、上一轮遗留 A/B 2 条、`prb*` 4 条
+- dev 库 `axum_api_manual` 复位到 42 菜单，悬空父 0，环 0，可达节点 42/42
+- 挂起的后端连接已 `pg_terminate_backend` 清场，`GET /api/admin/users` 恢复 200 (0.007s)
+- 注：`prb%` 那 4 条按钮型菜单是**更早的 e2e/probe**留下的，不属本轮；本轮一并清掉
+
+### 下一步
+
+按用户指令**只出计划、不实现**。v0.17.0 计划见本会话回复，
+核心修复面：`update`/`create` 双路径加 parent_id 校验（存在 + 非自身 + 不在自身子树内，
+把现有递归 CTE 改成 `UNION` 或加环检测终止条件）+ 前端补父级字段并重置脏状态 +
+不可达菜单要能被看见和修复。
+
+### 同族第三处缺陷（后端，写入成功但毫无影响）
+
+`UpdateMenuRequest.parent_id: Option<Uuid>`（`src/model/menu.rs:100`）里
+**「没传这个字段」与「显式传 `null`」不可区分**，而 `update()` 用的是
+`fields.parent_id.or(menu.parent_id)`（`menu.rs:286`）。
+
+实测（把「用户管理」摘成根菜单）：
+
+```
+PUT /api/admin/menus/{用户管理}  {"parent_id": null}  -> 200
+返回体里的 parent_id = 7f000000-...-0006   # 仍是「系统管理」
+库里真实 parent_id   = 7f000000-...-0006   # 没变
+```
+
+即：**无法通过 API 把任何菜单摘成根菜单**——请求成功、返回 200、
+字段原样回显，但结构纹丝不动，没有任何提示说明它被忽略了。
+
+而前端弹窗又没有父级字段（见上），于是当前 UI + API 组合下
+**管理员根本没有任何途径调整菜单层级**，只能新建。
+
+## v0.17.0 动手前的计划（2026-10-03）
+
+### 起始 git 状态
+
+- 分支 `master`，HEAD = `472d60c1 feat(v0.16.0): 字典的三个开关都是摆设`
+- 工作区仅 `docs/AI_HANDOFF.md` 被修改（上一节的分析记录）
+- 版本号 0.16.0。**本版完成后 bump 到 0.17.0**，
+  bump 后必须 `cargo update --offline -p axum-api`，否则 `cargo clippy --locked` 报错
+
+### 修复面（4 块，动手前先定死，避免实现期漂移）
+
+| # | 改动 | 文件 |
+|---|---|---|
+| 1 | `parent_id` 三态化：区分「没传」/「显式 null=摘成根」/「指定父级」 | `src/model/menu.rs` |
+| 2 | 挂载校验：父级必须存在、非自身、不在自己子树内（Rust 侧向上走 + visited 集合） | `src/repository/menu.rs` |
+| 3 | 递归 CTE `UNION ALL` → `UNION`：库里已有环时 DELETE 也不会挂起 | `src/repository/menu.rs` |
+| 4 | 结构诊断 + 自救：`GET /api/admin/menus/diagnostics` + 前端告警条与一键摘成根 | `src/repository/menu.rs`、`src/controller/menu.rs`、`src/router/mod.rs`、`frontend/src/api/menu.ts`、`frontend/src/views/system/menu/index.vue` |
+
+### 关键决定
+
+1. **环检测放在 Rust 侧，不放 SQL 递归**
+   向上沿 `parent_id` 走，用 `HashSet` 记 visited。这样做的理由：
+   库里**可能已经存在环**（历史脏数据 / 直连 DB 写入），
+   任何无 visited 的向上遍历自己就会死循环——用 SQL 递归同样躲不掉。
+   顺带把「父级不存在」也一起给出可操作消息，而不是让 FK 抛 500。
+
+2. **自救复用 `PUT /admin/menus/:id` + `parent_id: null`，不新增写接口**
+   第 1 项做完，「摘成根」这条最朴素的修复动作就自动可用了。
+   diagnostics 只负责**把坏节点显出来**，修复仍走既有公开 API，
+   避免多出一条只有诊断页在用、却同样有权限需求的写路径。
+
+3. **不改 `build_tree` 的「父不在集合内即视为根」语义**
+   那条语义在按角色过滤时是**必需且正确**的（勾了子菜单没勾上级目录的角色
+   需要看到子菜单）。把坏节点显出来只能另开诊断口，不能改树本身的构造。
+
+4. 前端父级下拉**排除自身与自身子树**，但这只是减少误操作；
+   真正拦住环的是后端校验，不依赖前端。
+
+### 承重验证（证明修好了，不是证明没坏）
+
+- 集成测试（`--ignored`，真实 PG）：自引用被拒 / 挂到孙节点被拒 / 挂到不存在的父被拒 /
+  合法改父成功 / `parent_id: null` 真的摘成根 / 诊断口能报出人为造的环
+- 回归：既有的 `an_invalid_menu_type_is_a_bad_request`、
+  `deleting_a_menu_removes_its_nested_permission_buttons` 等不得变红
+- 缺陷注入：逐个注释掉校验点，确认对应测试变红
+- CTE 终止性：库里造环后直接跑 DELETE，必须有响应（不再挂起）
+- 前端单测 + e2e 套件
+
+## v0.17.0 实施记录（2026-10-03，已完成，门禁全绿）
+
+### 起始 git 状态
+
+- `master`，HEAD = `472d60c1 feat(v0.16.0): 字典的三个开关都是摆设`
+- 工作区只有 `docs/AI_HANDOFF.md`（本轮分析记录）
+- 版本 0.16.0 → **已 bump 到 0.17.0**（`Cargo.toml` / `frontend/package.json` / `Cargo.lock`，
+  bump 后跑了 `cargo update --offline -p axum-api`，故 `cargo clippy --locked` 通过）
+
+### 实际改了哪些文件
+
+| 文件 | 改动 |
+|---|---|
+| `src/model/menu.rs` | `UpdateMenuRequest.parent_id` → `Option<Option<Uuid>>` + `double_option` 反序列化器；新增 `UnreachableMenu`；新增三态单测 |
+| `src/repository/menu.rs` | 新增 `ensure_attachable`（环检测，Rust 侧向上走 + visited）、`find_unreachable`；`create`/`update` 接上校验；递归 CTE `UNION ALL` → `UNION` |
+| `src/controller/menu.rs` | 新增 `GET /api/admin/menus/diagnostics`；`update_menu` 审计补记移动/摘成根 |
+| `src/router/mod.rs` | 注册 `/api/admin/menus/diagnostics`（静态段优先于 `{id}`） |
+| `src/docs/mod.rs` | 新路由登记进 OpenAPI 契约 |
+| `frontend/src/utils/menu.ts` | 新增 `collectSubtreeIds` / `buildParentOptions` |
+| `frontend/src/api/menu.ts` | `parent_id?: string \| null`；新增 `UpdateMenuReq`、`UnreachableMenu`、`diagnostics()` |
+| `frontend/src/views/system/menu/index.vue` | 补"上级菜单"字段；`openEdit` 回填并重置父级；诊断告警条 + 一键摘成根 |
+| `tests/api_integration.rs` | +9 个 v017 用例；`cleanup_temp_menu_dir` 的 CTE 改 `UNION`；新增 `flatten_menus_to_roots` |
+| `frontend/src/__tests__/menuParentOptions.spec.ts` | 新增，7 条断言 |
+| `e2e/suites/v017-menu-hierarchy.mjs` | 新增套件，26 条断言 |
+| `e2e/suites/v014-retention-honesty.mjs` | 修断言假红（见下） |
+| `CHANGELOG.md` / `README.md` | 版本条目与能力描述 |
+
+### 门禁（本地，全绿）
+
+| 项 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | ✅ |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | ✅ 零警告 |
+| 后端单测 | ✅ 75（+1） |
+| 集成（非 ignored 组） | ✅ 8 |
+| 集成（`--ignored` 组，真实 PG+Redis） | ✅ 125（116 → +9） |
+| 前端 lint | ✅ 0 error（1 个既有 warning 在 `env.d.ts`，与本版无关） |
+| 前端 typecheck | ✅ |
+| 前端 vitest | ✅ 144 / 17 文件（137 → +7） |
+| 前端 build | ✅ |
+| e2e | ✅ 10/10 套件（新增 v017 26/26） |
+| 授权探针 | ✅ 41/41 |
+
+### 缺陷注入（5 处，每处都有对应用例变红）
+
+1. CTE 改回 `UNION ALL` → `deleting_a_menu_does_not_hang...` 红，耗时 15.5s（超时兜底生效）
+2. `ensure_attachable` 直接 `return Ok(())` → 自引用/子孙/不存在上级三条红，正向用例仍绿
+3. 还原 `.or()` 语义 → 摘成根红，**连带把 diagnostics 的自救路径也测红了**
+   （证明"救回来"确实依赖"摘成根真的生效"，不是空转）
+4. 前端去掉自身子树过滤 → 4 条前端单测红
+5. 前端还原 `openEdit` 不重置父级 → e2e 红，并明确报出 `实际="v17hohnz5_A"`（B 被挂到 A 下）
+
+### 过程中被自己绊倒的三处（都记下来，免得下次重犯）
+
+1. **"树上找不到 = 已删除"是错的**。成环节点在树上永远不可见，
+   所以上一轮以为删净的 A/B 探针其实还在库里。删除是否成功**只能查 DB 确认**。
+2. **测试清理助手自己会挂死**。`cleanup_temp_menu_dir` 内部也是 `UNION ALL` 递归：
+   一旦某个用例失败跳过清理，残留环会让后续清理永久挂起。已改 `UNION`，
+   并加 `flatten_menus_to_roots` 在清理前剪环。另有一个用例把叶子摘成根后
+   它就不再随父级联删除了，漏了单独清理，每次跑都留一条孤儿菜单。
+3. **e2e 里 `const name = inputs[0]` 会抛 Illegal invocation**：
+   局部变量 `name` 遮蔽了全局 `window.name`，原生 setter 以它为 `this` 就炸。
+   另外 naive-ui 的行容器与内层文字 span 类名互为前缀
+   （`n-tree-node-content` / `n-tree-node-content__text`），
+   朴素选择器会同时命中两层；下拉选项必须在 `.n-tree-select-menu` 内取，
+   否则取到的是弹窗背后整棵页面树，断言会退化成恒真。
+
+### 顺带修掉的既有缺陷
+
+- **v0.14 e2e 套件是状态依赖的假红**：`v014-retention-honesty.mjs` 用
+  "alert 里含'早于'两个字"判定范围提示，但**清理横幅**在跑过清理任务后也含"早于"。
+  v0.16.0 门禁时绿（库里还没有清理记录），本轮一跑就红。
+  **已用 `git stash` 在干净的 v0.16.0 上复现确认**：不是本版引入的回归。
+  改为锚定范围提示自己的文案。
+- **测试自身的 CTE 挂起隐患**（见上）。
+
+### 环境备注
+
+- QQ 进程占着 8080；后端能起来是因为抢在它前面 bind。e2e 需要后端在 8080。
+- vite 只监听 `[::1]:3000`（IPv6），`curl 127.0.0.1:3000` 连不上，
+  `e2e/lib/harness.mjs` 已用 `localhost` 兼容。
+- 后台进程随 exec 会话回收，e2e 期间需用 PTY 会话保持 vite 与后端存活。
+
+### 下一步
+
+**尚未提交**。按用户既有指令：本地提交、不推送，等全部工作完成或收到指令再统一推送。
+
+---
+
+## v0.17.0 收尾：核对探针残留时，发现工具自己在撒谎
+
+**起始 git 状态**：分支 `master`，HEAD = `472d60c1 feat(v0.16.0): 字典的三个开关都是摆设`，
+工作区有 v0.17.0 的 13 个改动 + 1 个新文件，**全部未提交**。
+
+**任务**：上一轮遗留的唯一未收尾项——探针报告"夹具已全部清理"，
+但 `axum_api_test` 库里躺着 6 条 `prbfb7fc_*` 残留。
+按上一轮的判断"若是探针自身缺陷，顺手修掉并说明"。
+
+### 结论：是探针的缺陷，而且是三处叠加的假绿
+
+| # | 缺陷 | 为什么是假绿 |
+|---|---|---|
+| 1 | 清理顺序直接删角色/菜单 | 探针自造的 `probe:<uniq>:<n>` 是全新权限码，admin 按设计不持有它（种子"只授权新建行"）。删除撞上 v0.8.0/v0.9.0 的授权下界必然 403，探针照旧报"清理完成" |
+| 2 | 清理断言写反 | `created.*.length > 0` 判的是"我建过东西"，标签写着"已全部清理" |
+| 3 | 数据侧断言比一个从不存在的人 | body 用 `ctx.name()`、verify 查 `ctx.pending()`，两个不同名字 → 恒真 |
+
+第 3 条最要命：它正是探针最核心的断言（建号时的授权天花板）。
+
+**关键实测**：探针自造的动态权限码**不是产品死角**。出路存在且已验证——
+`PUT /roles/{id}/menus` 传 `{"menu_ids":[]}` 收回授权（**降权方向不设这道限**），
+再删菜单、删角色即 200。全程真实 HTTP。
+
+### 改了什么
+
+| 文件 | 内容 |
+|---|---|
+| `e2e/probe-write-guards.mjs` | 清理改"删用户 → 收回授权 → 删角色 → 删菜单"；断言改为**按名字回查数据库**（新增 `findResidue`，翻页扫全 + 树 + diagnostics）；`POST /api/admin/users` 的 body 与 verify 共用同一个名字；新增 `namedUsers` 账本 + `userIdByName`；删除死代码 `ctx.pending()` / `pendingNames` |
+| `tests/api_integration.rs` | `granted_temp_button` 返回值 `TempCodeFixture`（元组 → 具名结构体，补上此前根本没返回的 `holder_role`）；新增 `cleanup_holder`；6 个调用点各自清理；新增守卫用例 `the_permission_code_fixtures_leave_no_holder_behind` |
+
+`findResidue` 特意同时查树**和** `/menus/diagnostics`：成环节点在树上永远不可见，
+只查树会把"还在"报成"没了"——那正是本版刚踩过的坑。
+
+### 门禁（本地，全绿）
+
+| 项 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | ✅ |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | ✅ 零警告 |
+| 后端单测 | ✅ 75 |
+| 集成（非 ignored 组） | ✅ 8 |
+| 集成（`--ignored` 组） | ✅ 126（125 → +1 守卫用例） |
+| 前端 lint / typecheck / vitest / build | ✅ 0 error · ✅ · ✅ 144 · ✅ |
+| e2e | ✅ 10/10 套件（v017 26/26） |
+| 授权探针 | ✅ 41/41，且"无残留" |
+
+**注**：`cargo test --ignored --test-threads=4` 有一条
+`an_empty_keyword_means_no_filtering` 红（total 156 vs 155）。
+它连着发两次查询比对 total，并行时别的用例在增删用户就会飘——
+**不是回归**。单独跑绿，`--test-threads=1` 跑全量 126 条也绿。
+门禁一律串行跑。
+
+### 缺陷注入（本轮新增 3 处，都验证会红）
+
+1. 探针去掉"先收回授权" → `探针夹具已全部清理` 红，并精确列出 4 条残留的角色/菜单/码
+2. 探针不把放行侧账号登记进 `namedUsers` → 红，报出 `用户 prbdb7na_x18 | 角色 prbdb7na_strong`
+3. 集成测试去掉一处 `cleanup_holder` → 该用例仍绿（**这才是问题**），
+   但新增的守卫用例红，并报出 `角色 tmp_holder_role_3d1e537d` / `账号 tmp_holder_user_26093a23`
+
+第 3 条同时说明了两件事：`cleanup_holder` 是承重的；以及"测试全绿"并不代表
+"库是干净的"，所以才需要那条独立守卫。
+
+### 刻意没做的事（留给后续版本）
+
+**`operator_with_codes` 造的 20 处操作员角色同样没人清理**，累计已
+**156 个角色 / 264 个账号**堆在 `axum_api_test` 里（每轮 +若干）。
+它返回了 `role_id`/`user_id`，所以清理是可行的，只是 20 个调用点没人调。
+
+- 这不是 v0.17.0 引入的（该函数本轮完全没碰）
+- 因此守卫用例的范围**只圈 `granted_temp_button` 这一支**：
+  范围一旦放大到它，这条守卫就会长期红——**一个长期红的守卫等于没有守卫**，
+  不如先守住已经修干净的那一半
+- 下一步该做的是给 `operator_with_codes` 配 `cleanup_operator` 并在 20 处调用，
+  然后才把守卫范围放开
+
+### 踩过的坑
+
+- 用 shell 函数包 `curl` 时 `${3:+...}` 的引号会被吃掉，`PUT` 静默返回 400 空 body，
+  差点误判成"收回授权这条路也不通"。改用裸 `curl` 重试才看清。
+- Python heredoc 里写 Rust 源码要写 `\` 才能在 Rust 里留下 `\`，
+  否则 `\_` 变成 `\_` 被 Rust 判成 unknown character escape。
+
+### 下一步
+
+**尚未提交**。按用户既有指令：本地提交、不推送，等全部工作完成或收到指令再统一推送。

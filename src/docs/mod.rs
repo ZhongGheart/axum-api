@@ -48,6 +48,7 @@ use utoipa::OpenApi as _;
         crate::controller::role::get_user_roles,
         crate::controller::role::assign_user_role,
         crate::controller::menu::list_menus,
+        crate::controller::menu::menu_diagnostics,
         crate::controller::menu::create_menu,
         crate::controller::menu::update_menu,
         crate::controller::menu::restore_menu_permission,

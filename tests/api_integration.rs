@@ -3287,11 +3287,7 @@ async fn rewriting_a_granted_menu_permission_to_an_unheld_code_is_denied() {
 /// 顺序有讲究，且被授权下界卡着：**必须先建角色与用户、再授权按钮**。
 /// 反过来（先授权再建用户）会失败——`ensure_can_grant_roles` 要求
 /// "建号时赋予的角色，其码集 ⊆ 你的码集"，而 admin 恰恰不持有这个新码。
-async fn granted_temp_button(
-    app: &Router,
-    admin_tok: &str,
-    code_prefix: &str,
-) -> (uuid::Uuid, uuid::Uuid, String, String, uuid::Uuid) {
+async fn granted_temp_button(app: &Router, admin_tok: &str, code_prefix: &str) -> TempCodeFixture {
     // ① 空角色 + 空用户：此刻它不含任何码，建号的下界才过得去
     let holder_role_name = unique("tmp_holder_role");
     let holder_role = create_role_via_api(app, admin_tok, &holder_role_name).await;
@@ -3380,7 +3376,90 @@ async fn granted_temp_button(
         "夹具未生效：持有者还应能改菜单，实得 {held:?}"
     );
 
-    (dir_id, btn_id, code, holder_tok, holder_uid)
+    TempCodeFixture {
+        dir_id,
+        btn_id,
+        code,
+        holder_tok,
+        holder_role,
+        holder_uid,
+    }
+}
+
+/// `granted_temp_button` 造出来的四样东西：临时目录、临时按钮、专属码、持有者
+///
+/// 用具名结构体而不是匿名元组：这份账本此前漏了角色与持有者账号，
+/// 而元组允许调用方用 `_holder_uid` 把它们随手丢掉——一丢就再也找不回来。
+struct TempCodeFixture {
+    dir_id: uuid::Uuid,
+    btn_id: uuid::Uuid,
+    code: String,
+    holder_tok: String,
+    holder_role: uuid::Uuid,
+    holder_uid: uuid::Uuid,
+}
+
+/// 清理 `granted_temp_button` 造的持有者角色与账号
+///
+/// **必须走 SQL，不能走 API**——这正是本轮实测的结论（探针那边同源）：
+/// 持有者角色上挂着 `tmp:*:priv:*` 这种一次性专属码，而 admin 按设计不持有它
+/// （种子是"只授权新建行"，管理员在菜单页撤销的授权不该被下次启动悄悄恢复）。
+/// 于是 `DELETE /api/admin/roles/{id}` 与 `DELETE /api/admin/users/{id}`
+/// 都会被授权下界挡回 403/400——**用 API 清理自己造的夹具会被自己测的守卫锁死**。
+///
+/// 降权方向（收回授权）不设限，但走 API 要多两跳且仍可能被"仍有用户持有该角色"
+/// 挡下；这里直接按外键级联删行，是测试夹具自己的账本，不该再考验被测逻辑。
+async fn cleanup_holder(holder: &TempCodeFixture) {
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(holder.holder_uid)
+        .execute(&pool().await)
+        .await
+        .expect("清理持有者账号失败");
+    sqlx::query("DELETE FROM roles WHERE id = $1")
+        .bind(holder.holder_role)
+        .execute(&pool().await)
+        .await
+        .expect("清理持有者角色失败");
+}
+
+/// 权限码夹具跑完后不该留下持有者——把"漏清理"从惯例变成红灯
+///
+/// 上一轮实测（`git stash` 验过不是本轮引入的回归）：`granted_temp_button`
+/// 每跑一次就把一个持有者角色和一个持有者账号留在库里——临时菜单目录有
+/// `cleanup_temp_menu_dir` 收拾，这两个没有——而 125 个用例**全绿**。
+/// 测试不检查自己留下的垃圾，就永远发现不了自己在漏：共享库会被一轮轮堆肥，
+/// 分页类断言的噪声基线也随之抬高。
+///
+/// 范围只圈 `granted_temp_button` 这一支，不圈全部夹具：`operator_with_codes`
+/// 造的 20 处操作员角色同样没人清理（累计已 156 个角色 / 264 个账号），
+/// 那是另一笔账、另一个版本的活。这里若把范围放大到它，本条就会一直红，
+/// 而一个长期红的守卫等于没有守卫——不如先守住已经修干净的那一半。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_permission_code_fixtures_leave_no_holder_behind() {
+    let p = pool().await;
+
+    let roles: Vec<String> =
+        sqlx::query_scalar(r#"SELECT name FROM roles WHERE name LIKE 'tmp\_holder\_role\_%'"#)
+            .fetch_all(&p)
+            .await
+            .expect("扫描残留持有者角色失败");
+    let users: Vec<String> = sqlx::query_scalar(
+        r#"SELECT username FROM users WHERE username LIKE 'tmp\_holder\_user\_%'"#,
+    )
+    .fetch_all(&p)
+    .await
+    .expect("扫描残留持有者账号失败");
+
+    let mut leaked: Vec<String> = roles.into_iter().map(|n| format!("角色 {n}")).collect();
+    leaked.extend(users.into_iter().map(|n| format!("账号 {n}")));
+
+    assert!(
+        leaked.is_empty(),
+        "权限码夹具留下了 {} 条持有者残留（共享库会被一轮轮堆肥）:\n  - {}",
+        leaked.len(),
+        leaked.join("\n  - ")
+    );
 }
 
 async fn permission_of(menu_id: uuid::Uuid) -> Option<String> {
@@ -3415,7 +3494,7 @@ async fn cleanup_temp_menu_dir(app: &Router, admin_tok: &str, dir_id: uuid::Uuid
         "DELETE FROM role_menus WHERE menu_id IN (
              WITH RECURSIVE subtree AS (
                  SELECT id FROM menus WHERE id = $1
-                 UNION ALL
+                 UNION
                  SELECT m.id FROM menus m JOIN subtree s ON m.parent_id = s.id
              )
              SELECT id FROM subtree
@@ -3439,6 +3518,27 @@ async fn cleanup_temp_menu_dir(app: &Router, admin_tok: &str, dir_id: uuid::Uuid
     assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
 }
 
+/// 把 [id] 及其整棵子树里的所有菜单摘成根节点
+///
+/// 专治"清理助手在环上把自己挂死"：`cleanup_temp_menu_dir` 要算子树
+///（SQL 递归），而 v0.17.0 的一批用例会**故意造环**。清理前先把环剪开。
+/// 递归用 `UNION` 去重：万一目标本身就在环里，也只是转一圈就停。
+async fn flatten_menus_to_roots(id: uuid::Uuid) {
+    sqlx::query(
+        "WITH RECURSIVE subtree AS (
+             SELECT id FROM menus WHERE id = $1
+             UNION
+             SELECT m.id FROM menus m JOIN subtree s ON m.parent_id = s.id
+         )
+         UPDATE menus SET parent_id = NULL
+         WHERE id IN (SELECT id FROM subtree) AND parent_id IS NOT NULL",
+    )
+    .bind(id)
+    .execute(&pool().await)
+    .await
+    .expect("剪开菜单环失败");
+}
+
 /// 核心闭环：清空 → 记录凭据 → **死路演示** → 恢复 → 凭据一次性作废
 ///
 /// "死路演示"那一步是本 PR 存在的理由：清空后没有任何角色再持有该码，
@@ -3449,8 +3549,13 @@ async fn cleanup_temp_menu_dir(app: &Router, admin_tok: &str, dir_id: uuid::Uuid
 async fn clearing_a_permission_code_can_be_restored_by_the_clearing_user() {
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (dir_id, btn_id, code, holder_tok, holder_uid) =
-        granted_temp_button(&app, &admin_tok, "tmp:restore").await;
+    let holder = granted_temp_button(&app, &admin_tok, "tmp:restore").await;
+    let (dir_id, btn_id, code, holder_tok) = (
+        holder.dir_id,
+        holder.btn_id,
+        holder.code.clone(),
+        holder.holder_tok.clone(),
+    );
 
     // 前提：该码确实已授予某个角色（否则清空不改变任何人的权限，守卫不会介入）
     assert!(grant_count_for_menu(btn_id).await > 0, "夹具应已授予该按钮");
@@ -3474,7 +3579,7 @@ async fn clearing_a_permission_code_can_be_restored_by_the_clearing_user() {
 
     let (prev, cleared_by) = restore_slot(btn_id).await;
     assert_eq!(prev.as_deref(), Some(code.as_str()), "应留下可恢复的码");
-    assert_eq!(cleared_by, Some(holder_uid), "应记下清空者");
+    assert_eq!(cleared_by, Some(holder.holder_uid), "应记下清空者");
 
     // 死路演示：清空后没人再持有该码，update_menu 会把写回也拦死
     let (status, body) = send(
@@ -3534,6 +3639,7 @@ async fn clearing_a_permission_code_can_be_restored_by_the_clearing_user() {
 
     cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
     assert!(!menu_still_exists(btn_id).await, "临时按钮应已清干净");
+    cleanup_holder(&holder).await;
 }
 
 /// 清空一个**别人正在用**的码 = 跨角色撤权，必须持有该码
@@ -3548,8 +3654,13 @@ async fn clearing_a_code_others_rely_on_requires_holding_it() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (dir_id, btn_id, code, _holder_tok, _holder_uid) =
-        granted_temp_button(&app, &admin_tok, "tmp:clear").await;
+    let holder = granted_temp_button(&app, &admin_tok, "tmp:clear").await;
+    let (dir_id, btn_id, code, _holder_tok) = (
+        holder.dir_id,
+        holder.btn_id,
+        holder.code.clone(),
+        holder.holder_tok.clone(),
+    );
 
     // 操作员只持 menu:update，不持那个一次性码
     let (tok, _role_id, _uid) = operator_with_codes(
@@ -3582,6 +3693,7 @@ async fn clearing_a_code_others_rely_on_requires_holding_it() {
     );
 
     cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
+    cleanup_holder(&holder).await;
 }
 
 /// 清空一个**没授予任何角色**的码不改变任何人的权限，应放行
@@ -3686,8 +3798,13 @@ async fn only_the_clearing_user_can_restore_a_permission_code() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (dir_id, btn_id, code, holder_tok, _holder_uid) =
-        granted_temp_button(&app, &admin_tok, "tmp:owner").await;
+    let holder = granted_temp_button(&app, &admin_tok, "tmp:owner").await;
+    let (dir_id, btn_id, code, holder_tok) = (
+        holder.dir_id,
+        holder.btn_id,
+        holder.code.clone(),
+        holder.holder_tok.clone(),
+    );
 
     let (status, body) = send(
         &app,
@@ -3745,6 +3862,7 @@ async fn only_the_clearing_user_can_restore_a_permission_code() {
     assert_eq!(permission_of(btn_id).await.as_deref(), Some(code.as_str()));
 
     cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
+    cleanup_holder(&holder).await;
 }
 
 /// 菜单树要告诉前端"这个按钮的码可以恢复"，否则恢复入口无从发现
@@ -3753,8 +3871,13 @@ async fn only_the_clearing_user_can_restore_a_permission_code() {
 async fn the_menu_tree_reports_a_restorable_permission_code() {
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (dir_id, btn_id, code, holder_tok, _holder_uid) =
-        granted_temp_button(&app, &admin_tok, "tmp:tree").await;
+    let holder = granted_temp_button(&app, &admin_tok, "tmp:tree").await;
+    let (dir_id, btn_id, code, holder_tok) = (
+        holder.dir_id,
+        holder.btn_id,
+        holder.code.clone(),
+        holder.holder_tok.clone(),
+    );
 
     let find_node = |nodes: &Value, id: uuid::Uuid| -> Option<Value> {
         fn walk(nodes: &Value, id: uuid::Uuid) -> Option<Value> {
@@ -3821,6 +3944,7 @@ async fn the_menu_tree_reports_a_restorable_permission_code() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "清理临时目录失败: {body}");
+    cleanup_holder(&holder).await;
 }
 
 /// 正向对照：持有全部权限码的 admin 仍然能建出 admin 用户。
@@ -3900,8 +4024,13 @@ async fn deleting_a_granted_button_others_rely_on_requires_holding_it() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (dir_id, btn_id, code, holder_tok, _holder_uid) =
-        granted_temp_button(&app, &admin_tok, "tmp:del").await;
+    let holder = granted_temp_button(&app, &admin_tok, "tmp:del").await;
+    let (dir_id, btn_id, code, holder_tok) = (
+        holder.dir_id,
+        holder.btn_id,
+        holder.code.clone(),
+        holder.holder_tok.clone(),
+    );
 
     // 操作员只持 menu:delete，不持那个一次性码，也没有 menu:grant
     let (tok, _role_id, _uid) = operator_with_codes(
@@ -3971,6 +4100,7 @@ async fn deleting_a_granted_button_others_rely_on_requires_holding_it() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "撤销授权后应可删除: {body}");
+    cleanup_holder(&holder).await;
 }
 
 /// 删除一个**没授予任何角色**的按钮不改变任何人的权限，应放行
@@ -4078,8 +4208,13 @@ async fn deleting_a_directory_with_a_granted_button_below_is_denied() {
 
     let app = app().await;
     let admin_tok = admin_token(&app).await;
-    let (dir_id, btn_id, code, holder_tok, _holder_uid) =
-        granted_temp_button(&app, &admin_tok, "tmp:delcascade").await;
+    let holder = granted_temp_button(&app, &admin_tok, "tmp:delcascade").await;
+    let (dir_id, btn_id, code, holder_tok) = (
+        holder.dir_id,
+        holder.btn_id,
+        holder.code.clone(),
+        holder.holder_tok.clone(),
+    );
 
     let (tok, _role_id, _uid) = operator_with_codes(
         &app,
@@ -4130,6 +4265,7 @@ async fn deleting_a_directory_with_a_granted_button_below_is_denied() {
     );
 
     cleanup_temp_menu_dir(&app, &admin_tok, dir_id).await;
+    cleanup_holder(&holder).await;
 }
 
 /// 非法的菜单类型应报 400，而不是服务器内部错误
@@ -8063,4 +8199,623 @@ async fn refresh_dict_cache_reports_the_number_of_keys_it_deleted() {
         second, reloaded,
         "第二次清理的键数应等于第一次回填的类型数（缓存里正好只有那批键）"
     );
+}
+
+// ══════════════════════════════════════════════════════════════
+// v0.17.0：菜单树成环 → 整棵子树静默消失 → 删除永久挂起 → 全站 500
+//
+// 这一组的每个用例都对应一条**实测复现过**的破坏链环节。
+// 断言写在"外部可观测后果"上（HTTP 状态、树里还在不在、请求会不会返回），
+// 而不是"某个私有函数返回了 Err"——后者只能证明代码跑到了，证明不了行为。
+// ══════════════════════════════════════════════════════════════
+
+/// 造一棵两层的临时菜单（根 → 子），返回 (根 id, 子 id)
+async fn make_two_level_menu(app: &Router, tok: &str) -> (uuid::Uuid, uuid::Uuid) {
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(tok),
+            Some(json!({
+                "name": unique("v017_dir"),
+                "type": "directory",
+                "sort_order": 97
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建根菜单失败: {body}");
+    let root = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(tok),
+            Some(json!({
+                "parent_id": root,
+                "name": unique("v017_leaf"),
+                "type": "menu",
+                "path": format!("/{}", unique("v017p")),
+                "sort_order": 1
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建子菜单失败: {body}");
+    let leaf = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    (root, leaf)
+}
+
+/// 直查库里某个菜单当前的 `parent_id`（`None` 表示它是根）
+///
+/// 刻意查库而不是看响应体：v0.17.0 之前最恶劣的一个症状就是
+/// **响应体原样回显了没生效的 `parent_id`**——只看响应会以为成功了。
+async fn parent_in_db(id: uuid::Uuid) -> Option<uuid::Uuid> {
+    sqlx::query_scalar("SELECT parent_id FROM menus WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询菜单父级失败")
+}
+
+/// 菜单名出现在管理页菜单树里吗
+async fn menu_visible_in_tree(app: &Router, tok: &str, name: &str) -> bool {
+    let (status, body) = send(app, request("GET", "/api/admin/menus", Some(tok), None)).await;
+    assert_eq!(status, StatusCode::OK, "读取菜单树失败: {body}");
+
+    let mut found = false;
+    fn walk(nodes: &Value, needle: &str, found: &mut bool) {
+        for n in nodes.as_array().into_iter().flatten() {
+            if n["name"].as_str() == Some(needle) {
+                *found = true;
+            }
+            walk(&n["children"], needle, found);
+        }
+    }
+    walk(&body["data"], name, &mut found);
+    found
+}
+
+/// 菜单不能把自己设为自己的上级
+///
+/// 这是破坏链的**起点**：一次 `PUT` 返回 200 就能让一棵子树从界面上消失。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_menu_cannot_be_its_own_parent() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (root, _) = make_two_level_menu(&app, &token).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{root}"),
+            Some(&token),
+            Some(json!({ "parent_id": root })),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "把自己设为上级必须被拒: {body}"
+    );
+    // 关键：库里必须真的没变。返回 400 但数据照样写进去，等于没修。
+    assert_eq!(
+        parent_in_db(root).await,
+        None,
+        "自引用被拒后，父级必须保持为根"
+    );
+
+    cleanup_temp_menu_dir(&app, &token, root).await;
+}
+
+/// 不能把菜单挪到它自己的子孙下面（成环）
+///
+/// 这一条才是真正会造成"整棵子树静默消失 + 删除永久挂起"的那个操作。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_menu_cannot_be_moved_under_its_own_descendant() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (root, leaf) = make_two_level_menu(&app, &token).await;
+    let root_name = format!("{root}");
+
+    // 先记下叶子在管理页的名字：成环之后它必须**仍在**树上
+    let (status, body) = send(&app, request("GET", "/api/admin/menus", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let leaf_name = body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|n| {
+            let mut acc = Vec::new();
+            let mut stack = vec![n.clone()];
+            while let Some(x) = stack.pop() {
+                if x["id"].as_str() == Some(leaf.to_string().as_str()) {
+                    acc.push(x["name"].as_str().unwrap_or_default().to_string());
+                }
+                if let Some(ch) = x["children"].as_array() {
+                    stack.extend(ch.iter().cloned());
+                }
+            }
+            acc
+        })
+        .next()
+        .expect("临时子菜单应出现在菜单树里");
+    assert!(!leaf_name.is_empty(), "子菜单名不应为空: {root_name}");
+
+    // 把根挂到叶子下面 ⇒ 根→叶子→根
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{root}"),
+            Some(&token),
+            Some(json!({ "parent_id": leaf })),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "挂到自己的子孙下必须被拒: {body}"
+    );
+    assert_eq!(
+        parent_in_db(root).await,
+        None,
+        "成环被拒后，根菜单必须仍然是根"
+    );
+    assert!(
+        menu_visible_in_tree(&app, &token, &leaf_name).await,
+        "成环被拒后，子菜单必须仍在菜单树里"
+    );
+
+    cleanup_temp_menu_dir(&app, &token, root).await;
+}
+
+/// 挂到不存在的上级上返回 400，而不是 500「服务器内部错误」
+///
+/// 这是**入参问题**：外键能挡住写入，但抛出来的 500 会让管理员看不懂，
+/// 也会把错误监控污染成服务端故障。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn moving_a_menu_under_an_unknown_parent_is_a_bad_request() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (root, _) = make_two_level_menu(&app, &token).await;
+    let ghost = uuid::Uuid::new_v4();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{root}"),
+            Some(&token),
+            Some(json!({ "parent_id": ghost })),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "挂到不存在的上级应报 400: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("上级菜单不存在"),
+        "错误消息要说清是上级菜单的问题: {body}"
+    );
+    assert_eq!(parent_in_db(root).await, None, "父级必须保持为根");
+
+    cleanup_temp_menu_dir(&app, &token, root).await;
+}
+
+/// `parent_id: null` 真的把菜单摘成根（此前返回 200 却什么也没做）
+///
+/// 这是"管理员没有任何途径调整菜单层级"的直接成因：
+/// `Option<Uuid>` 让「没传」与「传 null」不可区分，后者被当成"本次不改"。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_null_parent_id_actually_detaches_the_menu_to_the_top_level() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (root, leaf) = make_two_level_menu(&app, &token).await;
+    assert_eq!(
+        parent_in_db(leaf).await,
+        Some(root),
+        "前置条件：叶子应挂在根下"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{leaf}"),
+            Some(&token),
+            Some(json!({ "parent_id": null })),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "摘成根应成功: {body}");
+    // 响应体和数据库**都要**查：v0.17.0 之前响应体原样回显了旧父级，
+    // 只看响应会漏掉这个缺陷。
+    assert_eq!(
+        body["data"]["parent_id"].as_str(),
+        None,
+        "响应体应回显 parent_id=null"
+    );
+    assert_eq!(parent_in_db(leaf).await, None, "库里的父级必须真的被清空");
+
+    // 摘成根后它仍然在树上，且成了顶层节点
+    let (status, body) = send(&app, request("GET", "/api/admin/menus", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let top_level_ids: Vec<&str> = body["data"]
+        .as_array()
+        .expect("菜单树应是数组")
+        .iter()
+        .filter_map(|n| n["id"].as_str())
+        .collect();
+    assert!(
+        top_level_ids.contains(&leaf.to_string().as_str()),
+        "摘成根的菜单应出现在顶层"
+    );
+
+    cleanup_temp_menu_dir(&app, &token, root).await;
+    cleanup_temp_menu_dir(&app, &token, leaf).await;
+}
+
+/// 没传 `parent_id` 时保持原样（区分"没传"与"传 null"的前提）
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn omitting_parent_id_leaves_it_unchanged() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (root, leaf) = make_two_level_menu(&app, &token).await;
+
+    // 只改名字，不提父级
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{leaf}"),
+            Some(&token),
+            Some(json!({ "name": unique("v017_renamed") })),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "改名应成功: {body}");
+    assert_eq!(
+        parent_in_db(leaf).await,
+        Some(root),
+        "没传 parent_id 时父级必须保持不变"
+    );
+
+    cleanup_temp_menu_dir(&app, &token, root).await;
+}
+
+/// 合法改父级确实生效（确认校验没有把正常操作一起拦掉）
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_legitimate_reparent_takes_effect() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (root_a, leaf) = make_two_level_menu(&app, &token).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(json!({ "name": unique("v017_other"), "type": "directory", "sort_order": 96 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建第二个根菜单失败: {body}");
+    let root_b = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{leaf}"),
+            Some(&token),
+            Some(json!({ "parent_id": root_b })),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "合法改父级应成功: {body}");
+    assert_eq!(parent_in_db(leaf).await, Some(root_b), "父级应真的改掉");
+
+    cleanup_temp_menu_dir(&app, &token, root_a).await;
+    cleanup_temp_menu_dir(&app, &token, root_b).await;
+}
+
+/// 库里已经有环时，`DELETE` 不会再永久挂起
+///
+/// 这是本版最重的一条。v0.17.0 之前 `granted_codes_in_subtree` 用
+/// `UNION ALL` 递归，环上永不收敛 → 请求不返回、连接不归还 →
+/// 占满连接池后**与菜单无关的端点也全部 500**。
+///
+/// 环是**直连 SQL 造的**：API 已经被拦住，这里要证明的是第二道防线
+/// （`UNION` 去重）在遇到历史脏数据 / 运维直连写入时仍能收住。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_a_menu_does_not_hang_when_the_tree_contains_a_cycle() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (root, leaf) = make_two_level_menu(&app, &token).await;
+
+    // 绕过 API 直接造环：根→叶子→根
+    sqlx::query("UPDATE menus SET parent_id = $2 WHERE id = $1")
+        .bind(root)
+        .bind(leaf)
+        .execute(&pool().await)
+        .await
+        .expect("造环失败");
+
+    // 超时兜底：万一又挂起，测试会**失败**而不是把整个套件拖死
+    let deleted = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        send(
+            &app,
+            request(
+                "DELETE",
+                &format!("/api/admin/menus/{root}"),
+                Some(&token),
+                None,
+            ),
+        ),
+    )
+    .await;
+
+    assert!(
+        deleted.is_ok(),
+        "树上存在环时，DELETE 仍然永久挂起——递归 CTE 没终止"
+    );
+
+    // 删除本身也要真的生效：级联会顺着 parent_id 把叶子一起带走
+    assert!(
+        !menu_still_exists(root).await && !menu_still_exists(leaf).await,
+        "删除环上的根菜单后，环上其余节点应随级联一并消失"
+    );
+
+    // 删完必须能立刻响应下一个请求：挂起时连接不归还，这才是全站 500 的成因
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/menus/diagnostics", Some(&token), None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "删除请求返回后服务应立即可用: {body}"
+    );
+
+    // 级联已经把叶子一并带走了（leaf.parent_id = root），
+    // 所以这里只需在"确实还留着"时再清一次——重复 DELETE 会拿到 404。
+    if menu_still_exists(leaf).await {
+        // 先剪环再清理：万一上面某条断言没过，残留也不会是个挂死清理助手的环
+        flatten_menus_to_roots(leaf).await;
+        cleanup_temp_menu_dir(&app, &token, leaf).await;
+    }
+}
+
+/// 诊断口能报出成环的节点，并能用公开 API 把它救回来
+///
+/// 修复动作刻意复用 `PUT .../menus/:id` + `parent_id: null`，
+/// 不新增第二条写路径——那样又多一处需要同样权限守卫的地方。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn diagnostics_report_menus_trapped_in_a_cycle_and_they_can_be_rescued() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (root, leaf) = make_two_level_menu(&app, &token).await;
+
+    // 干净起点：没有环
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/menus/diagnostics", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "读取诊断失败: {body}");
+    assert_eq!(
+        body["data"].as_array().map(Vec::len),
+        Some(0),
+        "干净库里不应报出不可达节点: {body}"
+    );
+
+    let root_name = sqlx::query_scalar::<_, String>("SELECT name FROM menus WHERE id = $1")
+        .bind(root)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询菜单名失败");
+    let leaf_name = sqlx::query_scalar::<_, String>("SELECT name FROM menus WHERE id = $1")
+        .bind(leaf)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询菜单名失败");
+
+    // 造环（绕过 API 模拟历史脏数据）
+    sqlx::query("UPDATE menus SET parent_id = $2 WHERE id = $1")
+        .bind(root)
+        .bind(leaf)
+        .execute(&pool().await)
+        .await
+        .expect("造环失败");
+
+    // 环上两个节点都从菜单树上消失了——这正是"管理员看不见、也就修不了"的由来
+    assert!(
+        !menu_visible_in_tree(&app, &token, &root_name).await,
+        "成环后根菜单不应出现在菜单树里（这正是无法自救的原因）"
+    );
+    assert!(
+        !menu_visible_in_tree(&app, &token, &leaf_name).await,
+        "成环后叶子菜单也不应出现在菜单树里：整支被剪掉，不是只剪环上的父节点"
+    );
+
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/menus/diagnostics", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "读取诊断失败: {body}");
+    let broken = body["data"].as_array().expect("诊断应返回数组").clone();
+    let broken_ids: Vec<String> = broken
+        .iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        broken_ids.contains(&root.to_string()) && broken_ids.contains(&leaf.to_string()),
+        "诊断应报出环上的两个节点，实际: {body}"
+    );
+    assert!(
+        broken[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("成环"),
+        "应说明是成环而不是别的: {body}"
+    );
+
+    // 自救：把根摘成根节点，环就破了
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{root}"),
+            Some(&token),
+            Some(json!({ "parent_id": null })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "摘成根应能救回来: {body}");
+
+    // 破环后根重新出现在树上
+    assert!(
+        menu_visible_in_tree(&app, &token, &root_name).await,
+        "破环后根菜单应重新出现在菜单树里"
+    );
+
+    // 把剩下的叶子也摘出来，诊断归零
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{leaf}"),
+            Some(&token),
+            Some(json!({ "parent_id": null })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "摘成根应成功: {body}");
+
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/menus/diagnostics", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"].as_array().map(Vec::len),
+        Some(0),
+        "全部救回后诊断应为空: {body}"
+    );
+
+    flatten_menus_to_roots(root).await;
+    flatten_menus_to_roots(leaf).await;
+    cleanup_temp_menu_dir(&app, &token, root).await;
+    cleanup_temp_menu_dir(&app, &token, leaf).await;
+}
+
+/// 造环的操作会留下审计痕迹，且说清是移动而非静默改结构
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn moving_a_menu_is_recorded_in_the_audit_log() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+    let (root_a, leaf) = make_two_level_menu(&app, &token).await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(&token),
+            Some(json!({ "name": unique("v017_dst"), "type": "directory", "sort_order": 95 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let root_b = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    let dst_name: String = sqlx::query_scalar("SELECT name FROM menus WHERE id = $1")
+        .bind(root_b)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询目标目录名失败");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{leaf}"),
+            Some(&token),
+            Some(json!({ "parent_id": root_b })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "移动应成功: {body}");
+
+    // 审计里必须有"移动"字样并点名新上级；此前结构性变更**完全不留痕**
+    let found: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM audit_logs
+             WHERE result LIKE '%移动菜单%' AND result LIKE $1
+         )",
+    )
+    .bind(format!("%{dst_name}%"))
+    .fetch_one(&pool().await)
+    .await
+    .expect("查询审计失败");
+    assert!(found, "移动菜单应在审计里留痕并点名新上级");
+
+    // 摘成根也要留痕
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/menus/{leaf}"),
+            Some(&token),
+            Some(json!({ "parent_id": null })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "摘成根应成功: {body}");
+    let detached: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM audit_logs WHERE result LIKE '%摘成根菜单%')",
+    )
+    .fetch_one(&pool().await)
+    .await
+    .expect("查询审计失败");
+    assert!(detached, "摘成根应在审计里留痕");
+
+    // 叶子已被摘成根，不再随 root_a/root_b 级联——必须单独删，
+    // 否则每次跑这个用例都在测试库里留一条孤儿菜单
+    cleanup_temp_menu_dir(&app, &token, leaf).await;
+    cleanup_temp_menu_dir(&app, &token, root_a).await;
+    cleanup_temp_menu_dir(&app, &token, root_b).await;
 }

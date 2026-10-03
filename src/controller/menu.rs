@@ -14,7 +14,8 @@ use crate::middleware::permission::{
     PermMenuCreate, PermMenuDelete, PermMenuGrant, PermMenuList, PermMenuUpdate,
 };
 use crate::model::{
-    ApiResponse, AssignMenuRequest, CreateMenuRequest, Menu, MenuNode, UpdateMenuRequest,
+    ApiResponse, AssignMenuRequest, CreateMenuRequest, Menu, MenuNode, UnreachableMenu,
+    UpdateMenuRequest,
 };
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
@@ -109,6 +110,37 @@ pub async fn my_permissions(
         .find_permission_codes(&auth_user.roles)
         .await?;
     Ok(Json(ApiResponse::success(codes)))
+}
+
+/// GET /api/admin/menus/diagnostics — 走不到根、因而不在任何菜单树里的菜单
+///
+/// 成环（或悬空引用）的菜单会被 `build_tree` **静默剪掉**：
+/// 侧栏和管理页看不到它，管理员也就无法点开改回来，只能直连数据库救。
+/// 本接口把这些节点显出来，让"看不见"变成"看得见并能修"。
+///
+/// 修复动作复用既有公开 API：把它挂到根下（`parent_id: null`）即可，
+/// 所以这里只读、不提供第二条写路径。
+#[utoipa::path(
+    get,
+    path = "/api/admin/menus/diagnostics",
+    tag = "菜单管理",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "结构诊断结果", body = ApiResponse<Vec<UnreachableMenu>>)
+    )
+)]
+pub async fn menu_diagnostics(
+    State(state): State<AppState>,
+    _perm: PermMenuList,
+) -> Result<Json<ApiResponse<Vec<UnreachableMenu>>>, AppError> {
+    let broken = state.menu_repo.find_unreachable().await?;
+    if !broken.is_empty() {
+        tracing::warn!(
+            count = broken.len(),
+            "菜单树存在不可达节点（成环或悬空引用），它们不会出现在任何菜单树里"
+        );
+    }
+    Ok(Json(ApiResponse::success(broken)))
 }
 
 /// POST /api/admin/menus — 新增菜单
@@ -241,6 +273,40 @@ pub async fn update_menu(
         before_code.as_deref(),
         after_code.as_deref(),
     ));
+
+    // 父级变更是**结构性**变更，此前审计完全不留痕：
+    // 把一个目录挪到别处，它整棵子树的导航归属就变了，而审计里只有一行
+    // "无权限码变更"。这里补上，且说清是"挪走"还是"摘成根"。
+    if let Some(new_parent) = saved.parent_id {
+        if before.parent_id != Some(new_parent) {
+            let parent_name = state
+                .menu_repo
+                .find_by_id(new_parent)
+                .await
+                .map(|m| m.name)
+                .unwrap_or_else(|_| new_parent.to_string());
+            // 旧上级也用名字：审计是用来事后读的，裸 UUID 逼人去翻库
+            let old_parent_desc = match before.parent_id {
+                Some(old) => state
+                    .menu_repo
+                    .find_by_id(old)
+                    .await
+                    .map(|m| format!("\"{}\"（{}）", m.name, old))
+                    .unwrap_or_else(|_| old.to_string()),
+                None => "根".to_string(),
+            };
+            audit.push(format!(
+                "移动菜单 \"{}\"（{}）：上级从 {} 改为 \"{}\"（{}）",
+                saved.name, saved.id, old_parent_desc, parent_name, new_parent
+            ));
+        }
+    } else if let Some(old_parent) = before.parent_id {
+        // `parent_id: null` 现在真的生效了（此前返回 200 却什么也没做）
+        audit.push(format!(
+            "移动菜单 \"{}\"（{}）：摘成根菜单，不再挂在上级 {} 下",
+            saved.name, saved.id, old_parent
+        ));
+    }
     Ok(Json(ApiResponse::success(MenuNode::from(saved))))
 }
 

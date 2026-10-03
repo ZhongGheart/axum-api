@@ -25,7 +25,14 @@ export interface MenuNode {
 }
 
 export interface CreateMenuReq {
-  parent_id?: string
+  /**
+   * 上级菜单，`null` 表示"摘成根菜单"
+   *
+   * 三态必须分清：**不传** = 本次不改父级；`null` = 摘成根。
+   * 此前这里只是 `string`，`null` 与"不传"在后端被当成同一件事——
+   * 请求返回 200、字段原样回显，而结构纹丝不动。
+   */
+  parent_id?: string | null
   name: string
   path?: string
   component?: string
@@ -34,6 +41,29 @@ export interface CreateMenuReq {
   type: string
   permission?: string
   is_visible?: boolean
+}
+
+/**
+ * 更新菜单请求：**全部字段可选**，未出现的字段保持原样
+ *
+ * 刻意与 `CreateMenuReq` 分开：复用创建类型会逼调用方回传必填的 `name`，
+ * 而"顺手把旧名字再写一遍"正是意外覆盖的来源。
+ */
+export type UpdateMenuReq = Partial<CreateMenuReq>
+
+/**
+ * 走不到根、因而不在任何菜单树里的菜单（`GET /api/admin/menus/diagnostics`）
+ *
+ * 这些节点被后端 `build_tree` 静默剪掉，管理员在菜单页看不到它们，
+ * 也就无法点开改回来。这个类型让它们**被看见**。
+ */
+export interface UnreachableMenu {
+  id: string
+  name: string
+  parent_id: string | null
+  /** 成环 / 悬空引用。两者修复动作相同（挂到根下），排查方向不同 */
+  reason: string
+  sort_order: number
 }
 
 export const menuApi = {
@@ -47,13 +77,22 @@ export const menuApi = {
     return http.get<MenuNode[]>('/admin/menus')
   },
 
+  /**
+   * GET /api/admin/menus/diagnostics — 菜单树结构诊断（只读）
+   *
+   * 修复动作复用 `update(id, { parent_id: null })`，不额外引入写路径。
+   */
+  diagnostics() {
+    return http.get<UnreachableMenu[]>('/admin/menus/diagnostics')
+  },
+
   /** POST /api/admin/menus */
   create(data: CreateMenuReq) {
     return http.post<MenuNode>('/admin/menus', data)
   },
 
   /** PUT /api/admin/menus/:id */
-  update(id: string, data: CreateMenuReq) {
+  update(id: string, data: UpdateMenuReq) {
     return http.put<MenuNode>(`/admin/menus/${id}`, data)
   },
 

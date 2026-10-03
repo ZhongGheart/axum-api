@@ -60,7 +60,7 @@
 | 操作日志 | ✅ | 受保护路由写入 `audit_logs`（方法/路径/查询串 + **写操作变更摘要**；**不记录请求体**，口令与令牌不入库）；**登录成功/失败与注册也落审计**（`AUTH_LOGIN_SUCCESS`/`AUTH_LOGIN_FAILURE`/`AUTH_REGISTER`，带 `client_ip` 与失败原因）；支持按用户名/操作/状态码/时间范围**真筛选**；导出支持同一套条件，且**截断状态随响应头明示** |
 | 变更追溯 | ✅ | 写操作由 handler 显式声明"改了什么"并落进 `result` 列：角色/用户/菜单**删除前先取名字**（行删掉后名字仍在审计里）、授权记录**授出与撤销的权限码差异**、状态切换记录前后状态；**口令一个字都不记**；失败的写操作不留摘要（不谎报"已授予"） |
 | 数据字典 | ✅ | Redis 缓存 + 写操作真实失效；读取接口对**任意已登录用户**开放；**`status=disabled` 真的生效**（禁用项与禁用类型不进读取端点）；**`is_default` 靠部分唯一索引保证同一字典只有一个**；**「刷新缓存」真删 `dict:*` 并如实报出清了多少键** |
-| 菜单管理 | ✅ | 菜单是导航的唯一来源：`/api/auth/menus` 决定侧栏与前端动态路由 |
+| 菜单管理 | ✅ | 菜单是导航的唯一来源：`/api/auth/menus` 决定侧栏与前端动态路由；**层级可调**（界面上能改上级、能摘成顶级）；**成环与悬空引用一律被拒**（自引用、挂到自己的子孙下、挂到不存在的上级均 400），且结构损坏的节点能通过 `/api/admin/menus/diagnostics` **被看见并救回** |
 | 权限码 | ✅ | 28 个 `<模块>:<资源>:<动作>` 权限码存于 `menus.permission`（按钮型菜单），后端强制鉴权 + 前端按码判定；清空后可由清空者本人恢复 |
 | 角色与授权 | ✅ | 角色增删改（**分页**）+ 菜单/权限码授权树；授权**要么完整成功、要么整体回滚**；内置角色不可删除、不可改名；自定义角色可直接分配给用户 |
 | 用户管理 | ✅ | 增删改查（分页 + `keyword` 真搜索）、批量删除、状态切换、重置密码；**多角色分配**；含"最后一个管理员"保护 |
@@ -247,9 +247,10 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | POST | `/api/admin/users/{id}/reset-password` | 重置密码（并吊销会话） |
 | GET/POST | `/api/admin/users/{id}/roles` | 查询 / 追加用户角色 |
 | GET/POST | `/api/admin/roles?page=&page_size=`、`PUT/DELETE /api/admin/roles/{id}` | 角色管理（**列表已分页**；内置角色不可删除/改名；仍被用户占用的角色拒绝删除；角色名自动归一化，撞名 409） |
-| GET/POST | `/api/admin/menus`、`PUT/DELETE /api/admin/menus/{id}` | 菜单管理（改动即时影响前端导航） |
+| GET/POST | `/api/admin/menus`、`PUT/DELETE /api/admin/menus/{id}` | 菜单管理（改动即时影响前端导航）；`parent_id` **三态**：不传=不改、`null`=摘成根、给 id=改上级 |
 | PUT | `/api/admin/roles/{id}/menus` | 角色-菜单关联（**全量覆盖**；任一 ID 非法即整体 400） |
 | GET | `/api/admin/menus?role_id={id}` | 某角色已授权的菜单树（授权弹窗的默认勾选值） |
+| GET | `/api/admin/menus/diagnostics` | 菜单树结构诊断：走不到根、不在任何菜单树里的节点（成环 / 悬空引用）及其原因 |
 | GET/POST | `/api/admin/dict/types`、`PUT/DELETE /api/admin/dict/types/{id}` | 字典类型管理 |
 | GET/POST | `/api/admin/dict/items`、`PUT/DELETE /api/admin/dict/items/{id}` | 字典项管理 |
 | POST | `/api/admin/dict/refresh` | 刷新字典缓存 |
