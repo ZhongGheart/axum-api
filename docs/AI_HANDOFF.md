@@ -6238,3 +6238,51 @@ model/router/docs 接线、前端 profile + login + router。
 **没有打 tag，也没抬版号。** 当前 `Cargo.toml` 仍是 0.23.0，
 `package.json` 仍是 0.23.0，而代码里已经含 v0.24.0 与 v0.25.0 的功能——
 发布动作（抬版号 + `CHANGELOG` + 打 tag）等用户单独下指令时再做。
+
+---
+
+## 2026-10-04 v0.25.0 修复：接口文档页 `No layout defined for "StandaloneLayout"`
+
+**现象**：系统管理 → 接口文档整页不可用，页面上直接显示
+`No layout defined for "StandaloneLayout"`。用户截图报障。
+
+**根因在后端，不在前端。** `src/docs/mod.rs` 的 `swagger_ui_handler`
+生成的内联 HTML 里写了 `layout: "StandaloneLayout"` +
+`SwaggerUIBundle.SwaggerUIStandalonePreset`。这段配置是从 Redoc 那边抄过来的，
+而 swagger-ui v5 已经不成立。
+
+实证方式：下载页面实际引用的 `swagger-ui@5` 的 `swagger-ui-bundle.js`（1.58MB），
+在文件里数字符串出现次数——
+
+| 符号 | 在 `swagger-ui-bundle.js` 中出现次数 |
+|---|---|
+| `SwaggerUIStandalonePreset` | 0 |
+| `StandaloneLayout` | 0 |
+| `Topbar` | 0 |
+
+v5 把 standalone preset 拆到了独立的 `swagger-ui-standalone-preset.js`，
+而本页只加载了 bundle。`getLayout()` 取不到组件时不报错，直接渲染
+`<h1>No layout defined for "StandaloneLayout"</h1>`，所以只有打开页面才看得见。
+
+**修法**：删掉 `layout` 一行、`presets` 收敛为 `[SwaggerUIBundle.presets.apis]`，
+并删掉因此成为死代码的 `.topbar { display: none; }`（那条 CSS 本来就是为了藏
+standalone 的顶栏）。**不损失任何功能**——standalone preset 提供的只是顶部工具条，
+而本页原先就把它藏了。handler 的文档注释里写清了原因，防止再被抄回去。
+
+**回归测试** `swagger_page_does_not_reference_a_missing_layout`：断言渲染出的 HTML
+不含 `StandaloneLayout` / `SwaggerUIStandalonePreset`。这条断言的作用是让"抄回 Redoc
+的配置项"这个动作立刻失败——该错误没有任何编译期或启动期信号，而接口文档不是
+每次改动都会去点的页面。
+
+**验证**：先做缺陷注入（把坏配置加回去，测试如期 FAILED 并给出中文断言消息），
+确认测试真的咬得住，再恢复文件。后端重启后 `curl /api/swagger-ui/index.html |
+grep -c StandaloneLayout` = 0；Chrome（headless）登录 admin 打开接口文档，
+截图确认正常渲染，控制台的 `Could not find component: StandaloneLayout` 已消失。
+顺带确认 2FA 的 6 个端点都在 OpenAPI 里。
+
+门禁：`cargo fmt --all` / `cargo clippy --all-targets` 0 warning /
+`cargo test --lib` **130 passed 0 failed**（原 129，+1）。
+未跑 `cargo test --test api_integration`：本次只改文档 HTML 字符串，
+不触碰路由与接口契约。推送前建议补一次全量门禁。
+
+**状态**：本地提交，不推送、不打 tag，等用户指令。

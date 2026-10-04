@@ -165,6 +165,16 @@ pub fn documented_paths() -> Vec<(String, Vec<String>)> {
 ///
 /// 指向同源的 `/api/openapi.json` 作为数据源。
 /// 同源服务避免了 iframe 跨域限制，CDN 加载避免了前端打包体积膨胀。
+///
+/// **刻意只用 `presets.apis`、不设 `layout`**：
+/// swagger-ui v5 的 `swagger-ui-bundle.js` 已不再内含 standalone preset
+/// （`StandaloneLayout` / `Topbar` 在该文件里出现次数为 0，被拆到
+/// `swagger-ui-standalone-preset.js`）。此时写 `layout: "StandaloneLayout"`
+/// 会让 `getLayout()` 取不到该组件，直接在页面上渲染
+/// `No layout defined for "StandaloneLayout"`——接口文档整个不可用。
+///
+/// 而 standalone preset 提供的只是顶部工具条，本页原先又用
+/// `.topbar { display: none }` 把它藏了，所以移除它不损失任何功能。
 pub async fn swagger_ui_handler(
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> Result<Response<String>, std::convert::Infallible> {
@@ -185,7 +195,6 @@ pub async fn swagger_ui_handler(
     html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
     *, *:before, *:after { box-sizing: inherit; }
     body { margin: 0; background: #fafafa; }
-    .topbar { display: none; }
   </style>
 </head>
 <body>
@@ -196,12 +205,8 @@ pub async fn swagger_ui_handler(
       url: '/api/openapi.json',
       dom_id: '#swagger-ui',
       deepLinking: true,
-      presets: [
-        SwaggerUIBundle.presets.apis,
-        SwaggerUIBundle.SwaggerUIStandalonePreset
-      ],
+      presets: [SwaggerUIBundle.presets.apis],
       plugins: [SwaggerUIBundle.plugins.DownloadUrl],
-      layout: "StandaloneLayout",
       showExtensions: true,
       showCommonExtensions: true,
       tryItOutEnabled: true,
@@ -276,6 +281,35 @@ mod tests {
         assert!(
             schemes.contains_key("bearer_auth"),
             "缺少 bearer_auth 安全方案"
+        );
+    }
+
+    /// 渲染出来的文档页面不能再引用 `StandaloneLayout`
+    ///
+    /// swagger-ui v5 的 `swagger-ui-bundle.js` 不再内含 standalone preset，
+    /// 指定这个 layout 会让 `getLayout()` 取不到组件，页面上直接显示
+    /// `No layout defined for "StandaloneLayout"`，整个接口文档不可用。
+    ///
+    /// 这条断言的作用是**让"抄回 Redoc 的配置项"这个动作立刻失败**：
+    /// 那个错误不产生任何编译或启动期信号，只有真打开页面才看得见，
+    /// 而接口文档不是每次改动都会去点的页面。
+    #[tokio::test]
+    async fn swagger_page_does_not_reference_a_missing_layout() {
+        let response = swagger_ui_handler(axum::extract::Path("index.html".to_string()))
+            .await
+            .expect("handler 不应返回错误");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let html = response.body();
+        assert!(
+            !html.contains("StandaloneLayout"),
+            "文档页面引用了 swagger-ui v5 bundle 里不存在的 StandaloneLayout，\
+             页面会显示 No layout defined for \"StandaloneLayout\""
+        );
+        // 本页只加载了 bundle，没加载独立的 standalone preset 文件
+        assert!(
+            !html.contains("SwaggerUIStandalonePreset"),
+            "swagger-ui-bundle.js 不含 standalone preset，引用它等于引用 undefined"
         );
     }
 }
