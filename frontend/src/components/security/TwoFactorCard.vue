@@ -62,7 +62,7 @@
       v-model:show="setupVisible"
       title="绑定两步验证"
       preset="card"
-      :width="440"
+      style="width: 440px"
       :mask-closable="false"
       :close-on-esc="!busy"
     >
@@ -112,7 +112,7 @@
           App 已扫码成功，现在输入它显示的 6 位动态码完成绑定。
         </n-alert>
         <n-input-otp
-          v-model:value="confirmCode"
+          v-model:value="confirmCells"
           :length="6"
           :disabled="busy"
           size="large"
@@ -139,7 +139,7 @@
               v-else
               type="primary"
               :loading="busy"
-              :disabled="confirmCode.length !== 6"
+              :disabled="!confirmCodeReady"
               @click="submitEnable"
             >
               确认启用
@@ -154,7 +154,7 @@
       v-model:show="codesVisible"
       title="保存你的恢复码"
       preset="card"
-      :width="460"
+      style="width: 460px"
       :mask-closable="false"
       :close-on-esc="false"
     >
@@ -184,7 +184,7 @@
       v-model:show="disableVisible"
       title="关闭两步验证"
       preset="card"
-      :width="400"
+      style="width: 400px"
     >
       <n-alert type="error" :show-icon="true" class="setup-alert">
         关闭后，你的账号将只靠密码保护。确认要继续吗？
@@ -214,10 +214,10 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { authApi } from '@/api/auth'
 import { showError, showSuccess } from '@/utils/message'
-import { formatRecoveryCodes, groupSecret, renderQrDataUrl } from '@/utils/twoFactor'
+import { formatRecoveryCodes, groupSecret, joinOtp, renderQrDataUrl } from '@/utils/twoFactor'
 import type { TwoFactorStatus } from '@/api/types/response'
 
 /**
@@ -243,10 +243,15 @@ const setupVisible = ref(false)
 const setupStep = ref<1 | 2>(1)
 const qrDataUrl = ref('')
 const secret = ref('')
-const confirmCode = ref('')
+
+/** `n-input-otp` 的 value 是每格一个字符的数组，不是单个字符串 */
+const confirmCells = ref<string[] | null>(null)
 
 /** 只做展示分组，提交的密钥不受空格影响 */
 const groupedSecret = ref('')
+
+const confirmCode = computed(() => joinOtp(confirmCells.value))
+const confirmCodeReady = computed(() => confirmCode.value.length === 6)
 
 // ── 恢复码 ──────────────────────────────────────────────────────
 
@@ -295,7 +300,7 @@ async function startSetup() {
       showError('二维码渲染失败，请手动输入密钥')
     }
     setupStep.value = 1
-    confirmCode.value = ''
+    confirmCells.value = null
     setupVisible.value = true
   } catch {
     // 错误提示已由响应拦截器统一弹出
@@ -305,7 +310,7 @@ async function startSetup() {
 }
 
 async function submitEnable() {
-  if (busy.value || confirmCode.value.length !== 6) return
+  if (busy.value || !confirmCodeReady.value) return
   busy.value = true
   try {
     const resp = (await authApi.enableTwoFactor(confirmCode.value)) as unknown as {
@@ -315,7 +320,7 @@ async function submitEnable() {
     // "两个弹窗都没了、恢复码没看见"的空档
     showRecoveryCodes(resp.recovery_codes)
     setupVisible.value = false
-    confirmCode.value = ''
+    confirmCells.value = null
     await loadStatus()
   } catch {
     // 错误提示已由响应拦截器统一弹出。密钥仍在待确认槽位里，可直接重试
@@ -327,7 +332,7 @@ async function submitEnable() {
 function closeSetup() {
   if (setupStep.value === 2) {
     setupStep.value = 1
-    confirmCode.value = ''
+    confirmCells.value = null
     return
   }
   setupVisible.value = false

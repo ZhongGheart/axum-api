@@ -208,7 +208,16 @@ http.interceptors.response.use(
     const responseBody = error.response.data as { message?: unknown } | undefined
     const serverMessage = typeof responseBody?.message === 'string' ? responseBody.message : ''
 
-    let message = `请求失败 (${status})`
+    /*
+     * 默认**用后端的话**，前端不另编通用句。
+     *
+     * 此前这里对 400 / 409 / 413 一律写死 `请求失败 (400)`，把后端
+     * message 整段丢掉。后端是分得清的（`校验失败: 验证码不正确，请确认
+     * 手机时间准确后重试` 与 `校验失败: 恢复码已被使用` 说的是两件事，
+     * 用户该知道自己下一步做什么），把它换成状态码等于用"发生了什么"
+     * 冒充"为什么"，和上面 401 那段踩的是同一个坑。
+     */
+    let message = serverMessage || `请求失败 (${status})`
 
     switch (status) {
       case 401:
@@ -239,15 +248,18 @@ http.interceptors.response.use(
         message = serverMessage || '未授权，请重新登录'
         break
       case 403:
-        message = '权限不足'
+        // 无权访问的**原因**分得清（缺哪个权限码），比"权限不足"可行动
+        message = serverMessage || '权限不足'
         break
       case 404:
-        message = '请求的资源不存在'
+        message = serverMessage || '请求的资源不存在'
         break
       case 429:
-        message = '请求过于频繁，请稍后再试'
+        // 锁定类错误带"还剩几次/解锁时间"，那正是用户要看到的
+        message = serverMessage || '请求过于频繁，请稍后再试'
         break
       case 500:
+        // 500 刻意不看后端消息：内部错误的具体原因按设计不外泄
         message = '服务器内部错误'
         break
     }

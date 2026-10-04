@@ -9,6 +9,7 @@ import { describe, it, expect } from 'vitest'
 import {
   groupSecret,
   isRecoveryCodeFilled,
+  joinOtp,
   normalizeRecoveryCode,
   formatRecoveryCodes,
   renderQrDataUrl,
@@ -56,6 +57,20 @@ describe('groupSecret', () => {
 describe('formatRecoveryCodes', () => {
   it('每行一个码', () => {
     expect(formatRecoveryCodes(['ABCD2345', 'EFGH6789'])).toBe('ABCD2345\nEFGH6789')
+  })
+})
+
+describe('joinOtp', () => {
+  it('把每格一个字符的数组拼成字符串', () => {
+    expect(joinOtp(['9', '3', '4', '1', '9', '6'])).toBe('934196')
+  })
+
+  /**
+   * `n-input-otp` 的 value 是 `null | string[]`。空态是 null 而不是 []，
+   * 直接 `.join` 会抛——那会让"还没输就点提交"变成一次白屏异常。
+   */
+  it('空态不会抛', () => {
+    expect(joinOtp([])).toBe('')
   })
 })
 

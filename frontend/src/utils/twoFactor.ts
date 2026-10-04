@@ -9,6 +9,22 @@
 import QRCode from 'qrcode'
 
 /**
+ * 把 `n-input-otp` 的绑定值拼成字符串
+ *
+ * **这个坑踩过**：`n-input-otp` 的 `value` 类型是 `string[]`（每格一个字符），
+ * 不是我们习惯的单个字符串。写成 `ref('')` 之后界面照常显示、按钮照常可点，
+ * 直到后端回 `code: invalid type: sequence, expected a string` 才暴露——
+ * 而 `vue-tsc` 在这里没报错，所以只能靠"提交前统一过一道"来兜。
+ *
+ * 两处用到（登录第二步、绑定确认），收在这里是因为这个类型认知本身
+ * 就是这个工具模块的一部分，不该让每个调用点各写一次 `.join('')`。
+ */
+export function joinOtp(cells: string[] | null): string {
+  // 空态是 null 而不是 []，直接 .join 会抛
+  return cells ? cells.join('') : ''
+}
+
+/**
  * 归一化用户输入的恢复码
  *
  * 与后端 `hash_recovery_code` 的归一化保持一致：转大写、去掉 `-` 和空格。

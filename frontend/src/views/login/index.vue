@@ -16,7 +16,7 @@
           {{ step === 'credentials' ? '登录 Axum Admin' : '两步验证' }}
         </h1>
         <p class="login-subtitle">
-          {{ step === 'credentials' ? '使用你的账号登录' : '输入验证器 App 的 6 位动态码' }}
+          {{ stepSubtitle }}
         </p>
       </header>
 
@@ -103,7 +103,7 @@
           -->
           <n-input-otp
             v-if="codeMode === 'totp'"
-            v-model:value="otpCode"
+            v-model:value="otpCells"
             :length="6"
             :disabled="verifying"
             size="large"
@@ -168,6 +168,7 @@ import { showError, showSuccess } from '@/utils/message'
 import { getStorage, setStorage, removeStorage } from '@/utils/storage'
 import { buildSessionEndedMessage, takeSessionEnded } from '@/utils/session'
 import { IDENTIFIER_MAX_LEN, loginIdentifierRules, loginPasswordRules } from '@/utils/accountRules'
+import { isRecoveryCodeFilled, joinOtp, normalizeRecoveryCode } from '@/utils/twoFactor'
 import AuthShell from '@/components/common/AuthShell.vue'
 
 // ── 状态 ────────────────────────────────────────────────────────
@@ -221,7 +222,8 @@ const rememberMe = ref(false)
 
 const step = ref<LoginStep>('credentials')
 const codeMode = ref<CodeMode>('totp')
-const otpCode = ref('')
+/** `n-input-otp` 的 value 是每格一个字符的数组，不是单个字符串 */
+const otpCells = ref<string[] | null>(null)
 const recoveryCode = ref('')
 const verifying = ref(false)
 
@@ -235,8 +237,21 @@ let challengeToken: string | null = null
 
 /** 位数不足时先拦在本地，省一次注定失败的往返 */
 const codeReady = computed(() =>
-  codeMode.value === 'totp' ? otpCode.value.length === 6 : recoveryCode.value.trim().length >= 6,
+  codeMode.value === 'totp'
+    ? joinOtp(otpCells.value).length === 6
+    : isRecoveryCodeFilled(recoveryCode.value),
 )
+
+/**
+ * 副标题跟着当前状态走
+ *
+ * 之前只按 `step` 判断，切到"恢复码"时副标题还写着"6 位动态码"——
+ * 副标题说 A、输入框要 B 时，用户会怀疑自己看错了页面。
+ */
+const stepSubtitle = computed(() => {
+  if (step.value === 'credentials') return '使用你的账号登录'
+  return codeMode.value === 'totp' ? '输入验证器 App 的 6 位动态码' : '输入一个一次性的恢复码'
+})
 
 // ── 表单校验规则 ────────────────────────────────────────────────
 //
@@ -328,7 +343,13 @@ async function handleVerify(): Promise<void> {
   if (verifying.value || !challengeToken || !codeReady.value) return
   verifying.value = true
   try {
-    const code = codeMode.value === 'totp' ? otpCode.value.trim() : recoveryCode.value.trim()
+    // 恢复码先归一化再提交：手抄的码常带空格与连字符，
+    // 交给后端去归一化也行，但那样失败提示会指向后端，
+    // 而用户的问题就出在抄写上。归一化规则与后端同一套。
+    const code =
+      codeMode.value === 'totp'
+        ? joinOtp(otpCells.value)
+        : normalizeRecoveryCode(recoveryCode.value)
     const result = await userStore.completeTwoFactorLogin(challengeToken, code)
     if (!result) return
     // 用掉即弃：挑战令牌一次性，不清掉会在"换个账号"之后
@@ -347,7 +368,7 @@ async function handleVerify(): Promise<void> {
 function backToCredentials(): void {
   challengeToken = null
   step.value = 'credentials'
-  otpCode.value = ''
+  otpCells.value = null
   recoveryCode.value = ''
 }
 
