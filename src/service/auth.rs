@@ -387,6 +387,37 @@ impl AuthService {
             PasswordCheck::Valid => {}
         }
 
+        // ── 并发会话上限（v0.23.0）────────────────────────────────
+        //
+        // 放在**口令校验之后、登记新会话之前**：放在口令校验之前会变成
+        // 一个"账号是否存在 / 口令对不对"的探针（多一次登录尝试就能试出
+        // 上限是否已满，而"已满"本身泄露了"这个账号有活跃会话"）；
+        // 放在登记之后则要先建一条再删一次，留下一个短暂的超限窗口。
+        //
+        // **0 表示不限制**（默认）。与口令策略同一原则：默认值必须与
+        // 本版此前的行为逐字一致——此前同一账号可在任意多设备同时在线，
+        // 把默认值设成 1 会让一次常规发版突然只允许一台设备登录。
+        let max_concurrent = self.setting_service.session_max_concurrent().await;
+        if max_concurrent > 0 {
+            let existing = redis_client.list_sessions(user.id).await?.len() as u64;
+            if existing >= max_concurrent {
+                self.audit(AuthAudit {
+                    action: Self::ACTION_LOGIN_FAILURE,
+                    path: Self::PATH_LOGIN,
+                    status_code: 403,
+                    client_ip,
+                    username: &login_input,
+                    user_id: Some(user.id),
+                    result: "并发会话数已达上限",
+                })
+                .await?;
+                return Err(AppError::PermissionDenied(format!(
+                    "该账号已在 {} 个设备上登录，请先下线其他设备",
+                    max_concurrent
+                )));
+            }
+        }
+
         let roles = self.role_repo.find_roles_by_user_id(user.id).await?;
 
         tracing::debug!("用户 {} 拥有的角色: {:?}", user.username, roles);

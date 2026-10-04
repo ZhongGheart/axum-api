@@ -48,6 +48,8 @@ pub enum SettingGroup {
     Login,
     /// 注册准入
     Registration,
+    /// 会话
+    Session,
 }
 
 impl SettingGroup {
@@ -57,6 +59,7 @@ impl SettingGroup {
             SettingGroup::Password => "password",
             SettingGroup::Login => "login",
             SettingGroup::Registration => "registration",
+            SettingGroup::Session => "session",
         }
     }
 }
@@ -181,6 +184,17 @@ pub const SETTING_DEFS: &[SettingDef] = &[
         max: 1,
         consumed_by: "注册入口的准入判定（`service::auth::register` 的第一道检查）",
     },
+    SettingDef {
+        key: "security.session.max_concurrent",
+        name: "并发会话上限",
+        description: "同一账号最多同时在线几个会话。**0 表示不限制**（默认）。达到上限后新登录会被拒绝，用户需先下线其他设备（个人中心 → 登录会话）。",
+        value_type: SettingType::Int,
+        group: SettingGroup::Session,
+        default: "0",
+        min: 0,
+        max: 100,
+        consumed_by: "登录时判定是否还有空位（口令校验之后、登记新会话之前）",
+    },
 ];
 
 /// 按 key 查定义
@@ -263,6 +277,19 @@ mod tests {
             "默认值必须是 true：收紧要由管理员显式表达"
         );
         assert_eq!(def.group, SettingGroup::Registration);
+    }
+
+    /// 并发会话上限必须存在，且默认值必须是 `0`（不限制）
+    ///
+    /// 默认非 0 会让一次常规发版突然只允许有限设备登录——
+    /// 与注册开关同一原则：默认值必须与本版此前的行为逐字一致。
+    #[test]
+    fn concurrent_session_limit_exists_and_defaults_to_unlimited() {
+        let def = find_def("security.session.max_concurrent")
+            .expect("并发会话上限必须是已定义的系统参数");
+        assert_eq!(def.value_type, SettingType::Int);
+        assert_eq!(def.default, "0", "默认值必须是 0（不限制）");
+        assert_eq!(def.group, SettingGroup::Session);
     }
 
     /// 默认值必须与本版此前的硬编码常量一致

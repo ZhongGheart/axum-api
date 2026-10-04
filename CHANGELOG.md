@@ -10,6 +10,13 @@
 新增参数 `security.registration.enabled`（Bool，默认 `true`），
 注册入口据此决定放行还是 403。
 
+同版还落地了 **A1 用户自助会话管理** 与 **A2 并发会话上限**：
+新增 `GET /api/auth/sessions`、`POST /api/auth/sessions/{jti}/revoke`、
+`POST /api/auth/sessions/revoke-others`（恒以调用者自己为作用域），
+以及参数 `security.session.max_concurrent`（Int，默认 `0` = 不限制）。
+因此迁移 `017` 实际插**两行**种子，文件改名为 `017_account_security.sql`
+（迁移未发布，改名安全）。
+
 ### 缺口本身
 
 `/api/auth/register` 挂在 `public_routes` 上**无条件开放**，

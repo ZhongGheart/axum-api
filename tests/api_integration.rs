@@ -11628,6 +11628,212 @@ async fn a_self_service_session_revocation_is_audited() {
     assert!(row.is_some(), "自助吊销会话必须落审计");
 }
 
+// ──────────────────────────────────────────────
+// v0.23.0 A2：并发会话上限
+// ──────────────────────────────────────────────
+
+/// 达到上限后新登录被拒，但**已登录的会话不受影响**
+///
+/// 这是 A2 的核心：上限约束的是"还能不能新开一个会话"，
+/// 不是"已经在线的会话要不要被踢"。后者是 `revoke-others` 的事。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn concurrent_session_limit_blocks_new_logins_but_not_existing_sessions() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (username, _id) = make_plain_user(&app, &admin, "maxconc").await;
+
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_SESSION_MAX_CONCURRENT}"),
+            Some(&admin),
+            Some(json!({ "value": "1" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "设置上限失败");
+    flush_settings_cache().await;
+
+    // 第一个会话：成功
+    let first = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    // 第二个会话：必须被拒
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": username, "password": "Str0ng!Pass" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "达到上限后新登录必须被拒: {body}"
+    );
+
+    // **已登录的那条不受影响**
+    let (status, body) = send(&app, request("GET", "/api/auth/me", Some(&first), None)).await;
+    assert_eq!(status, StatusCode::OK, "已在线的会话不得被上限影响: {body}");
+
+    // 复原
+    put_setting_raw(KEY_SESSION_MAX_CONCURRENT, "0", None).await;
+    flush_settings_cache().await;
+}
+
+/// 默认 `0` 表示不限制
+///
+/// 这条钉的是"发版不能改变既成行为"：本参数出现之前同一账号可在
+/// 任意多设备同时在线，默认非 0 会让一次常规发版突然只允许有限设备登录。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn concurrent_session_limit_defaults_to_unlimited() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (username, _id) = make_plain_user(&app, &admin, "maxzero").await;
+
+    let row = get_setting_row(KEY_SESSION_MAX_CONCURRENT)
+        .await
+        .expect("并发会话上限必须有种子行");
+    assert_eq!(row.0, "0", "默认值必须是 0（不限制）");
+
+    // 开 5 个会话都该成功
+    for _ in 0..5 {
+        let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+        let (status, body) = send(&app, request("GET", "/api/auth/me", Some(&tok), None)).await;
+        assert_eq!(status, StatusCode::OK, "不限制时每个会话都该可用: {body}");
+    }
+}
+
+/// 腾出空位后新登录就能成功
+///
+/// 这是 A1 与 A2 的协同：用户被上限挡住时，
+/// 个人中心 → 登录会话 → 下线一台设备，就能给自己腾出空位。
+/// 没有 A1 的话，用户只能找管理员。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn freeing_a_slot_allows_a_new_login() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (username, _id) = make_plain_user(&app, &admin, "maxfree").await;
+
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_SESSION_MAX_CONCURRENT}"),
+            Some(&admin),
+            Some(json!({ "value": "1" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    flush_settings_cache().await;
+
+    let first = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    // 被上限挡住
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": username, "password": "Str0ng!Pass" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // 用 first 下线自己（= 登出这一台），腾出空位。
+    // 先列出自己的会话拿到 jti——`revoke-others` 会保留当前会话，
+    // 用它来"腾空位"是自相矛盾的。
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/auth/sessions", Some(&first), None),
+    )
+    .await;
+    let jti = body["data"][0]["jti"].as_str().unwrap().to_string();
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/auth/sessions/{jti}/revoke"),
+            Some(&first),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "下线自己失败");
+
+    // 现在空出一个位置，新登录该成功
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": username, "password": "Str0ng!Pass" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "腾出空位后应能登录: {body}");
+
+    put_setting_raw(KEY_SESSION_MAX_CONCURRENT, "0", None).await;
+    flush_settings_cache().await;
+}
+
+/// 上限判定必须在**口令校验之后**
+///
+/// 放在口令校验之前会变成一个探针：多一次登录尝试就能试出
+/// "上限是否已满"，而"已满"本身泄露了"这个账号有活跃会话"。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_concurrent_limit_check_runs_after_password_verification() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let (username, _id) = make_plain_user(&app, &admin, "maxorder").await;
+
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_SESSION_MAX_CONCURRENT}"),
+            Some(&admin),
+            Some(json!({ "value": "1" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    flush_settings_cache().await;
+
+    let _first = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    // 上限已满时，**错口令仍必须返回 401**，不能变成 403
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": username, "password": "wrong-password" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "错口令必须返回 401 而不是 403（否则上限状态可被当作探针）: {body}"
+    );
+
+    put_setting_raw(KEY_SESSION_MAX_CONCURRENT, "0", None).await;
+    flush_settings_cache().await;
+}
+
 #[tokio::test]
 #[ignore = "需要真实 Postgres + Redis"]
 async fn revoking_a_malformed_or_unknown_jti_is_refused() {
@@ -12444,6 +12650,7 @@ const KEY_MIXED_CASE: &str = "security.password.require_mixed_case";
 const KEY_EXPIRY_DAYS: &str = "security.password.expiry_days";
 const KEY_MAX_FAILURES: &str = "security.login.max_failures";
 const KEY_REGISTRATION_ENABLED: &str = "security.registration.enabled";
+const KEY_SESSION_MAX_CONCURRENT: &str = "security.session.max_concurrent";
 
 #[tokio::test]
 #[ignore = "需要真实 Postgres + Redis"]

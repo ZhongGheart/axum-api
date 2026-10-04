@@ -125,10 +125,11 @@ const GROUP_TITLES: Record<SettingGroup, string> = {
   password: '口令策略',
   login: '登录防护',
   registration: '注册准入',
+  session: '会话',
 }
 
 const sections = computed(() => {
-  const order: SettingGroup[] = ['password', 'login', 'registration']
+  const order: SettingGroup[] = ['password', 'login', 'registration', 'session']
   const grouped = new Map<string, SettingItem[]>()
   for (const item of items.value) {
     const bucket = grouped.get(item.group)

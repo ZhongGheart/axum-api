@@ -23,6 +23,7 @@ pub mod keys {
     pub const LOGIN_MAX_FAILURES: &str = "security.login.max_failures";
     pub const LOGIN_FAILURE_WINDOW_SECONDS: &str = "security.login.failure_window_seconds";
     pub const REGISTRATION_ENABLED: &str = "security.registration.enabled";
+    pub const SESSION_MAX_CONCURRENT: &str = "security.session.max_concurrent";
 }
 
 /// 系统参数服务
@@ -226,6 +227,19 @@ impl SettingService {
         self.resolve_bool(keys::REGISTRATION_ENABLED).await
     }
 
+    /// 并发会话上限；`0` 表示不限制
+    ///
+    /// 默认 `0` 是**刻意**的：本参数出现之前同一账号可在任意多设备同时在线，
+    /// 把默认值设成非 0 会让一次常规发版突然只允许有限设备登录。
+    ///
+    /// 读失败时 [`resolve_int`] 回落到 `default`（即 `0` = 不限制）：
+    /// 参数表不可用就把上限当成 0，会让"谁也登不进来"成为一个
+    /// 由数据库故障引发的全站停摆——与口令策略、注册开关同一原则。
+    pub async fn session_max_concurrent(&self) -> u64 {
+        let v = self.resolve_int(keys::SESSION_MAX_CONCURRENT).await;
+        v.max(0) as u64
+    }
+
     /// 列出参数，并把 `value` / `source` 换成**实际生效**的那一份
     ///
     /// 参数页要显示的是"现在真正生效的数字"，而不是 DB 里躺着的那个。
@@ -394,6 +408,7 @@ mod tests {
                 keys::LOGIN_MAX_FAILURES,
                 keys::LOGIN_FAILURE_WINDOW_SECONDS,
                 keys::REGISTRATION_ENABLED,
+                keys::SESSION_MAX_CONCURRENT,
             ]
             .contains(&def.key);
             assert!(

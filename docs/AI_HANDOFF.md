@@ -5845,3 +5845,60 @@ fmt ✓ / clippy 0 warning / Rust 单测 109 / 集成 **186 passed 0 failed** /
 
 v0.23.0 还剩 **A2 并发登录上限**，与 A1 共享会话代码路径。
 **约定：本地提交，不推送。**
+
+---
+
+## 2026-10-04 v0.23.0 / A2 并发会话上限（已实现，待提交）
+
+**目标**：同一账号可在任意多设备同时在线，`max_session|concurrent|session_limit`
+全仓零命中，管理员只能事后逐个吊销。
+
+**起始 git 状态**：`a65bc055 chore: 同步 Cargo.lock 版号到 0.23.0`。
+
+### 改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `src/model/setting.rs` | 新增 `SettingGroup::Session`；新增参数 `security.session.max_concurrent`（Int，默认 `0` = 不限制，范围 0-100）；加单测 |
+| `src/service/setting.rs` | 新增 `keys::SESSION_MAX_CONCURRENT` 与 `session_max_concurrent()`；加进"每个 key 必须被常量覆盖"的反向断言 |
+| `src/service/auth.rs` | `login()` 在**口令校验之后、登记新会话之前**插入上限判定，达上限即 `PermissionDenied`（403）并落审计 |
+| `migrations/017_account_security.sql` | 由 `017_registration_enabled.sql` **改名**并补种子行（迁移未发布，改名安全） |
+| `src/docs/mod.rs` | 三个新端点登记进 `ApiDoc`（`every_registered_route_is_documented` 要求） |
+| 前端 | `SettingGroup` 加 `'session'`；参数页 `GROUP_TITLES` 加 `session: '会话'` |
+| `tests/api_integration.rs` | 4 条新用例 |
+
+### 四个刻意的决定
+
+1. **默认 `0`（不限制）**。本参数出现之前同一账号可在任意多设备同时在线，
+   默认非 0 会让一次常规发版突然只允许有限设备登录。
+   读失败时 `resolve_int` 回落到 `default`（即 `0`）——参数表不可用就把上限当成 0，
+   会让"谁也登不进来"成为数据库故障引发的全站停摆，与口令策略、注册开关同一原则。
+2. **判定放在口令校验之后、登记新会话之前**。放在口令校验之前会变成一个探针：
+   多一次登录尝试就能试出"上限是否已满"，而"已满"本身泄露了"这个账号有活跃会话"；
+   放在登记之后则要先建一条再删一次，留下一个短暂的超限窗口。
+   `the_concurrent_limit_check_runs_after_password_verification` 钉住（错口令仍 401 而非 403）。
+3. **上限约束的是"还能不能新开一个会话"，不是"已在线的要不要被踢"**。
+   后者是 `revoke-others` 的事。`concurrent_session_limit_blocks_new_logins_but_not_existing_sessions`
+   用已登录的会话验证它仍然 200。
+4. **与 A1 协同**。用户被上限挡住时，个人中心 → 登录会话 → 下线一台设备，
+   就能给自己腾出空位。没有 A1 的话，用户只能找管理员。
+   `freeing_a_slot_allows_a_new_login` 覆盖这条链路。
+
+### 踩到的一个坑
+
+**改了已应用的迁移 → 测试库校验和失配**。C2 的 `017_registration_enabled.sql`
+在 C2 测试跑时已被应用；A2 往同一个文件里加种子行后，
+`migration 17 was previously applied but has been modified`。
+处理：把文件**改名**成 `017_account_security.sql`（迁移未发布，改名安全）
+并 DROP/CREATE 测试库重跑。**已发布的迁移绝不能改内容**，只能新增文件。
+
+### 门禁结果
+
+fmt ✓ / clippy 0 warning / Rust 单测 **110** / 集成 **190 passed 0 failed** /
+前端 lint 0 error（`env.d.ts` 1 个历史 warning）/ typecheck ✓ / **203 passed** / build ✓
+
+### v0.23.0 状态
+
+C2 ✅ + A1 ✅ + A2 ✅，**v0.23.0 三项全部完成**。
+下一版按 ROADMAP 是 **v0.24.0 = B1 部门树（单独占一版）**。
+**约定：本地提交，不推送。**
