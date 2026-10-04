@@ -124,10 +124,11 @@ const loadFailed = ref(false)
 const GROUP_TITLES: Record<SettingGroup, string> = {
   password: '口令策略',
   login: '登录防护',
+  registration: '注册准入',
 }
 
 const sections = computed(() => {
-  const order: SettingGroup[] = ['password', 'login']
+  const order: SettingGroup[] = ['password', 'login', 'registration']
   const grouped = new Map<string, SettingItem[]>()
   for (const item of items.value) {
     const bucket = grouped.get(item.group)

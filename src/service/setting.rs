@@ -22,6 +22,7 @@ pub mod keys {
     pub const PASSWORD_EXPIRY_DAYS: &str = "security.password.expiry_days";
     pub const LOGIN_MAX_FAILURES: &str = "security.login.max_failures";
     pub const LOGIN_FAILURE_WINDOW_SECONDS: &str = "security.login.failure_window_seconds";
+    pub const REGISTRATION_ENABLED: &str = "security.registration.enabled";
 }
 
 /// 系统参数服务
@@ -211,6 +212,20 @@ impl SettingService {
         v as u64
     }
 
+    /// 是否开放自助注册
+    ///
+    /// 默认 `true` 是**刻意**的：本参数出现之前注册就是无条件开放的，
+    /// 把默认值设成 `false` 会让一次常规发版突然关掉所有部署的注册入口。
+    /// 收紧的意图必须由管理员显式表达。
+    ///
+    /// 读失败时 [`resolve_bool`] 回落到 `default`（即 `true`）：
+    /// 参数表不可用就把注册关掉，会让"谁也注册不了"成为一个
+    /// 由数据库故障引发的全站停摆——与口令策略同一原则，
+    /// 参数是收紧的手段，不该成为锁死系统的开关。
+    pub async fn registration_enabled(&self) -> bool {
+        self.resolve_bool(keys::REGISTRATION_ENABLED).await
+    }
+
     /// 列出参数，并把 `value` / `source` 换成**实际生效**的那一份
     ///
     /// 参数页要显示的是"现在真正生效的数字"，而不是 DB 里躺着的那个。
@@ -378,6 +393,7 @@ mod tests {
                 keys::PASSWORD_EXPIRY_DAYS,
                 keys::LOGIN_MAX_FAILURES,
                 keys::LOGIN_FAILURE_WINDOW_SECONDS,
+                keys::REGISTRATION_ENABLED,
             ]
             .contains(&def.key);
             assert!(

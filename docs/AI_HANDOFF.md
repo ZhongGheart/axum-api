@@ -5707,3 +5707,65 @@ JWT 密钥在 `/tmp/axum_jwt_secret.txt`。文档端点总数是 **50**，不是
 
 **改动文件**：仅 `docs/ROADMAP.md`（+ `docs/AI_HANDOFF.md` 本节）。无代码改动，未跑门禁（纯文档）。
 **约定**：本地提交，**不推送**。
+
+---
+
+## 2026-10-04 v0.23.0 / C2 开放注册开关（已实现，待提交）
+
+**目标**：关掉那条"部署出去就一直在敞开"的缺口——`/api/auth/register`
+挂在 `public_routes` 上无条件开放，注册成功即自动分配 `user` 角色，
+且 `allow_register|registration_enabled` 全仓零命中。
+
+**起始 git 状态**：`5239aa5c docs(roadmap): 按实测复核重排 v0.23.0/v0.24.0 计划`。
+
+### 改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `src/model/setting.rs` | 新增 `SettingGroup::Registration`；新增参数 `security.registration.enabled`（Bool，默认 `true`，分组 registration）；加单测 `registration_switch_exists_and_defaults_to_open` |
+| `src/service/setting.rs` | 新增 `keys::REGISTRATION_ENABLED` 与 `registration_enabled()`；把它加进"每个 key 必须被常量覆盖"的反向断言 |
+| `src/service/auth.rs` | `register()` **第一道**检查注册开关，关闭即 `AppError::Forbidden`（403）并落审计（`result="注册已关闭"`） |
+| `migrations/017_registration_enabled.sql` | 只插种子行，**无 DDL**（`system_settings` 的 key 是主键、由 `SETTING_DEFS` 定义，新增参数不需要改表） |
+| `frontend/src/api/setting.ts` | `SettingGroup` 联合类型加 `'registration'` |
+| `frontend/src/views/system/setting/index.vue` | `GROUP_TITLES` 加 `registration: '注册准入'`，`order` 同步 |
+| `tests/api_integration.rs` | 4 条新用例，见下 |
+
+### 三个刻意的决定
+
+1. **默认值是 `true`（保持开放）**。本参数出现之前注册就是无条件开放的，
+   这是既成事实而非疏忽。默认 `false` 会让一次常规发版突然关掉所有存量部署的
+   注册入口，包括**故意**开放注册的内部系统。收紧的意图必须由管理员显式表达。
+   读失败时 `resolve_bool` 回落到 `default`（即 `true`）——参数表不可用就把注册关掉，
+   会让"谁也注册不了"成为数据库故障引发的全站停摆，与口令策略同一原则。
+2. **准入判定放在所有校验之前**。顺序反了的话，关闭注册时一个非法用户名会拿到
+   400 而不是 403：既泄露"这个用户名能不能用"，也让前端把"注册已关闭"
+   显示成一次普通表单校验失败。`the_registration_gate_runs_before_any_validation` 钉住。
+3. **关闭注册不影响已注册用户登录**。注册准入与登录是两条独立路径，
+   `admin_can_close_and_reopen_registration` 里用关闭前注册的用户验证登录仍 200。
+
+### 测试
+
+- 单测 `registration_switch_exists_and_defaults_to_open`：参数必须存在、
+  必须是 Bool、默认必须 `true`、分组必须 `Registration`。
+  两个方向都会出事：参数不存在 → `resolve_bool` 回落 `false` → 注册被静默关掉
+  而管理员在界面上看不到任何能打开它的开关；默认 `false` → 发版即改变既成行为。
+- 集成 4 条（`--ignored`）：默认开放、可关可重开、被拒仍落审计、判定先于校验。
+  5 passed（含 `registration_is_audited` 这条历史遗留同名用例）。
+
+### 门禁结果
+
+fmt ✓ / clippy 0 warning / Rust 单测 **109** / 集成 **180 passed 0 failed** /
+前端 lint 0 error（`env.d.ts` 1 个历史 warning）/ typecheck ✓ / **203 passed** / build ✓
+
+### 环境注意（本轮踩到）
+
+**Postgres 在轮次之间会被重置**，本轮开场 `pg_isready -p 55432` → no response，
+5 条新用例全部 `pool timed out`。`scripts/test_env.sh start` 拉起后即正常。
+Redis（56379）没被重置。
+
+### 下一步
+
+v0.23.0 还剩 **A1 用户自助会话管理** 与 **A2 并发登录上限**，
+两者与 C2 共享「会话 + 参数表」代码路径，同版自洽。
+版号抬到 0.23.0 与 CHANGELOG 按既有规矩**单独一个提交**。
+**约定：本地提交，不推送。**

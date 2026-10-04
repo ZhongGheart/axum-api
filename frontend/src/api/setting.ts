@@ -13,7 +13,7 @@
 import http from './index'
 
 /** 参数分组（后端 `SettingGroup`） */
-export type SettingGroup = 'password' | 'login'
+export type SettingGroup = 'password' | 'login' | 'registration'
 
 /** 参数取值类型（后端 `SettingType::as_str`） */
 export type SettingValueType = 'int' | 'bool'

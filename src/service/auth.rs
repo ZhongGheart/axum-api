@@ -163,6 +163,26 @@ impl AuthService {
         req: RegisterRequest,
         client_ip: &str,
     ) -> Result<UserInfo, AppError> {
+        // 注册准入判定放在**所有校验之前**：关闭注册时不该因为
+        // "用户名不合法"而返回 400——那会泄露"这个用户名能不能用"，
+        // 也会让前端把关闭注册显示成一次表单校验失败。
+        //
+        // 失败也落审计：关闭注册后仍有人来撞注册口，
+        // 与登录失败计数一样，是"有人在试探"的直接证据。
+        if !self.setting_service.registration_enabled().await {
+            self.audit(AuthAudit {
+                action: Self::ACTION_REGISTER,
+                path: Self::PATH_REGISTER,
+                status_code: 403,
+                client_ip,
+                username: &req.username,
+                user_id: None,
+                result: "注册已关闭",
+            })
+            .await?;
+            return Err(AppError::Forbidden);
+        }
+
         // 归一在**校验之前**：`users.username` / `users.email` 的唯一数据源。
         // 下面的查重用的就是归一后的值，于是查重自动变成"归一后比较"——
         // 不必再单独写一条大小写不敏感的查重，那样两处规则迟早会走偏。

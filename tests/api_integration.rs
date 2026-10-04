@@ -12145,6 +12145,7 @@ const KEY_MIN_LENGTH: &str = "security.password.min_length";
 const KEY_MIXED_CASE: &str = "security.password.require_mixed_case";
 const KEY_EXPIRY_DAYS: &str = "security.password.expiry_days";
 const KEY_MAX_FAILURES: &str = "security.login.max_failures";
+const KEY_REGISTRATION_ENABLED: &str = "security.registration.enabled";
 
 #[tokio::test]
 #[ignore = "需要真实 Postgres + Redis"]
@@ -13086,4 +13087,271 @@ async fn the_settings_permission_codes_are_seeded_even_on_an_existing_database()
         component, "system/setting/index",
         "component 必须对应前端真实存在的 .vue 文件"
     );
+}
+
+// ──────────────────────────────────────────────
+// v0.23.0 开放注册开关
+// ──────────────────────────────────────────────
+
+/// 默认必须开放注册
+///
+/// 这条钉的是"发版不能改变既成行为"：本参数出现之前注册就是无条件开放的，
+/// 若默认值取错成 `false`，一次常规发版会突然关掉所有存量部署的注册入口。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn registration_is_open_by_default() {
+    let app = app().await;
+
+    let row = get_setting_row(KEY_REGISTRATION_ENABLED)
+        .await
+        .expect("开放注册开关必须有种子行");
+    assert_eq!(row.0, "true", "默认值必须是 true");
+    assert!(
+        row.1.is_none(),
+        "种子行不该有 updated_by，否则会被当成管理员显式改过"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": unique("regopen"),
+                "email": format!("{}@example.com", unique("ro")),
+                "password": "register1A"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "默认必须开放注册: {body}");
+}
+
+/// 管理员关闭注册后，注册入口必须真的关上
+///
+/// 这是 v0.23.0 的核心：在此之前 `/api/auth/register` 挂在 `public_routes` 上
+/// **无条件开放**，且注册成功即自动分配 `user` 角色——公网部署没有任何办法关掉它。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn admin_can_close_and_reopen_registration() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    // 先确认基线是开的
+    let baseline = unique("regbaseline");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": baseline,
+                "email": format!("{baseline}@example.com"),
+                "password": "register1A"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "关闭前必须能注册: {body}");
+
+    // 关闭
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_REGISTRATION_ENABLED}"),
+            Some(&admin),
+            Some(json!({ "value": "false" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "关闭注册失败: {body}");
+    flush_settings_cache().await;
+
+    // 注册必须被拒，且**不能创建任何用户行**
+    let probe = unique("regclosed");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": probe,
+                "email": format!("{probe}@example.com"),
+                "password": "register1A"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "关闭后注册必须 403: {body}");
+
+    let created: Option<(String,)> =
+        sqlx::query_as("SELECT username FROM users WHERE username = $1")
+            .bind(&probe)
+            .fetch_optional(&pool().await)
+            .await
+            .expect("查询用户失败");
+    assert!(created.is_none(), "被拒的注册绝不能留下用户行");
+
+    // 关闭注册**不得影响已注册用户登录**。
+    // 基线用户是在关闭之前注册的，这里直接用它验证登录仍然可用。
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({
+                "username": baseline,
+                "password": "register1A"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "关闭注册不得影响已注册用户登录: {body}"
+    );
+
+    // 重新打开
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_REGISTRATION_ENABLED}"),
+            Some(&admin),
+            Some(json!({ "value": "true" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重开注册失败: {body}");
+    flush_settings_cache().await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": unique("regreopened"),
+                "email": format!("{}@example.com", unique("rr")),
+                "password": "register1A"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重开后必须能注册: {body}");
+
+    // 复原成种子状态，避免影响后续用例
+    put_setting_raw(KEY_REGISTRATION_ENABLED, "true", None).await;
+    flush_settings_cache().await;
+}
+
+/// 关闭注册后，被拒的请求必须落审计
+///
+/// 关闭注册后仍有人来撞注册口，与登录失败计数一样是"有人在试探"的证据。
+/// 不落审计的话，"谁尝试过注册"这件事在关闭期间完全不可见。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_closed_registration_attempt_is_still_audited() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_REGISTRATION_ENABLED}"),
+            Some(&admin),
+            Some(json!({ "value": "false" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    flush_settings_cache().await;
+
+    let probe = unique("regaudit");
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": probe,
+                "email": format!("{probe}@example.com"),
+                "password": "register1A"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let row: Option<(String, String)> = sqlx::query_as(
+        r#"
+        SELECT status_code::text, result FROM audit_logs
+        WHERE path = '/api/auth/register' AND username = $1
+        ORDER BY created_at DESC LIMIT 1
+        "#,
+    )
+    .bind(&probe)
+    .fetch_optional(&pool().await)
+    .await
+    .expect("查询审计失败");
+    let (code, result) = row.expect("被拒的注册必须落审计");
+    assert_eq!(code, "403");
+    assert_eq!(result, "注册已关闭");
+
+    put_setting_raw(KEY_REGISTRATION_ENABLED, "true", None).await;
+    flush_settings_cache().await;
+}
+
+/// 准入判定必须在**所有校验之前**
+///
+/// 若顺序反了，关闭注册时一个非法用户名会拿到 400 而不是 403——
+/// 那会泄露"这个用户名能不能用"，也让前端把"注册已关闭"
+/// 显示成一次普通的表单校验失败。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_registration_gate_runs_before_any_validation() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_REGISTRATION_ENABLED}"),
+            Some(&admin),
+            Some(json!({ "value": "false" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    flush_settings_cache().await;
+
+    // 空用户名 + 空口令：若先走校验，必然是 400
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({ "username": "", "email": "", "password": "" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "关闭注册时必须先返回 403 而不是 400: {body}"
+    );
+
+    put_setting_raw(KEY_REGISTRATION_ENABLED, "true", None).await;
+    flush_settings_cache().await;
 }

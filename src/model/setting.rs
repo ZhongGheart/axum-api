@@ -46,6 +46,8 @@ pub enum SettingGroup {
     Password,
     /// 登录防护
     Login,
+    /// 注册准入
+    Registration,
 }
 
 impl SettingGroup {
@@ -54,6 +56,7 @@ impl SettingGroup {
         match self {
             SettingGroup::Password => "password",
             SettingGroup::Login => "login",
+            SettingGroup::Registration => "registration",
         }
     }
 }
@@ -167,6 +170,17 @@ pub const SETTING_DEFS: &[SettingDef] = &[
         max: 86400,
         consumed_by: "写入失败计数时的 Redis TTL",
     },
+    SettingDef {
+        key: "security.registration.enabled",
+        name: "开放注册",
+        description: "关闭后 `/api/auth/register` 一律返回 403，**已注册用户不受影响**。公网部署若不需要自助注册，应关闭它——否则任何人都能注册并自动获得 `user` 角色。",
+        value_type: SettingType::Bool,
+        group: SettingGroup::Registration,
+        default: "true",
+        min: 0,
+        max: 1,
+        consumed_by: "注册入口的准入判定（`service::auth::register` 的第一道检查）",
+    },
 ];
 
 /// 按 key 查定义
@@ -230,6 +244,25 @@ mod tests {
             assert!(seen.insert(def.key), "参数名重复: {}", def.key);
         }
         assert_eq!(seen.len(), SETTING_DEFS.len());
+    }
+
+    /// 开放注册开关必须存在，且默认值必须是 `true`
+    ///
+    /// 两个方向都会出事：
+    /// - 参数不存在 → `resolve_bool` 回落到 `find_def` 失败后的 `false`，
+    ///   注册入口被静默关掉，而管理员在界面上看不到任何可以打开它的开关。
+    /// - 默认值是 `false` → 一次常规发版突然关掉所有存量部署的注册入口，
+    ///   包括那些**故意**开放注册的内部系统。
+    #[test]
+    fn registration_switch_exists_and_defaults_to_open() {
+        let def =
+            find_def("security.registration.enabled").expect("开放注册开关必须是已定义的系统参数");
+        assert_eq!(def.value_type, SettingType::Bool);
+        assert_eq!(
+            def.default, "true",
+            "默认值必须是 true：收紧要由管理员显式表达"
+        );
+        assert_eq!(def.group, SettingGroup::Registration);
     }
 
     /// 默认值必须与本版此前的硬编码常量一致
