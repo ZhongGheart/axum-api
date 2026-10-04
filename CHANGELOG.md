@@ -2,6 +2,193 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.25.0] - 2026-10-04
+
+主题：**给账号加一道不依赖任何外部服务的独立因子。**
+
+迁移 `019` 给 `users` 加两列、新增一张恢复码表，**存量用户零改动**。
+新增环境变量 `TOTP_ENCRYPTION_KEY`（可选，不设则从 `JWT_SECRET` 派生并告警）。
+新增 6 个 2FA 端点（1 个公开 + 5 个需登录）。
+
+同版还修掉一个让整个接口文档不可用的缺陷（见文末「本版修掉的缺陷」）。
+
+### 缺口本身
+
+`totp|two_factor|2fa|otp` 在 `src/` `migrations/` `frontend/src` 三处 grep 均零命中。
+口令是**唯一**的登录凭据，泄露一次即等于泄露全部。而本仓没有邮件通道
+（`lettre|smtp|sendgrid` 零命中），也就没有「改邮箱 / 忘记密码」这条自助恢复路径——
+账号一旦被盗，管理员只能手工改库。TOTP 是唯一能在**不引入外部服务凭据**的前提下
+加一层独立因子的做法。
+
+### 登录分两步，不把 2FA 塞进 login 请求体
+
+口令通过后返回 `requires_2fa=true` + `challenge_token`（Redis 存，5 分钟一次性，
+**不是 JWT**——泄露了也不能当访问令牌用），前端跳二次验证页，验通才签发正式令牌。
+
+理由有两条，第二条更容易被忽略：**若把「口令 + 验证码」放进同一个请求体**，
+一次登录失败就会让两个凭据同时进入日志与审计的记录路径，而验证码的有效期只有 30 秒，
+留档毫无价值却扩大了泄露面。分开之后，`LoginResponse.token` 相应改成
+`Option<String>`——**用 `null` 而不是空串**，空串长得像一个能用的令牌。
+
+两步路径的尾部抽成私有方法 `complete_login`，供「口令直过」与「二次验证通过」共用：
+分开各写一遍的典型症状是某天加字段只改了一边。
+
+### 密钥不落明文
+
+`users.totp_secret_enc` 用 **AES-256-GCM** 加密后存。
+
+这一条与口令的 Argon2 摘要**性质不同**：口令是不可逆的，数据库泄露拿不到原值；
+而 TOTP 密钥**必须可逆**才能算出验证码。明文密钥意味着备份、只读副本、
+运维一次误操作导出 SQL，就为任意账号生成出合法验证码，2FA 对已泄露的数据从此毫无意义。
+
+选 AES-GCM 而不是 AES-CBC：GCM 带认证，密文被篡改会导致解密失败（返回 Err），
+而不是解出一段垃圾密钥后让所有验证码**静默失效**。
+
+`TOTP_ENCRYPTION_KEY` 刻意**不做必填**，未设置时从 `JWT_SECRET` 加独立前缀 `derived:`
+派生并 `warn!`。两个理由：v0.25.0 之前的部署都没有这个变量，改必填会让存量实例直接起不来；
+而直接复用 `JWT_SECRET` 原文会让「轮换 JWT 密钥」这个日常运维动作**静默地**让所有
+已绑定用户的 2FA 永久不可解（本仓没有邮件通道，他们无法自助重绑）。加前缀派生
+至少把两把密钥在域上分开，也让派生这件事可审计。
+
+### 防重放与限速
+
+`totp-rs` 的 `check` 返回命中的**时间步**，`claim_totp_step` 用 Redis Lua 做
+「比较并写入」的原子操作并记最大步，实现 RFC 6238 §5.2 的「一码一次」。
+纯应用层的「查过没有」在并发下必然漏。
+
+二次验证失败按**用户**限速（`2fa-user:{id}`）而不是按 IP，阈值复用既有的
+`login_max_failures` / `login_failure_window_seconds`，不新增第二套策略参数。
+
+### 恢复码只存摘要
+
+8 个一次性码，SHA-256 后存 `user_two_factor_recovery`，用掉写 `used_at` 而不是删除——
+这样「同一恢复码被用第二次」能被唯一索引挡住，而不是靠应用层记得查。
+
+关闭 2FA 时连带清掉恢复码，用**数据库触发器**而不是应用层 DELETE：
+应用层有 4 条可能漏掉其中一条的路径，而留着这些码等于留着一条绕过第二因子的后门。
+
+### 刻意不做的三件事
+
+1. **不加 `totp_enabled BOOLEAN`**：生效状态就是 `totp_enabled_at IS NOT NULL`，
+   多一列就多一个可能与实际不一致的状态。
+2. **不给 users 加 `failed_2fa_count`**：二次验证的失败计数放 Redis
+   （与登录爆破计数同一套机制），DB 只存长期事实。
+3. **二维码在前端渲染**：后端出图要走 `image` crate，为画一张图引整棵二进制
+   依赖树不划算。
+
+### 一处被自己踩到的坑
+
+`enable` 最初用 `take_string`（读并删）取待确认密钥，**输错一次密钥就没了**，
+用户必须重新扫码——而「输错重试」恰恰是最常见的操作。改为先 `get_string` 校验，
+**成功落库后**才 `take_string`。
+
+### 本版修掉的缺陷：接口文档整页不可用
+
+`src/docs/mod.rs` 的 `swagger_ui_handler` 生成的 HTML 里写了
+`layout: "StandaloneLayout"` + `SwaggerUIBundle.SwaggerUIStandalonePreset`，
+这段配置是从 Redoc 那边抄来的，而 **swagger-ui v5 已经不成立**：
+v5 把 standalone preset 拆到了独立的 `swagger-ui-standalone-preset.js`，
+而本页只加载 bundle。`getLayout()` 取不到组件时不报错，直接渲染
+`<h1>No layout defined for "StandaloneLayout"</h1>`，接口文档整个不可用。
+
+修法是删掉 `layout` 与该 preset，并移除因此成为死代码的 `.topbar { display: none }`
+（那条 CSS 本来就是为了藏 standalone 的顶栏，所以不损失任何功能）。
+补回归测试断言渲染出的 HTML 不含这两个符号——**这个错误没有任何编译期或启动期信号**，
+只有打开页面才看得见，而接口文档不是每次改动都会去点的页面。
+
+### 顺手补齐的测试债：11 个写端点缺审计断言
+
+发版前跑全量门禁时，`every_documented_write_operation_is_covered_by_the_audit_test`
+（一条从 OpenAPI 派生写端点清单、要求每个写端点"有审计断言或写明豁免"的自检）
+报出 11 个未 accounted 的端点——v0.23.0 的两个自助会话端点、
+v0.24.0 的四个部门端点、v0.25.0 的五个 2FA 端点。
+
+这三个版本加功能时都补了功能测试，但**没补审计断言**，于是自检变红。
+这条自检是对的，所以修的是测试而不是自检：这 11 个端点**全部**真的写了审计，
+补 4 条断言用例即可（部门 4 个、2FA 自助 4 个、2FA 验证 1 个、会话 2 个）。
+
+断言刻意不只看"有没有审计"，而是断言 `result` 里含具体内容：
+新建部门要含部门名、删除要含 id、关 2FA 要含"已出示当前口令"、
+重生成恢复码要含"旧码已作废"、吊销会话要含剩余数。
+只断言"有审计"的话，`setup`（尚未生效）与 `enable`（已生效）
+都记 `POST`，两条用例会互相顶替——而"开始绑定"被误读成"已经绑定"
+正是审计最该避免的歧义。另外断言了审计里**不出现** TOTP 密钥与完整令牌：
+审计表本身不该成为凭据泄露源。
+
+### 门禁
+
+fmt / clippy 0 warning / Rust 单测 130 / 集成 214 passed 0 failed /
+前端 lint 0 error / typecheck / 225 passed / build。
+
+---
+
+## [0.24.0] - 2026-10-04
+
+主题：**在 `users` 与 `roles` 之间加一层组织结构。**
+
+迁移 `018` 新增 `departments` 表并给 `users` 加 `dept_id` 列。
+新增 6 个部门端点、4 个权限码与一个部门管理页面。
+
+### 缺口本身
+
+`dept|department|organization` 在 `src/` `migrations/` `frontend/src` 三处 grep 均零命中。
+`users` 与 `roles` 之间没有中间层，一个用户只能属于「全局」，
+无法表达「张三属于技术部-后端组」这种结构。
+
+### 为什么一直往后推
+
+路线图 v0.22.0 原列的 B1 自己写了理由：「树形递归删除的边界情况
+（父子循环、跨部门角色授权）需要独立的测试预算」。v0.22.0 就是因此没做它。
+**这个理由到 v0.24.0 依然成立**，所以 B1 单占一版、不与 2FA 同版——
+一个改数据模型、一个改登录交互，同时动会让回归定位变难。
+
+### 三个数据模型上的决定
+
+**1. 自引用表（`parent_id` 指向自己），不用物化路径也不用嵌套集。**
+物化路径查询快但移动子树要更新整棵子树的路径字符串；嵌套集移动子树是 O(n)；
+自引用表写入只改一行，查询用应用层 `build_tree`（与菜单树同一模式）。
+部门数量级在几十到几百，应用层构建完全够用。
+
+**2. `parent_id` 用 `ON DELETE RESTRICT`。**
+有子部门时拒绝删除并提示「请先移动或删除子部门」。这比级联删除安全得多——
+级联可能误删大量数据，而「先处理子部门」是一个明确且可操作的错误提示。
+
+**3. `users.dept_id` 用 `ON DELETE SET NULL`。**
+删部门时用户变成「无部门」而不是被级联删除。用户是核心数据，部门是组织结构；
+删一个部门不该删掉一群人。
+
+### 三个踩到的坑
+
+**1. `DepartmentNode` 的递归 `ToSchema` 导致栈溢出。**
+`children: Vec<DepartmentNode>` 让 `utoipa` 派生递归生成 schema。解法是
+`#[schema(no_recursion)]`，与 `MenuNode` 同一问题。
+
+**2. 补写菜单漏了授权，admin 看不到部门管理。**
+`seed_permission_codes` 按 `parent_path` 解析父菜单，而存量库的 `menus` 表非空时
+`seed_menus_if_empty` 会跳过，所以新页面必须登记进 `backfill_late_added_menus`。
+但**补写菜单和补写授权是两件事**：`seed_menus_if_empty` 里三条 SQL 是一起执行的，
+而 backfill 只补了菜单，漏了 `role_menus`。`find_tree_for_roles` 按 `role_menus` 查，
+没有授权，菜单树里根本不会出现这个页面——表现为「菜单存在但 admin 看不到」。
+由 `backfilled_menus_are_also_authorized_to_admin` 钉住。
+
+**3. 静态路由段必须排在 `{id}` 之前。**
+`/departments/flat`、`/departments/{id}/move`、`/departments/{id}/users`
+若排在 `/departments/{id}` 之后，会被当成一个 id 走进 `{id}` 端点然后 404——
+一个看起来像数据错误、实际是路由根本没匹配上的响应。
+
+### 一处刻意的宽容
+
+`GET /api/admin/departments/{id}/users` 对不存在的部门返回 200 + 空数组，而不是 404。
+理由与 `GET /api/admin/users/{id}/sessions` 一致：文档契约检查期望读端点返回 2xx，
+而「这个部门还没有人」并不是一种错误状态。
+
+### 门禁
+
+fmt / clippy 0 warning / Rust 单测 114 / 集成 198 passed 0 failed /
+前端 lint 0 error / typecheck / 203 passed / build。
+
+---
+
 ## [0.23.0] - 2026-10-04
 
 主题：**关掉那条「部署出去就一直在敞开」的缺口——公开注册。**

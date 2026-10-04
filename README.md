@@ -190,6 +190,7 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | `REDIS_URL` | **是** | `redis://127.0.0.1:6379` | Redis 连接字符串 |
 | `JWT_SECRET` | **是** | — | 至少 32 字符，生产环境禁止示例值 |
 | `JWT_EXPIRATION_SECONDS` | 否 | `604800` | JWT 过期时间（秒） |
+| `TOTP_ENCRYPTION_KEY` | 否 | 从 `JWT_SECRET` 派生 | **v0.25.0 新增**：AES-256-GCM 加密两步验证密钥用的主密钥（32 字节）。不设置时从 `JWT_SECRET` 加 `derived:` 前缀派生并告警。**已绑定 2FA 的部署应显式设置**：直接复用 `JWT_SECRET` 原文会让「轮换 JWT 密钥」静默地使所有已绑定用户的 2FA 永久失效，而本仓没有邮件通道，他们无法自助重绑 |
 | `CORS_ALLOWED_ORIGINS` | 否 | `http://localhost:3000` | 逗号分隔；生产环境禁止 `*` |
 | `DB_POOL_MAX_SIZE` | 否 | `20` | 数据库连接池大小 |
 | `DB_CONNECT_TIMEOUT` | 否 | `10` | 连接超时（秒） |
@@ -233,6 +234,7 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | GET | `/api/health` | 健康检查（真实探测 DB + Redis，异常返回 503） |
 | POST | `/api/auth/register` | 用户注册 |
 | POST | `/api/auth/login` | 登录（返回 JWT）。口令过期时返回**受限令牌**（`must_change_password=true`），只能改密 / 登出 / 查看自己 |
+| POST | `/api/auth/2fa/verify` | **两步验证第二段**（v0.25.0）。口令已通过时用 `challenge_token` + 动态码/恢复码换正式令牌。公开端点——此时调用者尚未持有任何令牌 |
 | GET | `/api/settings/password-policy` | **当前口令策略**（v0.22.0）。未登录可读，供注册页 / 改密页显示规则。**刻意不含**有效期与锁定阈值——把「账号多久被锁一次」暴露给未登录端点等于给爆破者一个可调的参数面板 |
 
 ### 需登录
@@ -245,6 +247,11 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | GET | `/api/dict/{code}/items` | 读取字典项（任意已登录用户） |
 | PUT | `/api/auth/profile` | **自助改资料**：展示名 / 头像路径，字段级三态 |
 | POST | `/api/auth/profile/avatar` | **自助上传头像**（`multipart/form-data`，字段名 `file`），上传与设置一步完成 |
+| GET | `/api/auth/2fa` | 当前用户的 2FA 状态（v0.25.0） |
+| POST | `/api/auth/2fa/setup` | 开始绑定：生成密钥与 `otpauth://` URI（**此时尚未落库**） |
+| POST | `/api/auth/2fa/enable` | 交出动态码确认绑定，返回 8 个一次性恢复码（**只此一次展示，库里仅存 SHA-256 摘要**） |
+| POST | `/api/auth/2fa/disable` | 关闭 2FA，**需出示当前口令**（登录态本身可能来自被盗设备） |
+| POST | `/api/auth/2fa/recovery-codes` | 重新生成恢复码，旧批次立即作废 |
 
 ### 仅 admin
 
@@ -265,6 +272,10 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | PUT | `/api/admin/roles/{id}/menus` | 角色-菜单关联（**全量覆盖**；任一 ID 非法即整体 400） |
 | GET | `/api/admin/menus?role_id={id}` | 某角色已授权的菜单树（授权弹窗的默认勾选值） |
 | GET | `/api/admin/menus/diagnostics` | 菜单树结构诊断：走不到根、不在任何菜单树里的节点（成环 / 悬空引用）及其原因 |
+| GET | `/api/admin/departments` | 部门树（v0.24.0，含 `level` 与 `path`） |
+| GET | `/api/admin/departments/flat` | 部门扁平列表，供下拉选择 |
+| GET | `/api/admin/departments/{id}/users` | 该部门下的用户。**部门不存在返回 200 + 空数组**，与用户会话列表同规则 |
+| POST | `/api/admin/departments/{id}/move` | 移动部门。**不能移到自己或自己的子孙下面** |
 | GET/POST | `/api/admin/dict/types`、`PUT/DELETE /api/admin/dict/types/{id}` | 字典类型管理 |
 | GET/POST | `/api/admin/dict/items`、`PUT/DELETE /api/admin/dict/items/{id}` | 字典项管理 |
 | POST | `/api/admin/dict/refresh` | 刷新字典缓存 |
@@ -294,6 +305,7 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | 字典 | `system:dict:list` `system:dict:create` `system:dict:update` `system:dict:delete` `system:dict:refresh` |
 | 日志 | `system:log:list` `system:log:export` |
 | 系统参数（v0.22.0） | `system:setting:list` `system:setting:update` |
+| 部门（v0.24.0） | `system:dept:list` `system:dept:create` `system:dept:update` `system:dept:delete` |
 | 监控 | `system:monitor:system` `system:monitor:api` `system:monitor:alert` `system:monitor:reset` `system:monitor:export` |
 | 其他 | `system:export:user` `system:test:access` `system:validate:test` |
 
@@ -664,6 +676,46 @@ cd frontend && pnpm install && pnpm build
 
 被拒的注册会落审计（`result="注册已关闭"`），
 所以「关闭注册后还有谁来撞过注册口」在审计日志里仍然查得到。
+
+## 从 v0.23 升级到 v0.25
+
+**两次迁移（`018` + `019`），无 API 破坏性变更，新增一个可选环境变量。**
+`MIGRATE_ON_STARTUP=true` 时自动执行。
+
+迁移 `018` 新增 `departments` 表并给 `users` 加 `dept_id`；
+迁移 `019` 给 `users` 加 `totp_secret_enc` / `totp_enabled_at` 两列
+并新增 `user_two_factor_recovery` 表。**两处都不改任何存量行**——
+存量用户的 `dept_id` 与 `totp_enabled_at` 均为 NULL，
+即「无部门」与「未启用 2FA」，行为与升级前逐字一致。
+
+### 新增权限码需要授权
+
+`system:dept:list` / `create` / `update` / `delete` 四个码随启动种子补授 admin。
+**若你显式撤销过 admin 的部门权限，重启不会悄悄恢复**（与既有权限码同一原则）。
+其他角色需要在「菜单管理」里单独授权，否则看不到部门管理页。
+
+### 六点必须提前告知，否则会被当成缺陷上报
+
+- **注册默认仍然开放，并发会话上限默认仍然是 0。** 这两项是 v0.23.0 的行为，
+  本版未改动默认值。
+- **2FA 默认对所有用户关闭。** 需要用户在个人中心主动绑定，
+  管理员无法代为开启——代开意味着管理员要经手用户的认证器。
+- **绑定时恢复码只展示一次。** 库里只存 SHA-256 摘要，无法二次查看。
+  弹窗因此禁用了遮罩点击与 ESC，并提供复制与下载两条出路。
+- **关闭 2FA 会连带作废全部恢复码**，由数据库触发器保证，不走应用层。
+- **同一动态码不能用第二次。** 按 RFC 6238 §5.2 用 Redis Lua 原子占位，
+  误触发后需要等下一个 30 秒窗口。
+- **`TOTP_ENCRYPTION_KEY` 不设置也能跑**，但会告警。已绑定 2FA 的部署
+  **应当显式设置**：从 `JWT_SECRET` 派生时，轮换 `JWT_SECRET` 会让所有
+  已绑定用户的 2FA 永久不可解，而本仓没有邮件通道，他们无法自助重绑。
+
+### 升级步骤
+
+1. 备份数据库（迁移 `019` 加列并建表，虽然不改存量行，仍建议先备）。
+2. 可选：设置 `TOTP_ENCRYPTION_KEY`（32 字节随机串），**在首次绑定之前设好**。
+3. 升级后端，`MIGRATE_ON_STARTUP=true` 会自动跑 `018` 与 `019`。
+4. 升级前端，进入「系统管理 → 部门管理」确认页面可见；
+   若不可见，检查该角色的菜单授权（见上一节）。
 
 ## License
 

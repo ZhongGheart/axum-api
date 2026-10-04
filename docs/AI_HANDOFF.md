@@ -6285,4 +6285,72 @@ grep -c StandaloneLayout` = 0；Chrome（headless）登录 admin 打开接口文
 未跑 `cargo test --test api_integration`：本次只改文档 HTML 字符串，
 不触碰路由与接口契约。推送前建议补一次全量门禁。
 
-**状态**：本地提交，不推送、不打 tag，等用户指令。
+**状态**：本地提交，不推送，等用户指令。
+
+---
+
+## 2026-10-04 发布 v0.25.0（抬版号 + CHANGELOG + tag）
+
+用户指令「抬版号、补 CHANGELOG、打 tag」。
+
+**基线状态有个值得记的事实**：tag 只到 `v0.22.0`，CHANGELOG 里已有 `[0.23.0]`，
+`Cargo.toml` 版号也才是 `0.23.0`，但代码里已经含 v0.24.0（部门树）与
+v0.25.0（2FA）的功能，也就是**功能领先版号三个版本**。
+
+因此本次发布补的是 `0.24.0` 与 `0.25.0` 两条 CHANGELOG 正文，
+版号一次抬到 `0.25.0` 而非 `0.24.0`，因为 0.24.0 的功能已包含在内，
+抬到 0.24.0 会让 tag 指向一个不含 2FA 的状态。
+
+改动清单：`Cargo.toml` / `frontend/package.json` 0.23.0 → 0.25.0；
+CHANGELOG 补 0.24.0 与 0.25.0 正文；README 补 `TOTP_ENCRYPTION_KEY`
+环境变量、4 个部门权限码、6 个 2FA 端点、4 个部门端点，
+以及「从 v0.23 升级到 v0.25」章节；ROADMAP 补 v0.25.0 章节、
+章节编号顺延（缺口全景 5→6、排期 6→7、不是缺口 7→8、速查 8→9）、
+C1 标 ✅、速查表补 v0.25.0 行、排期主线改为 `… → C1 ✅ → D1 → D2`。
+
+### 顺手发现并修掉的测试债：11 个写端点缺审计断言
+
+跑全量集成门禁时 `every_documented_write_operation_is_covered_by_the_audit_test` 变红，
+报 11 个写端点既没有被审计断言覆盖，也没有写明豁免理由。
+分别是 v0.23.0 的 2 个自助会话端点、v0.24.0 的 4 个部门端点，
+以及 v0.25.0 的 5 个 2FA 端点。
+
+**这不是我这次改动引入的**，是前三个版本加功能时只补了功能测试、没补审计断言。
+这条自检的价值正在于此：它从 OpenAPI 派生清单，
+新增写端点却没纳入审计断言就当场变红。
+
+**修的是测试而不是自检**。查过源码，这 11 个端点**全部**真的写了审计，
+部门 4 个与 2FA 自助 4 个用 `AuditDetail`，而 `/api/auth/2fa/verify` 是公开端点，
+由 `AuthService` 以语义 action 同步写。所以补断言是与事实相符的做法，
+写豁免反而是给漏测开门。
+
+补 4 条用例，覆盖部门 4 端点、2FA 自助 4 端点、2FA 验证 1 端点、会话 2 端点。
+断言刻意不只看有没有审计，而是断言 `result` 含具体内容，
+新建要含部门名、删除要含 id、关 2FA 要含「已出示当前口令」，
+重生成恢复码要含「旧码已作废」、吊销会话要含剩余数。
+理由是 `setup`（尚未生效）与 `enable`（已生效）都记 `POST`，
+只看「有审计」两条会互相顶替。另外断言审计里**不出现** TOTP 密钥与完整令牌。
+
+新增辅助 `wait_for_audit(method, path)`，**必须按方法一起过滤**。
+因为 `PUT /api/admin/departments/{id}` 与 `DELETE /api/admin/departments/{id}`
+路径完全相同，只按路径取最新一条会让两条断言互相读到对方那行。
+
+**缺陷注入验证**：把 `controller/department.rs` 里新建部门的 audit 文案
+从含部门名改成不含名字，用例如期 FAILED 并给出
+`新建部门的审计必须记下部门名，否则事后答不出建了什么: …`，确认断言咬得住，随后恢复。
+
+### 门禁（发版前全量实测）
+
+后端 `cargo fmt --all --check` ✓、
+`cargo clippy --all-targets --all-features -D warnings` 0 warning、
+`cargo test --lib` **130 passed 0 failed**、
+`cargo test --test api_integration -- --ignored --test-threads=1`
+**214 passed 0 failed**（268s，原 210，+4）。
+前端 `pnpm lint` 0 error（1 个 `env.d.ts` 历史 warning）、`pnpm typecheck` ✓、
+`pnpm test` **225 passed**、`pnpm build` ✓。
+
+**踩到的坑**：第一次跑集成测试时直接 `source /tmp/axum_dev.env`，
+结果报 `缺少 TEST_REDIS_URL`。集成测试要的是
+`TEST_DATABASE_URL` / `TEST_REDIS_URL` / `TEST_JWT_SECRET`，
+由 `scripts/test_env.sh env` 提供，且指向的是 55432 端口上的 **`axum_api_test` 库**，
+不是开发库 `axum_api`。正确姿势是 `eval "$(./scripts/test_env.sh env)"`。

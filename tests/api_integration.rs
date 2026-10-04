@@ -8349,6 +8349,27 @@ fn every_documented_write_operation_is_covered_by_the_audit_test() {
         "PUT /api/admin/settings/{key}",
         "POST /api/admin/settings/{key}/reset",
         "POST /api/admin/settings/refresh-cache",
+        // v0.23.0 A1 自助会话管理：两个写端点在
+        // `revoking_own_sessions_is_audited_with_the_counts` 里断言，
+        // 且断言了剩余会话数（只断言"有审计"答不出是否真踢掉）
+        "POST /api/auth/sessions/{jti}/revoke",
+        "POST /api/auth/sessions/revoke-others",
+        // v0.24.0 部门：四个写端点在
+        // `every_department_write_endpoint_is_audited_with_what_changed` 里断言
+        "POST /api/admin/departments",
+        "PUT /api/admin/departments/{id}",
+        "DELETE /api/admin/departments/{id}",
+        "POST /api/admin/departments/{id}/move",
+        // v0.25.0 两步验证：四个自助写端点在
+        // `every_two_factor_write_endpoint_is_audited` 里断言；
+        // `/verify` 是公开端点，由 AuthService 以语义 action 同步写审计，
+        // 在 `a_failed_two_factor_verification_is_audited_under_its_own_path`
+        // 里断言（成功侧复用 AUTH_LOGIN_SUCCESS 且 path 记为 /api/auth/login）
+        "POST /api/auth/2fa/setup",
+        "POST /api/auth/2fa/enable",
+        "POST /api/auth/2fa/disable",
+        "POST /api/auth/2fa/recovery-codes",
+        "POST /api/auth/2fa/verify",
     ];
 
     /// 明确豁免的写端点：**每一条都要写出理由**，否则豁免就变成了漏测的挡箭牌
@@ -15115,4 +15136,387 @@ async fn repeated_two_factor_failures_get_locked_out() {
         .delete_by_prefix("login:fail:2fa-user:")
         .await
         .expect("清理 2FA 失败计数失败");
+}
+
+// ============================================================
+// v0.25.0：补齐 v0.23.0 / v0.24.0 / v0.25.0 新增写端点的审计断言
+//
+// 起因：`every_documented_write_operation_is_covered_by_the_audit_test`
+// 一直在报这 11 个端点"既没被覆盖也没写明豁免"。那条自检是**对的**——
+// 它要求每个写端点要么有审计断言、要么有理由，而这三个版本新增端点时
+// 只加了功能测试、没补审计断言，于是自检变红。
+//
+// 这里不豁免它们：这 11 个端点**全部**真的写了审计
+// （部门 4 个与 2FA 4 个用 AuditDetail，2FA 验证与登录成功/失败
+// 由 AuthService 同步写），补断言才是与事实相符的做法。
+// ============================================================
+
+/// 轮询等某条路径 + 某个方法的审计落库，返回 `(action, result)`
+///
+/// 审计是 `tokio::spawn` 异步写的（登录/注册那条路径例外，它是同步写），
+/// 所以查询必须轮询而不是查一次就断言。
+/// **必须按方法一起过滤**：`PUT /api/admin/departments/{id}` 与
+/// `DELETE /api/admin/departments/{id}` 路径完全相同，只按路径取最新一条
+/// 会让两条用例互相读到对方那行。
+async fn wait_for_audit(method: &str, path: &str) -> (String, String) {
+    for _ in 0..50 {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT action, result FROM audit_logs WHERE path = $1 \
+             AND action LIKE $2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(path)
+        .bind(format!("{method}%"))
+        .fetch_optional(&pool().await)
+        .await
+        .expect("查询审计失败");
+        if let Some(row) = row {
+            return row;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("{method} {path} 没有落审计");
+}
+
+/// 部门写端点（v0.24.0）必须落审计，且要答得出"改成了什么"
+///
+/// 只断言"有审计"太弱：部门管理的审计若只记 `PUT /api/admin/departments/{id}`
+/// 而不记部门名，事后只能知道"有人改过某个部门"，答不出改成了什么。
+/// 因此这里逐个断言 `result` 里含新旧两个名字。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn every_department_write_endpoint_is_audited_with_what_changed() {
+    let app = app().await;
+    cleanup_departments().await;
+    let admin = admin_token(&app).await;
+
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/departments", Some(&admin), None),
+    )
+    .await;
+    let root_id = body["data"][0]["id"].as_str().unwrap().to_string();
+
+    // ── 新建 ──
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": root_id, "name": "审计技术部" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "新建部门失败: {body}");
+    let tech_id = body["data"]["id"].as_str().unwrap().to_string();
+
+    let (action, result) = wait_for_audit("POST", "/api/admin/departments").await;
+    assert!(action.contains("POST"), "审计动作应记方法: {action}");
+    assert!(
+        result.contains("审计技术部"),
+        "新建部门的审计必须记下部门名，否则事后答不出建了什么: {result}"
+    );
+
+    // ── 修改 ──
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/departments/{tech_id}"),
+            Some(&admin),
+            Some(json!({ "name": "审计技术部-改名" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "修改部门失败: {body}");
+    let (action, result) =
+        wait_for_audit("PUT", &format!("/api/admin/departments/{tech_id}")).await;
+    assert!(action.contains("PUT"), "审计动作应记方法: {action}");
+    assert!(
+        result.contains("审计技术部-改名"),
+        "修改部门的审计必须记下新名字: {result}"
+    );
+
+    // ── 移动 ──
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/departments/{tech_id}/move"),
+            Some(&admin),
+            Some(json!({ "new_parent_id": null })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "移动部门失败: {body}");
+    let (action, result) =
+        wait_for_audit("POST", &format!("/api/admin/departments/{tech_id}/move")).await;
+    assert!(action.contains("POST"), "审计动作应记方法: {action}");
+    assert!(
+        result.contains("审计技术部-改名") && result.contains("根"),
+        "移动部门的审计必须同时记下部门与新上级: {result}"
+    );
+
+    // ── 删除 ──
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/departments/{tech_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除部门失败: {body}");
+    let (action, result) =
+        wait_for_audit("DELETE", &format!("/api/admin/departments/{tech_id}")).await;
+    assert!(action.contains("DELETE"), "审计动作应记方法: {action}");
+    assert!(
+        result.contains(&tech_id),
+        "删除部门的审计必须记下被删的 id，否则删掉什么无从查证: {result}"
+    );
+}
+
+/// 2FA 的四个自助写端点（v0.25.0）必须落审计
+///
+/// 这一组比部门那组更要紧：**关掉 2FA 是账号失守时最关键的一次操作**，
+/// 事后必须能回答"谁在什么时候关掉了自己（或别人）的第二道因子"。
+/// 只断言"有审计"不够——`setup` 与 `enable` 都记 `POST`，
+/// 必须分别断言各自的 `result`，否则两条用例会互相顶替。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn every_two_factor_write_endpoint_is_audited() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+
+    // ── setup：生成密钥但尚未生效 ──
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/auth/2fa/setup", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "setup 失败: {body}");
+    let secret = body["data"]["secret"].as_str().unwrap().to_string();
+
+    let (action, result) = wait_for_audit("POST", "/api/auth/2fa/setup").await;
+    assert!(action.contains("POST"), "审计动作应记方法: {action}");
+    assert!(
+        result.contains("尚未生效"),
+        "setup 的审计必须写明密钥尚未生效，否则事后会把 \
+         「开始绑定」误读成「已经绑定」: {result}"
+    );
+    assert!(
+        !result.contains(&secret),
+        "审计里绝不能出现 TOTP 密钥明文，否则审计表本身成了密钥泄露源: {result}"
+    );
+
+    // ── enable：真正生效 ──
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/enable",
+            Some(&token),
+            Some(json!({ "code": current_totp(&secret) })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "enable 失败: {body}");
+
+    let (action, result) = wait_for_audit("POST", "/api/auth/2fa/enable").await;
+    assert!(action.contains("POST"), "审计动作应记方法: {action}");
+    assert!(
+        result.contains("启用两步验证"),
+        "enable 的审计必须写明 2FA 已生效: {result}"
+    );
+
+    // ── 重新生成恢复码：旧批次作废 ──
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/auth/2fa/recovery-codes", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重生成恢复码失败: {body}");
+
+    let (action, result) = wait_for_audit("POST", "/api/auth/2fa/recovery-codes").await;
+    assert!(action.contains("POST"), "审计动作应记方法: {action}");
+    assert!(
+        result.contains("旧码已作废"),
+        "重生成恢复码的审计必须写明旧码作废，否则事后分不清哪批还有效: {result}"
+    );
+
+    // ── disable：需出示当前口令 ──
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/disable",
+            Some(&token),
+            Some(json!({ "password": "user1234" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "关闭 2FA 失败: {body}");
+
+    let (action, result) = wait_for_audit("POST", "/api/auth/2fa/disable").await;
+    assert!(action.contains("POST"), "审计动作应记方法: {action}");
+    assert!(
+        result.contains("已出示当前口令"),
+        "关闭 2FA 的审计必须写明校验过当前口令: {result}"
+    );
+
+    reset_two_factor(&username).await;
+}
+
+/// 二次验证失败必须落审计，且用**独立于普通登录失败**的路径
+///
+/// 针对性场景是"2FA 正在被猜"：`AUTH_LOGIN_FAILURE` 混在一起时，
+/// 事后无法回答"这些失败里有多少是口令被猜、多少是验证码被猜"——
+/// 而两者的应对完全不同（前者查撞库，后者查已绑定账号是否已被拿到密钥）。
+/// 二次验证成功那侧复用 `complete_login`，记的是 `AUTH_LOGIN_SUCCESS`
+/// 且 path 为 `/api/auth/login`，**刻意不记成 `/api/auth/2fa/verify`**：
+/// 一次登录就是一次登录成功，不该因为多走了一步就记成另一种事。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_failed_two_factor_verification_is_audited_under_its_own_path() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+    let (secret, _codes) = bind_two_factor(&app, &token).await;
+
+    // 登录停在第二步，拿到挑战令牌
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/login",
+            None,
+            Some(json!({ "username": username, "password": "user1234" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "登录失败: {body}");
+    assert_eq!(body["data"]["requires_2fa"], true, "{body}");
+    let challenge = body["data"]["challenge_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 用一个必然错误的码
+    let wrong = if current_totp(&secret) == "000000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/verify",
+            None,
+            Some(json!({ "challenge_token": challenge, "code": wrong })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // 这条路径由 AuthService **同步**写，不需要轮询
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT action, result FROM audit_logs WHERE path = '/api/auth/2fa/verify' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&pool().await)
+    .await
+    .expect("查询审计失败");
+    let (action, result) = row.expect("二次验证失败没有落审计");
+    assert_eq!(
+        action, "AUTH_LOGIN_FAILURE",
+        "二次验证失败应复用登录失败动作（它就是一次未完成的登录）"
+    );
+    assert!(
+        result.contains("二次验证未通过"),
+        "审计必须能区分「口令被猜」与「验证码被猜」: {result}"
+    );
+
+    reset_two_factor(&username).await;
+    let redis = RedisClient::new(&test_config(1_000).redis)
+        .await
+        .expect("连接 Redis 失败");
+    redis
+        .delete_by_prefix("login:fail:2fa-user:")
+        .await
+        .expect("清理 2FA 失败计数失败");
+}
+
+/// 自助会话管理的两个写端点（v0.23.0）必须落审计
+///
+/// 这两个端点是"账号可能被盗用"时用户自己唯一的止血开关。
+/// 不记审计的话，管理员事后看到一条陌生会话在线，既答不出
+/// "用户什么时候踢过它"，也分不清"用户还没发现"与"用户踢过但没踢掉"。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn revoking_own_sessions_is_audited_with_the_counts() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    // 再登录一次凑出第二条会话
+    let _token2 = login_token(&app, &username, "user1234").await;
+
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/auth/sessions", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "列出会话失败: {body}");
+    let list = body["data"].as_array().expect("必须是数组");
+    assert_eq!(list.len(), 2, "两次登录应有两条会话: {body}");
+    let other_jti = list
+        .iter()
+        .filter(|s| s["is_current"] == false)
+        .map(|s| s["jti"].as_str().unwrap().to_string())
+        .next()
+        .expect("应至少有一条非当前会话");
+
+    // ── 吊销单个（非当前）会话 ──
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/auth/sessions/{other_jti}/revoke"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "吊销单个会话失败: {body}");
+
+    let (action, result) =
+        wait_for_audit("POST", &format!("/api/auth/sessions/{other_jti}/revoke")).await;
+    assert!(action.contains("POST"), "审计动作应记方法: {action}");
+    assert!(
+        result.contains("剩余会话 1 个"),
+        "吊销单个会话的审计必须记下剩余数，否则事后不知道是否真踢掉: {result}"
+    );
+
+    // ── 一键吊销除当前外的全部 ──
+    let _ = login_token(&app, &username, "user1234").await;
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/sessions/revoke-others",
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "吊销其他会话失败: {body}");
+
+    let (action, result) = wait_for_audit("POST", "/api/auth/sessions/revoke-others").await;
+    assert!(action.contains("POST"), "审计动作应记方法: {action}");
+    assert!(
+        result.contains("剩余 1 个"),
+        "一键吊销的审计必须记下踢掉几个、剩余几个: {result}"
+    );
 }
