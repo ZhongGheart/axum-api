@@ -8,6 +8,7 @@
 # 说明:
 #   - 数据库迁移由 API 启动时自动执行（MIGRATE_ON_STARTUP=true）
 #   - DB_PASSWORD / JWT_SECRET 必须显式提供，不提供弱默认值
+#   - 头像存在 /app/uploads，必须挂卷（uploads），否则重建容器会丢图
 #   - postgres / redis 默认不对宿主机暴露端口，仅在同网络内可达
 # ============================================
 
@@ -58,7 +59,12 @@ services:
       JWT_EXPIRATION_SECONDS: "604800"
       APP_ENV: "production"
       MIGRATE_ON_STARTUP: "true"
+      # 挂卷路径必须与 Dockerfile 里的 VOLUME 一致
+      UPLOAD_DIR: "/app/uploads"
       RUST_LOG: "info"
+    volumes:
+      # 头像不挂卷 = 每次重建容器都回到"所有人都没头像"的状态
+      - uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
@@ -86,3 +92,4 @@ services:
 
 volumes:
   pgdata:
+  uploads:

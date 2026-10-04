@@ -61,9 +61,14 @@
 | 变更追溯 | ✅ | 写操作由 handler 显式声明"改了什么"并落进 `result` 列：角色/用户/菜单**删除前先取名字**（行删掉后名字仍在审计里）、授权记录**授出与撤销的权限码差异**、状态切换记录前后状态；**口令一个字都不记**；失败的写操作不留摘要（不谎报"已授予"） |
 | 数据字典 | ✅ | Redis 缓存 + 写操作真实失效；读取接口对**任意已登录用户**开放；**`status=disabled` 真的生效**（禁用项与禁用类型不进读取端点）；**`is_default` 靠部分唯一索引保证同一字典只有一个**；**「刷新缓存」真删 `dict:*` 并如实报出清了多少键** |
 | 菜单管理 | ✅ | 菜单是导航的唯一来源：`/api/auth/menus` 决定侧栏与前端动态路由；**层级可调**（界面上能改上级、能摘成顶级）；**成环与悬空引用一律被拒**（自引用、挂到自己的子孙下、挂到不存在的上级均 400），且结构损坏的节点能通过 `/api/admin/menus/diagnostics` **被看见并救回** |
-| 权限码 | ✅ | 28 个 `<模块>:<资源>:<动作>` 权限码存于 `menus.permission`（按钮型菜单），后端强制鉴权 + 前端按码判定；清空后可由清空者本人恢复 |
+| 权限码 | ✅ | 30 个 `<模块>:<资源>:<动作>` 权限码存于 `menus.permission`（按钮型菜单），后端强制鉴权 + 前端按码判定；清空后可由清空者本人恢复 |
 | 角色与授权 | ✅ | 角色增删改（**分页**）+ 菜单/权限码授权树；授权**要么完整成功、要么整体回滚**；内置角色不可删除、不可改名；自定义角色可直接分配给用户 |
-| 用户管理 | ✅ | 增删改查（分页 + `keyword` 真搜索）、批量删除、状态切换、重置密码；**多角色分配**；含"最后一个管理员"保护 |
+| 用户管理 | ✅ | 增删改查（分页 + `keyword` 真搜索，另可按 `role` / `is_active` 筛选）、批量删除、状态切换、重置密码；**多角色分配**；含"最后一个管理员"保护 |
+| 个人资料 | ✅ | `PUT /api/auth/profile` 自助改**展示名**与头像路径，字段级**三态**语义（不带 = 不改 / `null` = 清空 / 带值 = 设置），前端不必先读旧值再原样回写（那是典型的丢失更新） |
+| 头像上传 | ✅ | `POST /api/auth/profile/avatar`（multipart，字段名 `file`）：**文件名由服务端生成 UUID**、扩展名由 MIME 白名单推导（绝不用客户端文件名拼路径）；替换时删旧文件，写库失败删新文件；`/uploads` 静态路由挂在鉴权之外。**落盘目录需挂卷**，见 `UPLOAD_DIR` |
+| 管理员解锁 | ✅ | `POST /api/admin/users/{id}/unlock` + **独立权限码 `system:user:unlock`**（不被 `system:user:update` 顺带放行）。清的是**用户名与邮箱两个桶**，刻意不碰 IP 桶——那是跨账号共享的，清了等于给爆破地址发新额度 |
+| 在线会话 | ✅ | 登录时登记会话，`GET /api/admin/users/{id}/sessions` 列举、**单会话吊销** + 权限码 `system:session:manage`。登记靠 **JWT 自身 TTL** 自过期；**登记失败不放行登录**（漏掉一次登录记录比登录失败更危险：用户毫无察觉） |
+| 批量导入用户 | ✅ | `POST /api/admin/users/import`（CSV，必需列 `username,email,password,roles`）：**逐行成败并带行号**（含表头上限），授权下界整批前置校验，`dry_run` 预览**绝不落库**；**口令一个字都不进审计** |
 | 密码策略 | ✅ | 自助改密（验旧口令、改密后吊销全部会话）；长度 ≥ 8 且至少 2 类字符，**只在设置口令时校验、登录不校验**；前后端共用一份判定样例，由集成测试比对两侧结论 |
 | 首次登录强制改密 | ✅ | 管理员新建/重置的用户须先改密，用**受限令牌**实现（只放行改密/登出/`/me`）；存量用户默认不受影响 |
 | 系统监控 | ✅ | CPU/内存/磁盘、DB/Redis 状态、接口耗时统计（进程内，重启丢失） |
@@ -200,6 +205,8 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | `METRICS_FLUSH_INTERVAL_SECONDS` | 否 | `5` | 内存指标缓冲的刷写间隔（秒）。传 `0` 会被兜底成 `1`，否则定时任务会空转刷 Redis |
 | `METRICS_KEY_TTL_SECONDS` | 否 | `604800` | 指标在 Redis 里的存活时间（秒）。到期即丢弃，**调小会让监控页出现断点**，而不是只丢精度 |
 | `METRICS_MAX_BUFFERED_ENDPOINTS` | 否 | `10000` | 单次刷写最多覆盖多少个不同端点，用来给内存占用封顶 |
+| `UPLOAD_DIR` | 否 | `./uploads` | 头像落盘根目录。**容器部署必须挂卷**，否则重建容器会丢掉所有已上传的头像（compose 已配 `uploads:/app/uploads`） |
+| `UPLOAD_MAX_FILE_SIZE` | 否 | `2097152` | 单张头像大小上限（字节，默认 2MB），超出回 413 |
 
 ⚠️ **保留策略不是只写在文档里**：`GET /api/admin/audit-logs/retention` 会返回
 当前部署的真实保留天数、现存最早一条日志的时刻，以及最近一次清理的
@@ -235,14 +242,20 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | GET | `/api/auth/menus` | 当前用户可见的导航菜单树（前端动态路由与侧栏的数据源） |
 | POST | `/api/auth/logout` | 注销**当前令牌** |
 | GET | `/api/dict/{code}/items` | 读取字典项（任意已登录用户） |
+| PUT | `/api/auth/profile` | **自助改资料**：展示名 / 头像路径，字段级三态 |
+| POST | `/api/auth/profile/avatar` | **自助上传头像**（`multipart/form-data`，字段名 `file`），上传与设置一步完成 |
 
 ### 仅 admin
 
 | Method | Path | 说明 |
 |--------|------|------|
-| GET/POST | `/api/admin/users?page=&page_size=&keyword=` | 用户列表（分页 + 关键字搜用户名/邮箱） / 新建用户 |
+| GET/POST | `/api/admin/users?page=&page_size=&keyword=&role=&is_active=` | 用户列表（分页 + 关键字搜用户名/邮箱，**另可按角色 / 启用状态筛选，两者同时给是 AND**） / 新建用户 |
 | PUT/DELETE | `/api/admin/users/{id}` | 更新 / 删除用户 |
 | POST | `/api/admin/users/batch-delete` | 批量删除（含最后管理员保护） |
+| POST | `/api/admin/users/{id}/unlock` | **解锁**被登录失败计数锁定的账号（需 `system:user:unlock`） |
+| GET | `/api/admin/users/{id}/sessions` | 该用户的**在线会话**列表（直接返回数组，不存在或无在线即空数组） |
+| POST | `/api/admin/users/{id}/sessions/{jti}/revoke` | **单会话吊销**（需 `system:session:manage`） |
+| POST | `/api/admin/users/import` | **CSV 批量导入用户**，请求体 `{csv, dry_run}`；逐行成败并带行号 |
 | PUT | `/api/admin/users/{id}/status` | 启用 / 停用（停用即吊销会话） |
 | POST | `/api/admin/users/{id}/reset-password` | 重置密码（并吊销会话） |
 | GET/POST | `/api/admin/users/{id}/roles` | 查询 / 追加用户角色 |
@@ -491,6 +504,34 @@ export RATE_LIMIT_USER_MAX=100000
   `username` / `email` 补上了此前漏写的字符集与长度上限。
   这三条都不是新增限制，只是让文档不再教人用会被拒绝的规则。
   若你的客户端生成代码时读取这段描述做校验，需要重新生成
+
+## 从 v0.19 升级到 v0.20
+
+两条迁移（`014_user_profile_fields` / `015_widen_audit_action`）均由启动时自动执行，
+**存量库直接重启即可**。需要留意四处：
+
+- **新增两个权限码，且已自动授予 admin**：`system:user:unlock` 与
+  `system:session:manage`。种子只给**本次新建**的权限码授权，
+  所以管理员日后在「菜单管理」页撤销的授权不会被下次启动悄悄恢复。
+  **自定义管理角色需要手动补这两个码**，否则解锁与吊销会话会 403
+
+- **`users` 表新增两列，存量行均为 `NULL`**。`display_name` 为 NULL 时界面回退显示用户名，
+  与 v0.20.0 之前一致，不会有视觉跳变
+
+- **`audit_logs.action` 列宽从 `VARCHAR(100)` 放宽到 `VARCHAR(512)`。**
+  此前只要请求路径略长，审计记录就会**整条写入失败且不报错**——
+  写库在 `tokio::spawn` 里，失败只留一行 `tracing::warn!`，请求照常返回 200。
+  表现是"这个操作没有审计记录"。v0.20.0 新增的会话吊销路径第一次越过 100 字符这条线
+
+- **`UPLOAD_DIR`（默认 `./uploads`）需要挂卷，否则重建容器会丢头像。**
+  `docker compose up` 已自动配置 `uploads:/app/uploads` 命名卷；
+  若是自行编排，务必挂到 `/app/uploads` 且属主要与容器内用户一致
+  （镜像里已预建该目录并设好属主，卷挂到**已存在**的路径会继承它）
+
+**行为变化**：`GET /api/admin/users/{id}/sessions` 对**不存在的用户**返回 `200` + 空数组，
+而不是 404。这是为了与 `GET /api/admin/users/{id}/roles` 保持一致——
+同一个 `{id}` 在两个"查这个人的附属信息"的端点上不该给出两种相反的答案。
+副作用是：一个写错或已删除的 id 与"这个人确实没在线"在响应上分不开。
 
 ## License
 

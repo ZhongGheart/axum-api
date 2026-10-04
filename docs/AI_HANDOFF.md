@@ -51,6 +51,182 @@ CHANGELOG 条目或 Release。用户当时只说"推送"没说"发布"，所以�
 前端 GET 缓存无用户维度（`requestCache.invalidate()` 在登录成功 / 401 / 任何非 GET 后都调了）；
 审计只记写操作（middleware 对所有方法都写）；"记住密码"存明文（只存 `{ username }`）。
 
+### 里程碑：M0–M2 完成（发布元数据 / 迁移 014 / 自助资料 + 列表筛选）
+
+**M0**：`CHANGELOG.md` 补 v0.19.0 完整条目（基于三个提交的真实内容）+ v0.20.0 占位；
+`Cargo.toml` 与 `frontend/package.json` 抬到 `0.20.0`。版本号仍**未推送、未打 tag**。
+
+**M1**：迁移 `014_user_profile_fields.sql` 加 `display_name VARCHAR(50)` / `avatar_url VARCHAR(512)`，
+各带 CHECK。`USER_COLUMNS` 一并加两列（10 处手写列名的集中常量，改一处即全生效）。
+
+#### 🐛 我自己写的迁移里有个真漏洞，是靠实跑才发现的
+
+初版约束只写了：
+```sql
+CHECK (avatar_url IS NULL OR avatar_url ~ '^/uploads/[A-Za-z0-9._/-]+$')
+```
+而该字符类里**同时有 `.` 和 `/`**，于是 `..` 天然合法。实测：
+
+```
+UPDATE users SET avatar_url='/uploads/../etc/passwd';  →  UPDATE 1   ← 被接受了
+```
+
+应用层 `normalize_avatar_url` 有逐段 `..` 检查，所以 HTTP 路径拦得住；
+但**绕过应用直写库**的路径会穿透，而这一列的 CHECK 存在的意义恰恰就是那条路径。
+把它当"第二道防线"写在注释里，实际在穿越这一项上是空的。
+
+修法是**加一条独立约束**而不是改正则——改正则会连带误伤 `a..b.png` 这类合法文件名：
+
+```sql
+CHECK (avatar_url IS NULL OR avatar_url !~ '(^|/)\.\.(/|$)')
+```
+
+`(^|/)` 与 `(/|$)` 保证 `..` 必须是**完整路径段**，否则 `..foo`、`a..b` 会被误拒。
+复验（重建二进制后在新库上跑）：4 个穿越用例
+（`/uploads/../etc/passwd`、`/uploads/a/../../b`、`/uploads/a/..`、`/uploads/..`）全部被拒，
+而 `/uploads/a..b.png` 仍然接受。
+
+#### 第二次栽在同一个坑：验证时用了没重编译的二进制
+
+改完 014 后我建了新库重跑，**穿越用例仍然全部通过（UPDATE 1）**——差点以为修复无效。
+真正原因是 `sqlx::migrate!` 在**编译期**把 SQL 嵌入二进制，我改了 `.sql` 文件但没 `cargo build`，
+跑的还是旧迁移。**迁移文件改完必须重编译再验证**，否则看到的现象会把你引向错误的结论。
+
+#### 展示名长度口径
+
+50 个汉字存入成功（`char_length` = 50），51 个被 `varchar(50)` 拒。
+应用层 `normalize_display_name` 按 `chars().count()` 判，先于 DB 拒绝，所以 HTTP 路径得到 400 而非 500。
+这里刻意**不加**长度 CHECK：varchar 已经拒了，再加一条只会让报错从"字段超长"变成"约束冲突"。
+
+**M2**：`PUT /api/auth/profile`（controller/auth.rs）+ `user_repo.update_profile` +
+`auth_service.update_profile`；`list_users` 支持 `is_active` / `role` 两个新筛选维度，
+`list_filtered` 从 `match keyword` 二分支改为**动态拼 WHERE + 顺序绑定**。
+
+#### 两个设计决定（都不是随手写的）
+
+**字段级三态 `Option<Option<String>>`**：外层区分"字段在不在请求里"，内层区分"要不要清空"。
+`Option<String>` 下"不带字段"和`"display_name": null` 都是 `None`——
+前端只想改头像时会顺手把展示名也清了，这是一次静默的数据丢失。
+仓储签名因此是 `update_profile(id, Option<Option<&str>>, Option<Option<&str>>)`，
+用 `COALESCE` 保持"缺省即不改"，前端不必先读旧值再原样写回（回写一个刚被别人改过的旧值
+就是典型的丢失更新）。
+
+**刻意不在受限令牌白名单里**：`middleware/auth.rs` 的 `pwd_stale` 分支只放行
+password / logout / me。待改密的用户不能改资料——那个会话尚未确认凭据。
+
+**列表筛选用 EXISTS 不用 JOIN**：一个用户可能同时命中多条角色行（多对多），
+JOIN 会让同一用户重复出现并把 total 算大。`role_name` 与 `is_active` 同时给是 **AND**
+（"既是 HR 又是禁用的"是一个明确的问法，改成 OR 会返回一批用户没预期的账号）。
+
+**自查清理**：scratch 库 `axum_api_scratch` 与其中的 `probe` 用户是我这轮造的，
+收尾要连库一起删。演示库 `axum_api_manual` 的 admin 行被我写测试用 SQL 动过
+（avatar_url / display_name），需确认已复原。
+
+### 开工记录：用户指令「执行新功能开发计划」
+
+用户未反对上轮建议，按**建议方案**执行：(1) 发布元数据补齐并把版号一并抬到 0.20.0；
+(2) 头像走本地磁盘 + `tower-http` ServeDir，对象存储抽象推 v0.22.0。
+
+**将要改什么**：M0 发布元数据 → M1 迁移 014（`users` 加 `display_name`/`avatar_url`）→
+M2 profile 端点 + 列表按角色/状态筛选 → M3 管理员解锁 + `system:user:unlock` →
+M4 会话登记（登录写 Redis）+ 列举/单吊销 + `system:session:manage` →
+M5 头像上传（开 axum multipart + tower-http fs + Docker 挂卷）→ M6 前端串联与门禁。
+B3 CSV 批量导入插入 M5 之后。
+
+**受影响文件**：`migrations/014_*.sql`（新）、`src/model/user.rs`、`src/model/permission.rs`、
+`src/repository/user.rs`、`src/controller/{auth,user}.rs`、`src/router/mod.rs`、
+`src/service/auth.rs`、`src/utils/redis.rs`、`src/config/mod.rs`、`Cargo.toml`、`Dockerfile`、
+`frontend/src/views/profile/index.vue`、`frontend/src/views/system/user/index.vue`、
+`frontend/src/api/*`、`tests/api_integration.rs`、CHANGELOG、README、Cargo.toml 与 package.json 版号。
+
+**预期下一步**：M0+M1 落地并跑迁移，确认 `users` 新列落地后再动 M2 端点。
+
+**每个里程碑都要做缺陷注入**（注入后必须红 + 回滚 + 查库清残留），这是本仓已确认的纪律。
+
+### 里程碑：M3–M6 完成 + 一个把 53 条测试一次性打红的夹具缺陷
+
+#### M3 解锁 / M4 会话 / M5 头像 / B3 CSV 的落点
+
+- **M3** `POST /api/admin/users/{id}/unlock` + `system:user:unlock`。解锁复用登录的
+  同一个归一函数算 scope（`account:{username}` / `account:{email}`），**故意不碰 IP 桶**——
+  那是跨账号共享的，清了等于给爆破地址发新额度。
+- **M4** 登录成功时登记 `sess:*`（靠 JWT 自身 TTL 自过期）；`GET /api/admin/users/{id}/sessions`
+  返回**数组本身**（不是 `{items,total}`），`POST .../sessions/{jti}/revoke` 走 jti 黑名单。
+  **登记失败不放行登录**：登记只用于管理视图，缺一条不影响认证结论，但会让"这个人
+  在哪些设备登录"漏掉一次登录，而管理员正是靠这个列表判断账号是否被盗用。
+- **M5** `POST /api/auth/profile/avatar`（multipart，字段名 `file`）。文件名由**服务端**
+  生成 UUID，扩展名由 MIME 白名单推导（绝不用原始文件名拼路径）；
+  `delete_uploaded_avatar` 校验 `uploads/avatars/` 前缀，防止任意文件删除；
+  换头像时删旧文件，而**旧头像必须在写新值之前读出**。
+  `/uploads` 的 `ServeDir` 刻意挂在鉴权之外（图片是 `<img src>`，带不了 Authorization 头）。
+- **B3** `POST /api/admin/users/import`，请求 `{csv, dry_run}`。**逐行成败**，失败带行号；
+  授权下界整批前置校验；口令不入审计。
+
+#### 🐛 审计 `action` 列宽 100，超长路径的审计**整条静默消失**
+
+`audit_logs.action` 是 `VARCHAR(100)`，而 `path` 是 `VARCHAR(500)`——
+两列装的是同一段信息（`action = "{method} {path}"`），宽度却差 5 倍。
+`POST /api/admin/users/{id}/sessions/{jti}/revoke` 拼出来是 **107 字符**，
+INSERT 直接失败；而中间件在 `tokio::spawn` 里写库，失败只留一行 `tracing::warn!`，
+**请求照常返回 200**。表现是"这个操作没有审计记录"，而不是"审计写不进去"。
+
+修法（`migrations/015_widen_audit_action.sql`）：`action` → `VARCHAR(512)`，
+中间件再加 `MAX_ACTION_LEN = 512` 截断。
+**改列宽而不是只截断**：action 的唯一用途就是检索，一条被截掉尾部的 action 检索不到，等于没有。
+
+#### 🐛🐛 一个夹具泄漏，表现为"随机大面积 403"——本轮最费时间的一处
+
+全量集成测试首跑 **53 条红**，几乎全是 `缺少权限：system:user:create` 之类的 403；
+而**单条跑全绿**。逐层查到：
+
+1. 库里 `admin` 用户的角色被改成了 `user`（`user_roles` 里 admin→admin 那行不见了）。
+2. 罪魁是 `the_user_list_can_be_filtered_by_role_and_by_active_status`——
+   它造 3 个 `filt_user_*` 加 1 个 **`filt_admin_role_*`（持 admin 角色）**，
+   测完只 `cleanup_operator`，**这 4 个账号一个都没删**。
+   `the_filtered_user_list_count_matches_the_filter` 同样漏了 2 个 `countme_*`。
+3. 为什么后果这么重：`ensure_not_last_admin` 判的是 `count_users_with_role("admin") <= 1`，
+   那是**全库**计数。多一个 admin 账号 → 守卫认为"还有别人是 admin"而**放行**降级 →
+   `last_admin_cannot_be_demoted_or_deleted` 把真 admin 降掉 →
+   之后**每一条**用例都因 admin 掉权而红。
+
+守卫本身没坏，**它的成立前提被夹具破坏了**，而这个前提从未写进任何测试。
+修法两条：
+- 两条筛选测试补齐账号清理（`user_id_by_name` + `delete_user`）。
+- `last_admin_cannot_be_demoted_or_deleted` **开头先查全库 admin 列表并断言恰好是 `["admin"]`**，
+  失败信息直接点名"是某个夹具没清理"。让前提出现在测试里，而不是靠运气。
+
+教训与 v0.19.0 那次"19 处夹具堆 212 个角色"同源：**夹具泄漏的症状可以离病因一百多条用例**。
+新写夹具的判据因此补一条：**只要建出来的账号持有 admin 这类内置角色，就必须清理**——
+`opf_*` 前缀守卫只圈 operator 夹具，圈不到这种藏在业务用例里的。
+
+#### 一个仍然存在的、被显式记录的行为
+
+`admin` 用户行与 `admin`/`user` 角色行的 `created_at` 完全相同（07:26:48），
+说明它们是**种子**建的；而 `admin` 的 `user_roles` 关联带的是后来那次降级的时间戳。
+换句话说种子只建角色与用户行，**角色关联是首次登录或首次建号时补的**。
+这不是本轮引入的，但值得记住：迁移重建库后 `user_roles` 可能短暂为空。
+
+### 收尾：M6 门禁全绿 + 本地提交（**未推送**）
+
+门禁结果：`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` 0 warning /
+92 单元 / 12 非集成 / **162 集成 passed**（`--ignored --test-threads=1`）/
+`pnpm lint` 0 errors（1 既存 warning：`env.d.ts` 的 `no-explicit-any`）/
+`pnpm typecheck`（`vue-tsc`）/ `pnpm test` 161 passed / `pnpm build`。
+
+**注入验证共 5 处**，每处都是"注入必红 → 回滚即绿 → 查库清残留"：
+015 迁移的列宽、解锁的 email 桶、profile 的清空 flag、头像的 multipart 拒绝、会话的 404。
+
+**部署侧改动**（本轮新增）：`Dockerfile` 里 `mkdir -p /app/uploads/avatars` + `chown app` +
+`VOLUME`；`docker-compose.yml` 加 `uploads:/app/uploads` 命名卷与 `UPLOAD_DIR`；
+`.env.example` 与 README 环境变量表补 `UPLOAD_DIR` / `UPLOAD_MAX_FILE_SIZE`；
+`.gitignore` 忽略 `uploads/`（开发机上传的头像否则会进版本库）。
+
+**未推送**：按用户既有规矩，本地提交后等明确指令再统一推送。
+
+**接手者注意**：测试库 `axum_api_test` 是长驻共享库，跑集成必须 `--test-threads=1`。
+若发现大量 403，先查 `SELECT r.name FROM user_roles ur JOIN roles r ... WHERE ur.user_id = <admin_id>`
+——admin 被降级会让**每一条**用例都红，而病因通常在几百行之前的一个漏清理夹具里。
+
 ### 里程碑：规划交付完成（未写任何实现代码）
 
 **改了什么**：`docs/ROADMAP.md` 新建（156 行）；`NEXT_VERSION_SCOPE.md` 顶部加封存指引（**历史内容保留未删**）；

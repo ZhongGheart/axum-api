@@ -2,6 +2,219 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.20.0] - 2026-10-04
+
+主题：**账号自持 + 管理可应急。**
+
+用户对自己的账号**没有任何自助修改能力**，管理员在出事时**没有手动手段**。
+两条线都是在已有机制上闭环，不开新战场。详见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
+
+### 缺口表
+
+| 缺口 | 实测依据 |
+|---|---|
+| 用户改不了自己的资料 | `/api/auth/*` 下只有 `password` 是 PUT，**没有 profile 端点**；`users` 表 8 列里没有 `display_name` / `avatar_url`；`profile/index.vue` 只有改密三个字段 |
+| 管理员找不到"某个角色的禁用账号" | `list_users` 只收 `page/page_size/keyword`，keyword 同时匹配 username+email，只能靠翻页 |
+| 文件上传是**悬空 affordance** | 前端 `BaseUpload.vue` 完整可用且已导出，但**无人使用**；后端 `axum` 只开 `features=["macros"]` **没开 multipart**，`tower-http` 也没开 `fs` |
+| 账号被锁只能干等 | `clear_login_failures` **唯一调用点在登录成功分支**，管理员**无手动解锁入口**；锁 TTL = `LOGIN_FAILURE_WINDOW` 默认 300s 自过期 |
+| "这个人现在在哪些设备上"无从回答 | 登录成功后**不写任何会话记录**，jti 只在登出时进黑名单。JWT Claims 里 `jti` 早就有了，地基是齐的，只差登记 |
+| 用户导入只有一个方向 | 只有 `GET /api/admin/export/users`，没有反向。全仓 `import` / `导入` 只命中 TS 动态 import |
+
+### A 线：用户自助
+
+**`PUT /api/auth/profile`** — 迁移 014 加 `display_name VARCHAR(50)` / `avatar_url VARCHAR(512)`，各带 CHECK。
+
+字段级**三态**语义（`Option<Option<String>>`）：不带 = 不改，`null` = 清空，带值 = 设置。
+用 `Option<String>` 的话"不带字段"和"display_name: null"都是 `None`——
+前端只想改头像时会顺手把展示名也清了，这是一次静默的数据丢失。
+仓储用**外层 flag + CASE WHEN** 而不是 `COALESCE`，前端不必先读旧值再原样写回
+（回写一个刚被别人改过的旧值就是典型的丢失更新）。
+
+列表筛选新增 `is_active` / `role` 两个维度，`list_filtered` 从 `match keyword` 二分支改为动态拼 WHERE + 顺序绑定。
+筛选用 **EXISTS 不用 JOIN**：一个用户可能同时命中多条角色行，JOIN 会让同一用户重复出现并把 total 算大。
+两者同时给是 **AND**（"既是 HR 又是禁用的"是一个明确的问法，改成 OR 会返回一批用户没预期的账号）。
+
+**`POST /api/auth/profile/avatar`** — 开 `axum/multipart` + `tower-http/fs`，`nest_service("/uploads", ServeDir)`。
+
+- 文件名由**服务端**生成 UUID，扩展名由 **MIME 白名单**推导。绝不能用原始文件名拼路径。
+- 替换头像时删旧文件，而**旧头像必须在写新值之前读出**——写完之后库里已指向新文件，
+  回头再读只能读到新路径，"替换掉旧文件"这件事就悄悄失效了。
+- 写库失败删掉刚写的文件，否则每次失败都留下一个没人引用的孤儿文件，而用户会以为"至少图还在"。
+- `/uploads` 刻意挂在鉴权之外：图片是 `<img src>`，带不了 Authorization 头。
+- 启动时 `create_dir_all`，让"部署漏挂卷"在启动时暴露，而不是等第一个用户上传才发现。
+
+### B 线：管理应急
+
+**`POST /api/admin/users/{id}/unlock`** + 新权限码 `system:user:unlock`。
+复用登录的同一个归一函数算 scope（`account:{username}` / `account:{email}`），
+否则清掉的 key 与写入的 key 对不上。**刻意不碰 IP 桶**——那是跨账号共享的，清了等于给爆破地址发新额度。
+Redis 出错时**回 500 而不是静默 200**：管理员会以为解锁了而用户仍登不进去。
+新权限码不给 `system:user:update` 顺带放行——后者是日常高频操作，几乎必然授给管理员，
+而"解锁"意味着"我确认这个人是本人"，两者共用开关就等于让前者必然带出后者。
+
+**在线会话** — 登录成功时登记 `sess:*`，`GET /api/admin/users/{id}/sessions` 列举，
+`POST .../sessions/{jti}/revoke` 单吊销 + 新权限码 `system:session:manage`。
+
+- 存储增长靠 **JWT 自身 TTL 自过期**。`revoke_user_sessions`（`user_revoked_before`）是整用户粒度，
+  单会话吊销仍走 jti 黑名单——两条路径不能混。
+- 登记只用于管理视图，缺一条记录不影响认证结论，但会让"这个人在哪些设备上登录"漏掉一次登录，
+  而管理员正是靠这个列表判断账号是否被盗用。所以**登记失败不放行登录**。
+- jti 会直接拼进 Redis 键，列举用的是 `SCAN sess:{user_id}:*` 这个 glob——
+  不校验 UUID 形状的话，一次键名污染就能让列表凭空多出别人的会话。
+
+**`POST /api/admin/users/import`**（CSV）— 必需列 `username,email,password,roles`，
+可选 `display_name`，`roles` 单元格用 `|` 分隔。
+
+- **逐行成败**，失败带**行号**（含表头上限）。"3 行失败"等于让管理员自己数行号。
+- **授权下界整批前置校验**：整批能授出的角色先判，越权则一行都不写。
+- 试运行（`dry_run`）**绝不落库**，但仍报告会有几行成功——管理员需要预览才能决定返工。
+- **口令不入审计**：`params` 与 `result` 两列都要查，只查 `result` 是不够的。
+
+### 🐛 审计 `action` 列宽 100，超长路径的审计整条静默消失
+
+`audit_logs.action` 是 `VARCHAR(100)`，而 `path` 是 `VARCHAR(500)`——
+两列装的是同一段信息（`action = "{method} {path}"`），宽度却差 5 倍。
+新端点 `POST /api/admin/users/{id}/sessions/{jti}/revoke` 第一次把路径推过了 100 字符这条线：
+拼出来 107 字符，INSERT 直接失败；而中间件在 `tokio::spawn` 里写库，失败只留一行 `tracing::warn!`，
+**请求照常返回 200**。表现是"这个操作没有审计记录"，而不是"审计写不进去"。
+
+迁移 015 把 `action` 拓宽到 `VARCHAR(512)`，中间件再加 `MAX_ACTION_LEN` 截断。
+**改列宽而不是只截断**：action 的唯一用途就是检索，一条被截掉尾部的 action 检索不到，等于没有。
+
+### 🐛 一个夹具泄漏，表现为"随机大面积 403"
+
+全量集成测试首跑 **53 条红**，几乎全是 `缺少权限：system:user:create`；而**单条跑全绿**。逐层查到：
+
+1. `the_user_list_can_be_filtered_by_role_and_by_active_status` 造 3 个普通账号加 1 个
+   **持 admin 角色的账号**，测完只清理了 operator 夹具，**这 4 个一个都没删**。
+2. `ensure_not_last_admin` 判的是 `count_users_with_role("admin") <= 1`——**全库**计数。
+   多一个 admin 账号，守卫就认为"还有别人是 admin"而**放行**降级，
+   `last_admin_cannot_be_demoted_or_deleted` 于是把真 admin 降掉。
+3. 之后**每一条**用例都因 admin 掉权而红。
+
+守卫本身没坏，**它的成立前提被夹具破坏了**，而这个前提从未写进任何测试。
+修法：两条筛选测试补齐账号清理；`last_admin_cannot_be_demoted_or_deleted`
+**开头先查全库 admin 列表并断言恰好是 `["admin"]`**，失败信息直接点名"是某个夹具没清理"。
+
+与 v0.19.0 那次"19 处夹具堆 212 个角色"同源：**夹具泄漏的症状可以离病因一百多条用例**。
+`opf_*` 前缀守卫只圈 operator 夹具，圈不到藏在业务用例里的那种。
+
+### 🐛 两处与既有守卫冲突的新端点
+
+**头像端点的入参错误绕过统一信封。** `Multipart` 提取器在 Content-Type 不对时
+**在进入处理函数之前**返回 `text/plain` 的 400，于是同一个"入参不对"有两种形态，
+调用方没法只靠 `code` 分支处理。改接 `Result<Multipart, MultipartRejection>` 自己翻译。
+
+**`GET /users/{id}/sessions` 对不存在的用户回 404。** 而 `GET /users/{id}/roles` 对同一个
+`{id}` 回 200 + 空数组——同一个"查这个人的附属信息"，两种相反的答案。
+仓库对读端点的统一约定也是"不存在即空"。改为返回空数组，并把代价写进注释：
+写错或已删除的 id 与"这个人确实没在线"确实分不开。
+
+### 缺陷注入验证（每处都做了，会红并回滚）
+
+| 注入 | 结果 |
+|---|---|
+| `audit_logs.action` 列宽改回 `VARCHAR(100)` | `every_write_operation_leaves_an_answerable_change_summary` 红在"审计里查不到 revoke 的摘要"——**正是原症状**：请求 200 而审计整条消失 |
+| 解锁的 scope 去掉 email 桶 | `unlocking_clears_the_email_counter_too_not_just_the_username_one` 红：`left: 3, right: 0` |
+| profile 的清空 flag 退回"内层为 Some 才写" | `a_user_can_set_and_clear_their_own_display_name` 红：`清空后应为 null, left: String("张三")` |
+| 头像端点退回提取器默认拒绝 | `a_non_multipart_avatar_upload_still_returns_the_json_envelope` panic（走不到信封断言） |
+| sessions 端点加回 `find_by_id` 的 404 | `sessions_of_an_unknown_user_are_an_empty_list_not_a_404` 红：`left: 404, right: 200` |
+
+每次注入后回滚并查库清残留（`opf_*` / `filt_*` / `countme_*` / `avct_*` 均为 0，
+admin 的 `user_roles` 保持 `admin`）。
+
+### 部署注意
+
+头像落在 `UPLOAD_DIR`（默认 `./uploads`）。**容器部署必须挂卷**：
+`docker-compose.yml` 已加 `uploads:/app/uploads` 命名卷，`Dockerfile` 在镜像里就
+`mkdir -p /app/uploads/avatars` 并设好属主——卷挂到镜像里**已存在**的目录会继承属主，
+挂到不存在的路径则按 root 建，容器内的非 root 用户写不进去，头像上传在运行时才报错。
+
+### 门禁结果（全绿）
+
+`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` 0 warning /
+92 单元 / **162 集成 passed** / `pnpm lint` 0 errors（1 既存 warning）/ `pnpm typecheck` /
+`pnpm test` **161 passed** / `pnpm build`。
+
+---
+
+## [0.19.0] - 2026-10-03
+
+主题：**承重守卫生效范围太窄，于是烂掉的端点没人发现。**
+
+`GET /api/admin/export/users` 自 v0.11.0 起**每个调用都 500**，跨越七个版本无人知晓。
+
+### 缺口表
+
+| 缺口 | 实测依据 |
+|---|---|
+| `export/users` 每个调用都 500 | 迁移 010 新增 `must_change_password`，而 `controller/demo.rs` 的裸 SQL 手写列名漏了它，`sqlx::FromRow` 运行时找不到该列。实测修复前 500、修复后 200 并返回 23555 字节真 xlsx |
+| 根因是守卫生效范围只覆盖写端点 | `every_documented_write_operation_is_covered_by_the_audit_test` 从 OpenAPI 派生的只有 POST/PUT/DELETE。**这是个 GET 端点，文档里 22 个 GET 一个都不在它视野里** |
+| 用户名大小写可冒充 admin | 用户名是**登录键**，也是管理员在列表里辨认账号的依据，而 `UNIQUE(username)` **大小写敏感**。`Admin` / `ADMIN` / `aDmIn` 可与真 admin 并存，且**自助注册一次就能造出来** |
+| 测试夹具在共享库里堆垃圾 | `operator_with_codes` 被 19 个用例共用，返回的 `(token, role_id, user_id)` 无一被清理。实测累积 212 个角色 / 424 个账号（整库 270 角色 / 424 用户），而 142 个用例全绿 |
+
+### 修法一：列名单一数据源 + 守卫生效范围扩到全部端点
+
+`repository::user::USER_COLUMNS` 集中列名（照 `repository::menu::MENU_COLUMNS` 的形状）。
+原先 **10 处手写**：user.rs 8 处 + demo.rs + rbac.rs，全部改用它。
+
+新守卫 `every_documented_endpoint_is_reachable_without_a_server_error`：从文档派生**全部 50 个端点**。
+GET 必须 2xx（无必填体，4xx 也是缺陷）；非 GET 只要不是 5xx（发 `{}` 停在校验层，不改真实数据）。
+路径与必填 query 参数同样由文档派生，**新增端点自动进探针表**，不用手动登记。
+
+### 修法二：用户名 / 邮箱大小写归一
+
+写入侧三条路径全部归一（trim + 小写），**先归一再校验**，保证被校验的就是被存下的。
+查重因此自动变成"归一后比较"，不必再单独写一条大小写不敏感的查重——两处规则迟早会走偏。
+登录侧复用同一个归一值走查库 / 限流 / 审计三处。
+
+迁移 013 遇到冲突**报错让应用起不来**，不照抄 008 的"跳过"：跳过会让那行变成
+**登录不到的孤儿账号**——归一后所有写入都是小写，`find_by_username("admin")` 只命中小写那行，
+旧 `Admin` 行再也登不进去，却仍挂在库里、仍持原角色，且在列表里与真 admin **肉眼无法区分**。
+那比迁移前更糟。合并会丢权限（`user_roles` 按 `user_id` 关联），必须管理员显式决定。
+
+### 顺带修掉 013 自己引入的缺陷
+
+仓储按约束名翻 409 时只认迁移 001 的 `users_username_key`，而**仅大小写不同的插入
+撞的是新建的 `users_username_lower_key`**（已实测）。只认旧名字的话，013 注释里承诺的
+"第二道防线"会报 **500 而不是 409**——防线拦住了却报 500，等于把一个可诊断的冲突
+变成"用户说系统坏了"。这条路径走 HTTP **永远测不到**（应用侧查重会先一步挡住），
+所以测试直接调 `UserRepository::create` 断言拿到 `AppError::Conflict`。
+
+### 修法三：测试夹具不留残
+
+`cleanup_operator` 走 API 而非 SQL，**顺序是先删用户后删角色**：删角色时"仍有 N 个用户使用该角色"
+会回 400，这条拒绝是有意设计——`user_roles` 的 ON DELETE CASCADE 会静默剥掉用户的角色，
+让人变成"没有任何角色"的用户而不自知。清理要顺着它的意思，而不是绕开它。
+
+守卫 `the_permission_code_fixtures_leave_no_holder_behind` 的范围从 `granted_temp_button`
+一支扩到两支。关键前置是给夹具加 `OPERATOR_FIXTURE_PREFIX = "opf_"`：
+不加就没法精确圈定（原命名与 `grantee_role_*`、`strong_role_*` 撞形状，
+守卫要么长期误报、要么被人加豁免，两者都等于没有守卫）。
+
+顺带清掉历史累积 181 角色 + 181 账号，库里角色数从 270 降到 87。
+
+### 缺陷注入验证（每处都做了，会红并回滚）
+
+| 注入 | 结果 |
+|---|---|
+| `demo.rs` 改回漏列的手写版 | 守卫当场红并**点名该端点** |
+| 抽掉 19 处夹具清理中的 1 处 | 对应测试**仍然通过**（泄漏是静默的），守卫红并点名 `opf_hr_role_c634c48b` / `opf_hr_user_d7b5b3b4` |
+| 三个归一函数全退回 `raw.to_string()` | 2 条集成测试红 |
+| **只去掉 `.to_lowercase()`，保留 trim** | 2 条红，且**红在大小写断言上**（隔离出"大小写"这一个属性） |
+| 约束名只认 `*_key` | `the_database_rejects_identities_differing_only_in_case` 红：`InternalServerError(... "users_username_lower_key")` |
+
+第一次注入只去掉小写时测试红在**别的地方**（trim 那一关），说明"大小写"这个属性
+其实没被单独覆盖，于是做了第二次更精确的注入。
+
+### 门禁结果（全绿）
+
+`cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` 0 warning /
+81 单元 / **133 集成 passed** / `pnpm lint` 0 errors / `pnpm typecheck` / `pnpm test` **161 passed** / `pnpm build`。
+CI run `37132068490` 三 job 全绿。
+
+---
+
 ## [0.18.0] - 2026-10-03
 
 主题：**创建账号的两个入口，规则停在七版之前。**

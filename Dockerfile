@@ -59,6 +59,14 @@ COPY --from=builder /app/target/release/axum-api /app/axum-api
 # 安全配置
 RUN chown -R app:app /app && chmod 500 /app/axum-api
 
+# 头像落盘目录（v0.20.0）
+#
+# 刻意在镜像里就建好并把属主设成 app：docker volume 挂载到一个**已存在**的
+# 目录时，会继承该目录的属主。挂到一个镜像里不存在的路径时，Docker 会按 root
+# 建目录 —— 于是挂上卷之后容器内的 app 用户写不进去，头像上传在运行时才报错。
+# 让"漏配挂载"这件事在启动时就被发现，而不是等第一个用户上传头像。
+RUN mkdir -p /app/uploads/avatars && chown -R app:app /app/uploads
+
 USER app
 
 # 探测真实健康端点（任一依赖不可用时返回 503）
@@ -66,5 +74,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/api/health || exit 1
 
 EXPOSE 8080
+
+# ⚠️ 必须挂卷，否则重建容器会丢掉所有头像
+VOLUME ["/app/uploads"]
 
 CMD ["/app/axum-api"]
