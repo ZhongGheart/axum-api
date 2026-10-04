@@ -11,8 +11,11 @@ import type {
   LoginRequest,
   LoginResponse,
   RegisterRequest,
+  RecoveryCodesResponse,
   RevokedOthers,
   RevokedSession,
+  TwoFactorSetup,
+  TwoFactorStatus,
   UpdateProfileRequest,
   UserInfo,
   UserSession,
@@ -101,5 +104,63 @@ export const authApi = {
    */
   revokeMyOtherSessions() {
     return http.post<RevokedOthers>('/auth/sessions/revoke-others')
+  },
+
+  // ── 两步验证（v0.25.0）──────────────────────────────────────
+
+  /**
+   * GET /api/auth/2fa — 当前用户的两步验证状态
+   */
+  twoFactorStatus() {
+    return http.get<TwoFactorStatus>('/auth/2fa')
+  },
+
+  /**
+   * POST /api/auth/2fa/setup — 生成密钥并返回扫码 URI
+   *
+   * **这一步不生效**：密钥只放在 Redis 待确认槽位里（15 分钟 TTL），
+   * 必须再调 enable 交一个 App 生成的码回来才落库。
+   */
+  setupTwoFactor() {
+    return http.post<TwoFactorSetup>('/auth/2fa/setup')
+  },
+
+  /**
+   * POST /api/auth/2fa/enable — 用 App 生成的码确认启用
+   *
+   * 返回的恢复码**明文只此一次**，之后不可再取。
+   */
+  enableTwoFactor(code: string) {
+    return http.post<RecoveryCodesResponse>('/auth/2fa/enable', { code })
+  },
+
+  /**
+   * POST /api/auth/2fa/disable — 关闭两步验证
+   *
+   * 要求出示**当前口令**：登录态本身可能就来自被盗设备，
+   * 只凭"已登录"就能关掉 2FA，会让这功能在最需要它的场景下形同虚设。
+   */
+  disableTwoFactor(password: string) {
+    return http.post<string>('/auth/2fa/disable', { password })
+  },
+
+  /**
+   * POST /api/auth/2fa/recovery-codes — 重新生成一批恢复码（旧码立即作废）
+   */
+  regenerateRecoveryCodes() {
+    return http.post<RecoveryCodesResponse>('/auth/2fa/recovery-codes')
+  },
+
+  /**
+   * POST /api/auth/2fa/verify — 登录第二步：交第二道因子换正式令牌
+   *
+   * 唯一的公开 2FA 端点：它持有挑战令牌，而挑战令牌本身就代表
+   * "口令已校验通过"，所以不需要再带 Authorization 头。
+   */
+  verifyTwoFactor(challengeToken: string, code: string) {
+    return http.post<LoginResponse>('/auth/2fa/verify', {
+      challenge_token: challengeToken,
+      code,
+    })
   },
 }

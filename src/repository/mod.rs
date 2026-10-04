@@ -9,4 +9,5 @@ pub mod dict;
 pub mod menu;
 pub mod role;
 pub mod setting;
+pub mod two_factor;
 pub mod user;

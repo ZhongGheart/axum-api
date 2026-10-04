@@ -93,6 +93,8 @@ pub struct AuthService {
     pub setting_service: SettingService,
     /// 审计仓储（登录/注册审计；见 [`Self::login`]）
     pub audit_repo: AuditLogRepository,
+    /// 两步验证服务（v0.25.0）
+    pub two_factor_service: crate::service::two_factor::TwoFactorService,
 }
 
 /// 一条待写的登录/注册审计
@@ -122,6 +124,8 @@ impl AuthService {
     const PATH_LOGIN: &'static str = "/api/auth/login";
     /// 注册路径（审计记录的 `path` 列）
     const PATH_REGISTER: &'static str = "/api/auth/register";
+    /// 二次验证路径（审计记录的 `path` 列）
+    const PATH_LOGIN_2FA: &'static str = "/api/auth/2fa/verify";
 
     /// 登录成功
     ///
@@ -131,6 +135,12 @@ impl AuthService {
     pub const ACTION_LOGIN_SUCCESS: &'static str = "AUTH_LOGIN_SUCCESS";
     /// 登录失败（含账号不存在 / 口令不符 / 账号停用 / 已锁定）
     pub const ACTION_LOGIN_FAILURE: &'static str = "AUTH_LOGIN_FAILURE";
+    /// 口令已通过、等待二次验证（v0.25.0）
+    ///
+    /// 单独一种动作而不是复用 `ACTION_LOGIN_SUCCESS`：这次登录**尚未完成**
+    /// （没有签发任何令牌），混进"登录成功"会让审计里的成功数虚高，
+    /// 也让"有多少人在用 2FA"这个问题答不出来。
+    pub const ACTION_LOGIN_PENDING_2FA: &'static str = "AUTH_LOGIN_PENDING_2FA";
     /// 注册成功
     pub const ACTION_REGISTER: &'static str = "AUTH_REGISTER";
 
@@ -157,6 +167,7 @@ impl AuthService {
         jwt_expiration_seconds: u64,
         audit_repo: AuditLogRepository,
         setting_service: SettingService,
+        two_factor_service: crate::service::two_factor::TwoFactorService,
     ) -> Self {
         Self {
             user_repo,
@@ -165,6 +176,7 @@ impl AuthService {
             jwt_expiration_seconds,
             setting_service,
             audit_repo,
+            two_factor_service,
         }
     }
 
@@ -418,6 +430,61 @@ impl AuthService {
             }
         }
 
+        // ── 两步验证闸门（v0.25.0）───────────────────────────────
+        //
+        // 放在**口令校验之后、签发令牌之前**。口令没过就没什么好问的
+        // （不能让 2FA 变成"账号是否存在"的探针）；令牌签发之后就问晚了。
+        //
+        // 这里**不登记会话、不清失败计数**：这次登录还没完成。
+        // 提前清零会让"拿到口令但过不了第二因子"的尝试看起来像成功登录过。
+        if self.two_factor_service.is_enabled(user.id).await? {
+            let challenge = self
+                .two_factor_service
+                .issue_challenge(
+                    redis_client,
+                    &crate::service::two_factor::PendingLogin {
+                        user_id: user.id,
+                        account_scope: account_scope.clone(),
+                        ip_scope: ip_scope.clone(),
+                    },
+                )
+                .await?;
+            self.audit(AuthAudit {
+                action: Self::ACTION_LOGIN_PENDING_2FA,
+                path: Self::PATH_LOGIN,
+                status_code: 200,
+                client_ip,
+                username: &user.username,
+                user_id: Some(user.id),
+                result: "口令校验通过，等待二次验证",
+            })
+            .await?;
+            return Ok(LoginResponse {
+                token: None,
+                token_type: "Bearer".to_string(),
+                must_change_password: false,
+                requires_2fa: true,
+                challenge_token: Some(challenge),
+            });
+        }
+
+        self.complete_login(&user, redis_client, client_ip, &account_scope, &ip_scope)
+            .await
+    }
+
+    /// 签发令牌并登记会话
+    ///
+    /// 从 [`Self::login`] 尾部抽出，供"口令直过"与"二次验证通过"两条路径共用。
+    /// 不抽成独立方法的话，第二条路径就得复制一遍"判受限令牌 → 签发 → 登记 → 审计"，
+    /// 而这几步里任何一处漏改（比如只改了登录路径的审计文案）都不会编译报错。
+    async fn complete_login(
+        &self,
+        user: &crate::model::user::User,
+        redis_client: &RedisClient,
+        client_ip: &str,
+        account_scope: &str,
+        ip_scope: &str,
+    ) -> Result<LoginResponse, AppError> {
         let roles = self.role_repo.find_roles_by_user_id(user.id).await?;
 
         tracing::debug!("用户 {} 拥有的角色: {:?}", user.username, roles);
@@ -453,7 +520,7 @@ impl AuthService {
             )
             .map_err(|e| AppError::InternalServerError(format!("JWT 签发失败: {e}")))?;
 
-        self.clear_login_failures(redis_client, &account_scope, &ip_scope)
+        self.clear_login_failures(redis_client, account_scope, ip_scope)
             .await;
 
         // 登记会话（"谁在线"的唯一数据来源）。
@@ -496,10 +563,61 @@ impl AuthService {
         tracing::info!("用户登录成功: {}", user.username);
 
         Ok(LoginResponse {
-            token,
+            token: Some(token),
             token_type: "Bearer".to_string(),
             must_change_password,
+            requires_2fa: false,
+            challenge_token: None,
         })
+    }
+
+    /// 二次验证通过后的登录收尾（v0.25.0）
+    ///
+    /// 与 [`Self::complete_login`] 的差别只有两点：先校验第二道因子，
+    /// 以及失败计数走 2FA 自己的 scope。其余（受限令牌判定、签发、登记、审计）
+    /// 全部复用，因此不会出现"两条路径的登录语义不一致"。
+    pub async fn complete_two_factor_login(
+        &self,
+        redis_client: &RedisClient,
+        challenge_token: &str,
+        code: &str,
+        client_ip: &str,
+    ) -> Result<LoginResponse, AppError> {
+        let pending = match self
+            .two_factor_service
+            .verify_challenge(redis_client, challenge_token, code)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                self.audit(AuthAudit {
+                    action: Self::ACTION_LOGIN_FAILURE,
+                    path: Self::PATH_LOGIN_2FA,
+                    status_code: 400,
+                    client_ip,
+                    username: "-",
+                    user_id: None,
+                    result: "二次验证未通过",
+                })
+                .await?;
+                return Err(e);
+            }
+        };
+
+        let user = self.user_repo.find_by_id(pending.user_id).await?;
+        // 挑战令牌最长活 5 分钟：期间账号可能已被停用。
+        // 不复查就发令牌，等于给"刚被停用的账号"开了一个 5 分钟的后门。
+        if !user.is_active {
+            return Err(AppError::Forbidden);
+        }
+        self.complete_login(
+            &user,
+            redis_client,
+            client_ip,
+            &pending.account_scope,
+            &pending.ip_scope,
+        )
+        .await
     }
 
     /// 用户登出：只注销当前令牌（jti）

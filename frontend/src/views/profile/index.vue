@@ -227,6 +227,16 @@
           </div>
         </n-card>
       </n-grid-item>
+
+      <!--
+        两步验证（v0.25.0）
+
+        放在登录会话之后而不是账号信息里：它是"给自己加一道锁"，
+        和会话管理同属账号安全，混进基本资料里容易被当成一个字段忽略。
+      -->
+      <n-grid-item span="2 m:1">
+        <TwoFactorCard />
+      </n-grid-item>
     </n-grid>
   </div>
 </template>
@@ -256,6 +266,7 @@ import { passwordIssues } from '@/utils/password'
 import { passwordMaxLength, passwordPlaceholder } from '@/utils/accountRules'
 import { useSettingStore } from '@/stores/setting'
 import BaseUpload from '@/components/common/BaseUpload.vue'
+import TwoFactorCard from '@/components/security/TwoFactorCard.vue'
 import { resolveAvatarUrl } from '@/utils/avatar'
 import type { UserInfo, UserSession } from '@/api/types/response'
 

@@ -71,3 +71,8 @@ axum-extra = { version = "0.10", features = ["typed-header"] }
 sysinfo = "0.33"
 # OpenAPI 规范由代码生成（handler 注解 + DTO 派生）
 utoipa = { version = "5.5.0", features = ["axum_extras", "uuid", "chrono"] }
+totp-rs = { version = "6", features = ["gen_secret", "otpauth"] }
+aes-gcm = "0.10"
+base32 = "0.5.1"
+getrandom = "0.3"
+base64 = "0.22"

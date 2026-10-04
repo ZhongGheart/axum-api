@@ -123,7 +123,13 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct LoginResponse {
     /// JWT 访问令牌
-    pub token: String,
+    ///
+    /// **`requires_2fa` 为真时为 `None`**——此时还没签发任何令牌。
+    /// 刻意不用空串：空串是一个"看起来有效"的令牌，
+    /// 调用方漏判 `requires_2fa` 时会拿着它去请求，
+    /// 然后在某个更远的地方收到一个语焉不详的 401。
+    /// `None` 会让它在本地就炸掉，错误发生得更靠近真正的原因。
+    pub token: Option<String>,
     /// 令牌类型
     pub token_type: String,
     /// 令牌是否为"受限令牌"（用户须先改密）
@@ -133,6 +139,16 @@ pub struct LoginResponse {
     /// 只靠前端跳转就等于把权限校验交给界面，
     /// 与 v0.10.0 关掉的"界面替后端承诺"是同一类错误。
     pub must_change_password: bool,
+    /// 是否需要第二步验证（v0.25.0）
+    ///
+    /// 为真时 `token` 为 `None`，需带着 `challenge_token` 调
+    /// `POST /api/auth/2fa/verify` 换取真正的令牌。
+    pub requires_2fa: bool,
+    /// 二步验证挑战令牌（仅 `requires_2fa` 为真时存在）
+    ///
+    /// **不是 JWT**：它只是一个 Redis 里 5 分钟一次性、
+    /// 用完即删的随机串，泄露了也无法当作访问令牌使用。
+    pub challenge_token: Option<String>,
 }
 
 /// 自助修改密码请求体

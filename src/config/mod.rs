@@ -118,6 +118,13 @@ pub struct Config {
     pub server_addr: SocketAddr,
     /// JWT 密钥
     pub jwt_secret: String,
+    /// 两步验证密钥的加密密钥（AES-256-GCM）
+    ///
+    /// **不设为必填是有意的**：v0.25.0 之前的所有部署都没有这个变量，
+    /// 若改成必填，一次发版就会让所有存量实例起不来——而"多一个部署前置条件"
+    /// 是需要单独决策的事（与 v0.24.0 未排期的邮件通道同一性质）。
+    /// 未设置时从 `JWT_SECRET` 派生（带独立前缀），并在启动日志里告警。
+    pub totp_encryption_key: String,
     /// JWT 过期时间（秒）
     pub jwt_expiration_seconds: u64,
     /// CORS 允许的来源
@@ -173,6 +180,23 @@ impl Config {
             .unwrap_or_else(|_| "604800".to_string())
             .parse()
             .expect("JWT_EXPIRATION_SECONDS 必须是有效的数字");
+
+        // ── 两步验证密钥的加密密钥 ──────────────────────────────
+        //
+        // 未设置时从 JWT_SECRET 派生，**并加独立前缀**：直接复用 JWT_SECRET
+        // 原文会让"轮换 JWT 密钥"这个运维动作静默地让所有已绑定用户的
+        // TOTP 密钥永久不可解（本仓没有邮件通道，他们无法自助重绑）。
+        // 加前缀派生至少把两把密钥在域上分开，也让派生过程可审计。
+        let (totp_encryption_key, totp_key_derived) = match env::var("TOTP_ENCRYPTION_KEY") {
+            Ok(key) => (key, false),
+            Err(_) => (format!("derived:{jwt_secret}"), true),
+        };
+        if totp_key_derived {
+            tracing::warn!(
+                "TOTP_ENCRYPTION_KEY 未设置，两步验证密钥的加密密钥已从 JWT_SECRET 派生；\
+                 建议显式配置独立密钥，否则轮换 JWT_SECRET 会使已绑定用户的 2FA 失效"
+            );
+        }
 
         let cors_allowed_origins: Vec<String> = env::var("CORS_ALLOWED_ORIGINS")
             .unwrap_or_else(|_| "http://localhost:3000".to_string())
@@ -301,6 +325,7 @@ impl Config {
         Self {
             server_addr,
             jwt_secret,
+            totp_encryption_key,
             jwt_expiration_seconds,
             cors_allowed_origins,
             redis,

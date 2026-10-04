@@ -6,3 +6,4 @@ pub mod department;
 pub mod monitor;
 pub mod rbac;
 pub mod setting;
+pub mod two_factor;

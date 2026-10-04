@@ -9,4 +9,5 @@ pub mod monitor;
 pub mod rbac;
 pub mod role;
 pub mod setting;
+pub mod two_factor;
 pub mod user;

@@ -430,6 +430,57 @@ impl RedisClient {
         Ok(())
     }
 
+    /// **原子**地取值并删除（`GETDEL`，Redis 6.2+）
+    ///
+    /// 给"一次性令牌"用：2FA 挑战令牌必须"用一次就作废"。
+    /// 先 `GET` 再 `DEL` 的写法在并发下会把同一个令牌用掉两次——
+    /// 而这个令牌代表的正是"口令已验证通过"这个中间结论，
+    /// 重复使用等于把 2FA 降级成可重放的一次性口令。
+    /// 值不存在时返回 `Ok(None)`（过期与不存在无法也不必区分）。
+    pub async fn take_string(&self, key: &str) -> Result<Option<String>> {
+        let mut conn = self.conn.clone();
+        let value: Option<String> = conn.get_del(key).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis GETDEL 失败: {e}"))
+        })?;
+        Ok(value)
+    }
+
+    /// 认领一个 TOTP 时间步：`step` 必须严格大于该用户已用过的最大步
+    ///
+    /// RFC 6238 §5.2 要求"一个码只被接受一次"，而 TOTP 本身不提供这个保证。
+    /// 没有这道闸，同一个 6 位码在它 90 秒的有效期（step ± 1）内能被反复用于登录，
+    /// 等于把第二因子降级成一个可重放的一次性口令。
+    ///
+    /// 用 Lua 保证"比较并写入"是原子的：分成 `GET` + `SET` 两步的话，
+    /// 两个并发请求会同时看到旧值并同时通过。
+    /// 只记**最大步**而不是已用步集合，是因为验证码随时间单调递增，
+    /// 记住最大步就等价于记住所有已用步（更早的码本来就已过期）。
+    ///
+    /// 记录无 TTL 是有意的：这个键很小（每用户几十字节），
+    /// 而设 TTL 意味着"用户恰好在 TTL 边界后重放了一个旧码"能被通过。
+    /// 它的值随时间单调增长，长期稳定。
+    pub async fn claim_totp_step(&self, user_id: &uuid::Uuid, step: u64) -> Result<bool> {
+        const SCRIPT: &str = r#"
+            local last = redis.call('GET', KEYS[1])
+            if last and tonumber(last) >= tonumber(ARGV[1]) then
+                return 0
+            end
+            redis.call('SET', KEYS[1], ARGV[1])
+            return 1
+        "#;
+        let key = format!("2fa:last_step:{user_id}");
+        let mut conn = self.conn.clone();
+        let claimed: i32 = redis::Script::new(SCRIPT)
+            .key(key)
+            .arg(step)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| {
+                crate::error::AppError::InternalServerError(format!("TOTP 防重放校验失败: {e}"))
+            })?;
+        Ok(claimed == 1)
+    }
+
     /// 删除任意键（用于字典等业务缓存失效）
     pub async fn delete_key(&self, key: &str) -> Result<()> {
         let mut conn = self.conn.clone();

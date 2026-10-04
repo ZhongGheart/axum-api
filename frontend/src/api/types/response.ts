@@ -18,9 +18,18 @@ export interface LoginRequest {
   password: string
 }
 
-/** 登录响应 */
+/**
+ * 登录响应（v0.25.0 起为两态）
+ *
+ * `requires_2fa === false` 时 `token` 一定有值；
+ * `requires_2fa === true` 时 `token` 为 `null`，改用 `challenge_token`
+ * 去 `/api/auth/2fa/verify` 换正式令牌。
+ *
+ * 后端刻意用 `null` 而不是空串表示"这次不发令牌"：空串长得像一个
+ * 能用的令牌，会一路飘到 `Authorization: Bearer ` 上再变成一条难懂的 401。
+ */
 export interface LoginResponse {
-  token: string
+  token: string | null
   token_type: string
   /**
    * 令牌是否为"受限令牌"（用户须先改初始密码）
@@ -29,6 +38,10 @@ export interface LoginResponse {
    * 不能当作安全边界。
    */
   must_change_password: boolean
+  /** 口令已通过，但账号绑了两步验证，需要再交第二道因子 */
+  requires_2fa: boolean
+  /** 二次验证用的挑战令牌，一次性、5 分钟有效 */
+  challenge_token: string | null
 }
 
 /** 注册请求 */
@@ -197,6 +210,41 @@ export interface ImportUsersResult {
 export interface ChangePasswordRequest {
   old_password: string
   new_password: string
+}
+
+// ── 两步验证（v0.25.0）────────────────────────────────────────
+
+/** 当前两步验证状态 */
+export interface TwoFactorStatus {
+  enabled: boolean
+  /** 生效时间；未启用为 null */
+  enabled_at: string | null
+  /** 剩余可用恢复码数量 */
+  recovery_codes_remaining: number
+}
+
+/**
+ * 绑定第一步的返回
+ *
+ * **此时密钥尚未生效**：用户在 App 里扫码不构成"绑定成功"，
+ * 必须再调 enable 交一个 App 生成的码回来，才落库。
+ */
+export interface TwoFactorSetup {
+  /** Base32 密钥，供 App 手动输入（扫码失败时的兜底） */
+  secret: string
+  /** `otpauth://` URI，渲染二维码用 */
+  provisioning_uri: string
+}
+
+/** 一次性恢复码批次 */
+export interface RecoveryCodesResponse {
+  /**
+   * 恢复码明文
+ *
+   * **只在生成这一次返回**，之后任何接口都取不回（库里只有 SHA-256 摘要）。
+ * 界面必须让用户复制保存后再关掉，不能静默关掉弹窗。
+ */
+  recovery_codes: string[]
 }
 
 /** 分页请求参数 */

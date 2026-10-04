@@ -14,7 +14,9 @@ use tower_http::trace::TraceLayer;
 // Swagger UI 通过前端 iframe + CDN 渲染
 
 use crate::config::{AuditLogConfig, Config, UploadConfig};
-use crate::controller::{auth, demo, department, dict, menu, monitor, rbac, role, setting, user};
+use crate::controller::{
+    auth, demo, department, dict, menu, monitor, rbac, role, setting, two_factor, user,
+};
 use crate::docs::swagger_ui_handler;
 use crate::error::AppError;
 use crate::middleware::api_metrics::{api_metrics_mw, MetricsCollector};
@@ -29,6 +31,7 @@ use crate::repository::dict::DictRepository;
 use crate::repository::menu::MenuRepository;
 use crate::repository::role::RoleRepository;
 use crate::repository::setting::SettingRepository;
+use crate::repository::two_factor::TwoFactorRepository;
 use crate::repository::user::UserRepository;
 use crate::service::auth::AuthService;
 use crate::service::rbac::RbacService;
@@ -48,6 +51,8 @@ pub struct AppState {
     pub department_repo: DepartmentRepository,
     /// 部门服务（v0.24.0）
     pub department_service: crate::service::department::DepartmentService,
+    /// 两步验证服务（v0.25.0）
+    pub two_factor_service: crate::service::two_factor::TwoFactorService,
     pub dict_repo: DictRepository,
     pub audit_log_repo: AuditLogRepository,
     pub db_pool: DatabasePool,
@@ -115,6 +120,12 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
             login_failure_window_seconds: config.security.login_failure_window_seconds,
         },
     );
+    // 密钥加密用的配置在构造时就取好，避免每个端点自己去读环境变量
+    let two_factor_service = crate::service::two_factor::TwoFactorService::new(
+        TwoFactorRepository::new(pool.clone()),
+        config.totp_encryption_key.clone(),
+        setting_service.clone(),
+    );
     let auth_service = AuthService::new(
         user_repo,
         role_repo.clone(),
@@ -122,6 +133,7 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         config.jwt_expiration_seconds,
         audit_log_repo.clone(),
         setting_service.clone(),
+        two_factor_service.clone(),
     );
     let department_service =
         crate::service::department::DepartmentService::new(department_repo.clone());
@@ -132,6 +144,7 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
     let state = AppState {
         auth_service,
         jwt_util: Arc::clone(&jwt_util),
+        two_factor_service,
         redis_client: Arc::clone(&redis_client),
         menu_repo,
         department_service,
@@ -183,6 +196,8 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         .route("/api/health", get(auth::health))
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
+        // 登录第二步：凭挑战令牌换正式令牌（挑战令牌本身即代表口令已通过）
+        .route("/api/auth/2fa/verify", post(two_factor::verify))
         // 口令策略对**未登录**页面公开：注册页需要它来提示要求，
         // 否则用户只能在提交失败后从报错里反推。
         // 返回体只含四条"设口令时必须知道"的规则，不含锁定阈值。
@@ -251,6 +266,15 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         )
         // 当前用户的导航菜单：前端据此动态生成路由与侧栏
         .route("/api/auth/menus", get(crate::controller::menu::my_menus))
+        // 两步验证自助端点（v0.25.0）：全部只作用于当前登录用户
+        .route("/api/auth/2fa", get(two_factor::status))
+        .route("/api/auth/2fa/setup", post(two_factor::setup))
+        .route("/api/auth/2fa/enable", post(two_factor::enable))
+        .route("/api/auth/2fa/disable", post(two_factor::disable))
+        .route(
+            "/api/auth/2fa/recovery-codes",
+            post(two_factor::regenerate_recovery_codes),
+        )
         // 当前用户的权限码：前端 v-permission 据此判定按钮级权限
         .route(
             "/api/auth/permissions",

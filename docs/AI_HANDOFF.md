@@ -6098,3 +6098,100 @@ v0.24.0 是 B1 部门树，单独占一版。
 - 导入 `departmentApi`，新增 `loadDepts` 函数。
 
 **门禁**：前端 lint 0 error / typecheck / 203 passed / build。
+
+---
+
+## 2026-10-04 v0.25.0 进行中：2FA / TOTP（C1）
+
+**基线**：`701b219e`（v0.24.0 用户管理分配部门），工作区干净，master 未推送若干提交。
+
+**目标**：兑现 ROADMAP 的 v0.25.0 —— TOTP 两步验证。
+
+**关键设计决策**：
+
+1. **登录分两步，不把 2FA 塞进 login 请求体**。
+   口令通过后返回 `requires_2fa=true` + `challenge_token`（Redis 存，5min 一次性，
+   非 JWT，泄露不能当访问令牌用），前端跳二次验证页，验通才签发正式令牌。
+   理由：避免"口令+验证码"同请求体导致验证码被日志/审计重复记录，
+   也让登录失败语义保持不变（口令错仍是 401，2FA 错是另一类）。
+
+2. **密钥不落明文**。`users.totp_secret_enc` 用 AES-256-GCM 存，
+   密钥来自新增 `TOTP_ENCRYPTION_KEY` 环境变量，启动校验长度（32 字节）。
+
+3. **恢复码只存摘要**。8 个一次性码，SHA-256 后存 `totp_recovery_codes`，用掉即删。
+
+**影响文件**：新增 migration 019、`src/utils/totp.rs`、
+`src/service/two_factor.rs`、`src/controller/two_factor.rs`、
+model/router/docs 接线、前端 profile + login + router。
+
+### 关键设计决策（接上文，做的时候才想清楚的几条）
+
+4. **`TOTP_ENCRYPTION_KEY` 刻意不做必填**。未设置时从 `JWT_SECRET` 加独立前缀
+   `derived:` 派生并告警。理由：v0.25.0 之前的部署都没有这个变量，改必填会让
+   存量实例直接起不来。沿用仓库既有原则（新增配置项一律可选 + 告警）。
+
+5. **防重放用 Redis Lua**。`totp-rs` 的 `check` 返回命中的时间步，
+   `claim_totp_step` 用 Lua 做"比较并写入"的原子操作并记最大步，
+   实现 RFC 6238 §5.2 的"一码一次"。
+
+6. **二次验证失败按用户限速**（`2fa-user:{id}`）而不是按 IP，
+   阈值复用 `login_max_failures` / `login_failure_window_seconds`。
+
+7. **`LoginResponse.token` 改成 `Option<String>`**，新增 `requires_2fa` /
+   `challenge_token`。用 `null` 而不是空串——空串长得像一个能用的令牌。
+   登录尾部抽成私有方法 `complete_login`，供"口令直过"与"二次验证通过"共用。
+
+### 本轮踩到并已修掉的坑
+
+**`enable` 输错码会吃掉待确认密钥。** 最初用 `take_string`（读并删）取待确认密钥，
+输错一次密钥就没了，用户必须重新扫码——而"输错重试"恰恰是最常见的操作。
+改为先 `get_string` 校验，**成功落库后**才 `take_string`。
+
+### 里程碑：后端完成
+
+新增 `migrations/019_user_two_factor.sql`、`src/utils/totp.rs`、
+`src/repository/two_factor.rs`、`src/model/two_factor.rs`、
+`src/service/two_factor.rs`、`src/controller/two_factor.rs`；
+改动 config / redis / auth / router / docs / model.user。
+
+新增依赖：`totp-rs 6`（Builder API；`check_current` 返回命中步）、`aes-gcm`、
+`base32`、`base64`、`getrandom`。曾加 `rand@0.10` 又移除——0.10 的 `TryRngCore`
+让取随机数变得可失败，不如 `getrandom::fill` 直接。
+
+11 条集成测试：绑定需有效码、密文非明文、登录停在第二步、挑战令牌一次性、
+同一码不可重放、恢复码替代且一次性、重生成作废旧批、关闭需口令、失败锁定。
+
+### 里程碑：前端完成
+
+- `api/types/response.ts`：`LoginResponse` 两态化 + 2FA 类型
+- `api/auth.ts`：6 个 2FA 端点
+- `stores/user.ts`：抽出 `applyToken`；`login` 遇 `requires_2fa` **不写本地状态**，
+  新增 `completeTwoFactorLogin`。两条路径汇流到同一个 `applyToken`——
+  分开各写一遍后，典型症状是某天加字段只改了一边
+- `views/login/index.vue`：第二步界面。**不复用第一步的表单**——
+  口令已通过还让人在同一屏改口令，只会以为"刚才输错了"。
+  动态码走 `n-input-otp`，恢复码走普通输入框（长度与字符集都不同）
+- `components/security/TwoFactorCard.vue`：绑定三段式
+  （setup 拿密钥 → 扫码 → enable 交码落库）。少了中间那步，
+  "我扫了但 App 说密钥无效"就是用户自己解不开的死结
+- `utils/twoFactor.ts`：恢复码归一化（**必须与后端 `hash_recovery_code` 同规则**，
+  手抄回来的码带空格换行是常态）、密钥分组、二维码渲染
+- 二维码**在前端渲染**（新增 `qrcode`）：后端出图要走 `image` crate，
+  为画一张图引整个二进制依赖树不划算
+- 恢复码弹窗禁用遮罩点击与 ESC，并给复制/下载两条出路：
+  不给出路的话用户多半直接点掉然后再也回不来（库里只有 SHA-256 摘要）
+- 关闭 2FA 要求出示当前密码：登录态本身可能来自被盗设备
+
+### 门禁（本轮实测）
+
+后端：`cargo fmt` / `cargo clippy --all-targets` 0 warning /
+`cargo test --lib` **129 passed** /
+`cargo test --test api_integration` **210 passed 0 failed**（248s）
+
+前端：`pnpm lint` 0 error（1 个 `env.d.ts` 历史 warning）/ `pnpm typecheck` /
+`pnpm test` **212 passed**（203 基线 +9）/ `pnpm build`
+
+### 下一步
+
+本地提交（**不推送、不打 tag**），等用户指令。
+版号抬到 0.25.0 与打 tag 属于"发布"动作，按惯例等用户单独下指令。

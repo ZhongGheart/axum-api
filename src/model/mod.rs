@@ -8,6 +8,7 @@ pub mod permission;
 pub mod response;
 pub mod role;
 pub mod setting;
+pub mod two_factor;
 pub mod user;
 
 pub use audit_log::*;
@@ -18,4 +19,5 @@ pub use permission::*;
 pub use response::*;
 pub use role::*;
 pub use setting::*;
+pub use two_factor::*;
 pub use user::*;

@@ -7,6 +7,7 @@ pub mod jwt;
 pub mod pagination;
 pub mod password;
 pub mod redis;
+pub mod totp;
 pub mod upload;
 pub mod user_import;
 pub mod validation;

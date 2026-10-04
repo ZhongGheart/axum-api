@@ -5,7 +5,7 @@
  */
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import type { LoginRequest, UserInfo } from '@/api/types/response'
+import type { LoginRequest, LoginResponse, UserInfo } from '@/api/types/response'
 import { authApi } from '@/api/auth'
 import { handleError } from '@/api/helper'
 import { getToken, removeToken, setToken, setUserInfo, removeUserInfo, getUserInfo } from '@/utils/storage'
@@ -37,20 +37,28 @@ export const useUserStore = defineStore('user', () => {
 
   // ── 登录 ──────────────────────────────────────────────────────
 
-  async function login(req: LoginRequest) {
+  /**
+   * 第一步：提交口令
+   *
+   * **不一定拿到令牌**（v0.25.0 起）：账号若绑了两步验证，后端在这里
+   * 就停下并回一个挑战令牌，正式令牌要拿挑战令牌再换。因此这里的
+   * 成功分支有两种，调用方（登录页）必须看 `requires_2fa` 决定下一步。
+   *
+   * 只有确实拿到令牌时才写本地状态——先把 `token` 写成空串再走分支，
+   * 会让中间态被路由守卫当成"已登录"又当成"未登录"。
+   */
+  async function login(req: LoginRequest): Promise<LoginResponse | undefined> {
     try {
       // 口令经 HTTPS 明文提交，服务端用 Argon2 存储（不再做客户端预哈希）
-      const res = await authApi.login({
+      const data = (await authApi.login({
         username: req.username,
         password: req.password,
-      })
+      })) as unknown as LoginResponse
 
-      const data = res as unknown as { token: string; token_type: string }
-      token.value = data.token
-      setToken(data.token)
-      isLoggedIn.value = true
-      mustChangePassword.value =
-        (data as unknown as { must_change_password?: boolean }).must_change_password === true
+      // 需要二次验证：只把挑战令牌交回调用方，本地会话状态一概不动
+      if (data.requires_2fa) return data
+
+      applyToken(data)
       // 换账号后不得复用上一会话的 GET 缓存
       requestCache.invalidate()
 
@@ -58,6 +66,41 @@ export const useUserStore = defineStore('user', () => {
     } catch (error) {
       handleError(error)
     }
+  }
+
+  /**
+   * 第二步：交第二道因子换正式令牌（v0.25.0）
+   *
+   * 成功后与口令直通的路径汇流到同一个 `applyToken`，两条路径
+   * 之后的本地状态**不应该有任何差别**。
+   */
+  async function completeTwoFactorLogin(
+    challengeToken: string,
+    code: string,
+  ): Promise<LoginResponse | undefined> {
+    try {
+      const data = (await authApi.verifyTwoFactor(challengeToken, code)) as unknown as LoginResponse
+      if (data.requires_2fa || !data.token) return undefined
+      applyToken(data)
+      requestCache.invalidate()
+      return data
+    } catch (error) {
+      handleError(error)
+    }
+  }
+
+  /**
+   * 把后端签发的令牌落到本地会话状态
+   *
+   * 口令直通与二次验证通过共用，避免两条路径各写一遍后**慢慢长歪**
+   * （典型症状：某天加了个字段只改了一边，受限账号登录后行为不同）。
+   */
+  function applyToken(data: LoginResponse) {
+    if (!data.token) return
+    token.value = data.token
+    setToken(data.token)
+    isLoggedIn.value = true
+    mustChangePassword.value = data.must_change_password === true
   }
 
   // ── 登出 ──────────────────────────────────────────────────────
@@ -131,6 +174,7 @@ export const useUserStore = defineStore('user', () => {
     isLoggedIn,
     mustChangePassword,
     login,
+    completeTwoFactorLogin,
     logout,
     clearLocalSession,
     applyUserInfo,

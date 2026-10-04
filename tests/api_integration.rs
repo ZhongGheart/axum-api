@@ -47,6 +47,8 @@ fn test_config(login_max_failures: u64) -> Config {
         server_addr: "127.0.0.1:0".parse().unwrap(),
         jwt_secret: std::env::var("TEST_JWT_SECRET")
             .unwrap_or_else(|_| "integration-test-secret-value-0123456789".to_string()),
+        // 固定值：集成测试要能重复解出同一批用户已绑定的密钥
+        totp_encryption_key: "integration-test-totp-key-0123456789ab".to_string(),
         jwt_expiration_seconds: 3600,
         cors_allowed_origins: vec!["http://localhost:3000".to_string()],
         redis: RedisConfig {
@@ -14485,4 +14487,632 @@ async fn the_registration_gate_runs_before_any_validation() {
 
     put_setting_raw(KEY_REGISTRATION_ENABLED, "true", None).await;
     flush_settings_cache().await;
+}
+
+// ──────────────────────────────────────────────
+// 两步验证（v0.25.0）
+// ──────────────────────────────────────────────
+
+/// 取当前时刻的合法 TOTP 码
+///
+/// 用被测代码自己的 `code_at` 生成，而不是在测试里另写一份 HMAC-SHA1：
+/// 那样测的是"测试里的 TOTP 实现"与"服务里的 TOTP 实现"是否一致，
+/// 而不是"用户从 App 里看到的码能不能登进来"。
+fn current_totp(secret: &str) -> String {
+    axum_api::utils::totp::code_at(secret, chrono::Utc::now().timestamp() as u64).unwrap()
+}
+
+/// 建一个干净的用户（无 2FA），返回用户名与登录令牌
+async fn fresh_user_with_token(app: &Router, role: &str) -> (String, String) {
+    let username = unique("tf");
+    let admin = admin_token(app).await;
+    let (status, body) = create_user_via_api(app, &admin, &username, role).await;
+    assert_eq!(status, StatusCode::OK, "建号失败: {body}");
+    let token = login_token(app, &username, "user1234").await;
+    (username, token)
+}
+
+/// 把某个用户的 2FA 状态清干净（含恢复码），避免用例之间互相影响
+async fn reset_two_factor(username: &str) {
+    sqlx::query(
+        "UPDATE users SET totp_secret_enc = NULL, totp_enabled_at = NULL WHERE username = $1",
+    )
+    .bind(username)
+    .execute(&pool().await)
+    .await
+    .expect("重置 2FA 状态失败");
+    sqlx::query(
+        "DELETE FROM user_two_factor_recovery WHERE user_id = \
+         (SELECT id FROM users WHERE username = $1)",
+    )
+    .bind(username)
+    .execute(&pool().await)
+    .await
+    .expect("清理恢复码失败");
+}
+
+/// 走完绑定流程，返回密钥明文与恢复码
+async fn bind_two_factor(app: &Router, token: &str) -> (String, Vec<String>) {
+    let (status, body) = send(
+        app,
+        request("POST", "/api/auth/2fa/setup", Some(token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "setup 失败: {body}");
+    let secret = body["data"]["secret"].as_str().unwrap().to_string();
+    assert!(
+        body["data"]["provisioning_uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("otpauth://totp/"),
+        "provisioning_uri 格式不对: {body}"
+    );
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/auth/2fa/enable",
+            Some(token),
+            Some(json!({ "code": current_totp(&secret) })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "enable 失败: {body}");
+    let codes: Vec<String> = body["data"]["recovery_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    (secret, codes)
+}
+
+/// 未绑定时状态必须是"未启用"，且自助端点必须要求登录
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn two_factor_starts_disabled_and_endpoints_require_auth() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+
+    let (status, body) = send(&app, request("GET", "/api/auth/2fa", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["enabled"], false);
+    assert_eq!(body["data"]["recovery_codes_remaining"], 0);
+
+    // 匿名不得读写任何人的 2FA 状态
+    for (method, path) in [
+        ("GET", "/api/auth/2fa"),
+        ("POST", "/api/auth/2fa/setup"),
+        ("POST", "/api/auth/2fa/recovery-codes"),
+    ] {
+        let (status, _) = send(&app, request(method, path, None, None)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} 未拦截匿名"
+        );
+    }
+}
+
+/// 绑定必须用 App 生成的码确认；输错则不生效
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn binding_only_takes_effect_after_a_valid_code() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/auth/2fa/setup", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let secret = body["data"]["secret"].as_str().unwrap().to_string();
+
+    // 错码：不得生效
+    let wrong = if secret.as_bytes()[0] == b'0' {
+        "111111"
+    } else {
+        "000000"
+    };
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/enable",
+            Some(&token),
+            Some(json!({ "code": wrong })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = send(&app, request("GET", "/api/auth/2fa", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["enabled"], false,
+        "错码后 2FA 竟已生效，用户会被自己锁在门外"
+    );
+
+    // 未确认的密钥不该落库
+    let has_secret: (bool,) =
+        sqlx::query_as("SELECT totp_secret_enc IS NOT NULL FROM users WHERE username = $1")
+            .bind(&username)
+            .fetch_one(&pool().await)
+            .await
+            .unwrap();
+    assert!(!has_secret.0, "未确认的密钥不该写进 users 表");
+
+    // 正确码：生效并给恢复码
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/enable",
+            Some(&token),
+            Some(json!({ "code": current_totp(&secret) })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["recovery_codes"].as_array().unwrap().len(), 8);
+
+    let (_status, body) = send(&app, request("GET", "/api/auth/2fa", Some(&token), None)).await;
+    assert_eq!(body["data"]["enabled"], true);
+    assert_eq!(body["data"]["recovery_codes_remaining"], 8);
+}
+
+/// 密钥必须密文存储
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn totp_secret_is_never_stored_in_plaintext() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/auth/2fa/setup", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let secret = body["data"]["secret"].as_str().unwrap().to_string();
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/enable",
+            Some(&token),
+            Some(json!({ "code": current_totp(&secret) })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let blob: (Option<Vec<u8>>,) =
+        sqlx::query_as("SELECT totp_secret_enc FROM users WHERE username = $1")
+            .bind(&username)
+            .fetch_one(&pool().await)
+            .await
+            .unwrap();
+    let blob = blob.0.expect("启用后应有密钥");
+    assert_ne!(
+        blob.as_slice(),
+        secret.as_bytes(),
+        "密钥以明文入库：数据库泄露即等于所有账号失守"
+    );
+    // 密文里也不该夹带明文片段
+    assert!(
+        !blob
+            .windows(secret.len().min(8))
+            .any(|w| w == &secret.as_bytes()[..secret.len().min(8)]),
+        "密文中出现了密钥明文片段"
+    );
+    reset_two_factor(&username).await;
+}
+
+/// 绑定后登录必须停在第二道因子前，且**不下发**任何令牌
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn bound_user_login_is_held_at_the_second_factor() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+    bind_two_factor(&app, &token).await;
+
+    let (status, body) = login(&app, &username, "user1234").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["requires_2fa"], true, "{body}");
+    assert!(
+        body["data"]["token"].is_null(),
+        "二次验证前竟下发了令牌：{body}"
+    );
+    assert!(
+        body["data"]["challenge_token"].is_string(),
+        "缺少挑战令牌：{body}"
+    );
+
+    // 拿不到令牌就不该能访问受保护资源
+    let (status, _) = send(&app, request("GET", "/api/auth/me", None, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    reset_two_factor(&username).await;
+}
+
+/// 通过第二道因子后换到可用的令牌
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn second_factor_exchanges_the_challenge_for_a_working_token() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+    let (secret, _) = bind_two_factor(&app, &token).await;
+
+    let (_, body) = login(&app, &username, "user1234").await;
+    let challenge = body["data"]["challenge_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/verify",
+            None,
+            Some(json!({ "challenge_token": challenge, "code": current_totp(&secret) })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["requires_2fa"], false);
+    let new_token = body["data"]["token"].as_str().unwrap().to_string();
+
+    // 这个令牌必须真的能用
+    let (status, body) = send(&app, request("GET", "/api/auth/me", Some(&new_token), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["username"], username);
+
+    reset_two_factor(&username).await;
+}
+
+/// 挑战令牌一次性：同一令牌不能换出第二个令牌
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn challenge_token_is_single_use() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+    let (secret, _) = bind_two_factor(&app, &token).await;
+
+    let (_, body) = login(&app, &username, "user1234").await;
+    let challenge = body["data"]["challenge_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let payload = json!({ "challenge_token": challenge, "code": current_totp(&secret) });
+
+    let (status, _) = send(
+        &app,
+        request("POST", "/api/auth/2fa/verify", None, Some(payload.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 换一个新的 TOTP 码再来一次：码是对的，但令牌已作废
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/auth/2fa/verify", None, Some(payload)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "挑战令牌被重复使用：{body}"
+    );
+
+    reset_two_factor(&username).await;
+}
+
+/// 同一个动态码不能重放（RFC 6238 §5.2）
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_same_totp_code_cannot_be_replayed() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+    let (secret, _) = bind_two_factor(&app, &token).await;
+
+    let (_, body) = login(&app, &username, "user1234").await;
+    let challenge = body["data"]["challenge_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let code = current_totp(&secret);
+
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/verify",
+            None,
+            Some(json!({ "challenge_token": challenge, "code": code.clone() })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "首次校验应当通过");
+
+    // 重新走一遍登录，拿新的挑战令牌，但提交**同一个**码
+    let (_, body) = login(&app, &username, "user1234").await;
+    let challenge2 = body["data"]["challenge_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/verify",
+            None,
+            Some(json!({ "challenge_token": challenge2, "code": code })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "同一个动态码被重放：{body}"
+    );
+
+    reset_two_factor(&username).await;
+}
+
+/// 恢复码可替代 App，且只能用一次
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_recovery_code_replaces_the_app_and_is_single_use() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+    let (_, codes) = bind_two_factor(&app, &token).await;
+    let code = codes[0].clone();
+
+    let (_, body) = login(&app, &username, "user1234").await;
+    let challenge = body["data"]["challenge_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/verify",
+            None,
+            Some(json!({ "challenge_token": challenge, "code": code.clone() })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "恢复码应当可用: {body}");
+
+    // 同一恢复码第二次使用必须失败
+    let (_, body) = login(&app, &username, "user1234").await;
+    let challenge2 = body["data"]["challenge_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/verify",
+            None,
+            Some(json!({ "challenge_token": challenge2, "code": code })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "恢复码被重复使用：{body}");
+
+    // 剩余数量应少了一个
+    let (status, body) = send(&app, request("GET", "/api/auth/2fa", Some(&token), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["recovery_codes_remaining"], 7);
+
+    reset_two_factor(&username).await;
+}
+
+/// 换一批恢复码后旧码全部作废
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn regenerating_recovery_codes_invalidates_the_old_batch() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+    let (_, old_codes) = bind_two_factor(&app, &token).await;
+
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/auth/2fa/recovery-codes", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let new_codes: Vec<String> = body["data"]["recovery_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(new_codes.len(), 8);
+    assert!(
+        !new_codes.iter().any(|c| old_codes.contains(c)),
+        "新一批恢复码里混进了旧码"
+    );
+
+    // 旧码不能再用
+    let (_, body) = login(&app, &username, "user1234").await;
+    let challenge = body["data"]["challenge_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/verify",
+            None,
+            Some(json!({ "challenge_token": challenge, "code": old_codes[0].clone() })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "旧恢复码仍可用：{body}");
+
+    reset_two_factor(&username).await;
+}
+
+/// 关闭 2FA 必须出示当前口令
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn disabling_two_factor_requires_the_current_password() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+    bind_two_factor(&app, &token).await;
+
+    // 口令不对：必须拒绝，且 2FA 仍处于启用状态
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/disable",
+            Some(&token),
+            Some(json!({ "password": "wrong-password" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (_status, body) = send(&app, request("GET", "/api/auth/2fa", Some(&token), None)).await;
+    assert_eq!(body["data"]["enabled"], true, "口令错误却把 2FA 关掉了");
+
+    // 口令正确：关闭成功
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/2fa/disable",
+            Some(&token),
+            Some(json!({ "password": "user1234" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_status, body) = send(&app, request("GET", "/api/auth/2fa", Some(&token), None)).await;
+    assert_eq!(body["data"]["enabled"], false);
+
+    // 恢复码必须被连带清掉：留着它们等于留了一条绕过第二因子的后门
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM user_two_factor_recovery WHERE user_id = \
+         (SELECT id FROM users WHERE username = $1)",
+    )
+    .bind(&username)
+    .fetch_one(&pool().await)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "关闭后仍残留 {} 条恢复码", count);
+
+    // 关闭后登录回到单步
+    let (status, body) = login(&app, &username, "user1234").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["requires_2fa"], false);
+    assert!(body["data"]["token"].is_string(), "{body}");
+
+    reset_two_factor(&username).await;
+}
+
+/// 已绑定用户不能靠"再扫一次"把正在用的密钥换掉
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_enabled_account_cannot_rebind_without_disabling_first() {
+    let app = app().await;
+    let (username, token) = fresh_user_with_token(&app, "user").await;
+    reset_two_factor(&username).await;
+    bind_two_factor(&app, &token).await;
+
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/auth/2fa/setup", Some(&token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    reset_two_factor(&username).await;
+}
+
+/// 二次验证连错会被限住（复用登录爆破防护的阈值）
+/// 连着猜二次验证码会被限住
+///
+/// 6 位动态码只有 100 万种组合，没有限速就等于可被脚本穷举。
+/// 阈值复用登录爆破防护那套参数（`login_max_failures`），
+/// 因此这里用 `strict_app` 那种低阈值 app 才能在几次内观测到锁定。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn repeated_two_factor_failures_get_locked_out() {
+    // 必须用低阈值 app：默认阈值是 1000 次，用例里不可能真的猜到那么多次，
+    // 而把阈值调到 1000 跑一遍这个断言等于什么都没验证。
+    let app = strict_app().await;
+    let admin = admin_token(&app).await;
+    let username = unique("tf");
+    let (status, body) = create_user_via_api(&app, &admin, &username, "user").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let token = login_token(&app, &username, "user1234").await;
+    reset_two_factor(&username).await;
+    let (secret, _) = bind_two_factor(&app, &token).await;
+    let wrong = if secret.as_bytes()[0] == b'0' {
+        "111111"
+    } else {
+        "000000"
+    };
+
+    let mut saw_locked = false;
+    for _ in 0..15 {
+        let (status, body) = login(&app, &username, "user1234").await;
+        if status != StatusCode::OK {
+            // 口令这一步就被 429 挡住，说明计数确实在生效
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+            saw_locked = true;
+            break;
+        }
+        let challenge = body["data"]["challenge_token"]
+            .as_str()
+            .expect("绑定后登录应下发挑战令牌")
+            .to_string();
+        let (status, _) = send(
+            &app,
+            request(
+                "POST",
+                "/api/auth/2fa/verify",
+                None,
+                Some(json!({ "challenge_token": challenge, "code": wrong })),
+            ),
+        )
+        .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            saw_locked = true;
+            break;
+        }
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert!(saw_locked, "连续猜码 15 次仍未被限速");
+
+    reset_two_factor(&username).await;
+    let redis = RedisClient::new(&test_config(1_000).redis)
+        .await
+        .expect("连接 Redis 失败");
+    // 清掉本用例留下的 2FA 失败计数，否则该用户后续用例会被残留计数挡住
+    redis
+        .delete_by_prefix("login:fail:2fa-user:")
+        .await
+        .expect("清理 2FA 失败计数失败");
 }

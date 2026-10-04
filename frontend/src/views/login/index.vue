@@ -12,12 +12,17 @@
       </n-alert>
 
       <header class="login-header">
-        <h1 class="login-title">登录 Axum Admin</h1>
-        <p class="login-subtitle">使用你的账号登录</p>
+        <h1 class="login-title">
+          {{ step === 'credentials' ? '登录 Axum Admin' : '两步验证' }}
+        </h1>
+        <p class="login-subtitle">
+          {{ step === 'credentials' ? '使用你的账号登录' : '输入验证器 App 的 6 位动态码' }}
+        </p>
       </header>
 
       <!-- 登录表单 -->
       <n-form
+        v-if="step === 'credentials'"
         ref="formRef"
         :model="formData"
         :rules="formRules"
@@ -72,7 +77,74 @@
         </n-button>
       </n-form>
 
-      <p class="login-footnote">口令经 HTTPS 提交，服务端只存 Argon2 哈希</p>
+      <!--
+        第二步：交第二道因子
+
+        **刻意不复用上面的表单**：口令已校验通过并换成挑战令牌，
+        继续让用户在同一屏改口令，只会让人以为"刚才输错了"。
+      -->
+      <n-form v-else @submit.prevent="handleVerify">
+        <n-alert type="info" :show-icon="true" class="login-alert">
+          密码校验通过，请完成第二步验证。
+        </n-alert>
+
+        <n-form-item label="验证方式">
+          <n-radio-group v-model:value="codeMode" size="small">
+            <n-radio-button value="totp">验证器 App</n-radio-button>
+            <n-radio-button value="recovery">恢复码</n-radio-button>
+          </n-radio-group>
+        </n-form-item>
+
+        <n-form-item :label="codeMode === 'totp' ? '动态验证码' : '恢复码'">
+          <!--
+            动态码固定 6 位，用 NInputOtp 一步输完；
+            恢复码是 10 位字母数字串，长度与字符集都不同，
+            所以两者用不同控件，而不是拿同一个框硬凑。
+          -->
+          <n-input-otp
+            v-if="codeMode === 'totp'"
+            v-model:value="otpCode"
+            :length="6"
+            :disabled="verifying"
+            size="large"
+            @finish="handleVerify"
+          />
+          <n-input
+            v-else
+            v-model:value="recoveryCode"
+            placeholder="请输入一次性的恢复码"
+            :maxlength="16"
+            :disabled="verifying"
+            size="large"
+            clearable
+            @keyup.enter="handleVerify"
+          />
+        </n-form-item>
+
+        <n-space vertical :size="12">
+          <n-button
+            type="primary"
+            block
+            size="large"
+            attr-type="submit"
+            :loading="verifying"
+            :disabled="!codeReady"
+          >
+            验证并登录
+          </n-button>
+          <n-button quaternary block :disabled="verifying" @click="backToCredentials">
+            换个账号
+          </n-button>
+        </n-space>
+      </n-form>
+
+      <p class="login-footnote">
+        {{
+          step === 'credentials'
+            ? '口令经 HTTPS 提交，服务端只存 Argon2 哈希'
+            : '挑战令牌 5 分钟内有效，且只能用一次'
+        }}
+      </p>
     </div>
   </AuthShell>
 </template>
@@ -92,7 +164,7 @@ import { useRouter } from 'vue-router'
 import { PersonOutline as UserIcon, LockClosedOutline as LockIcon } from '@vicons/ionicons5'
 import type { FormInst, FormRules } from 'naive-ui'
 import { useUserStore } from '@/stores/user'
-import { showSuccess } from '@/utils/message'
+import { showError, showSuccess } from '@/utils/message'
 import { getStorage, setStorage, removeStorage } from '@/utils/storage'
 import { buildSessionEndedMessage, takeSessionEnded } from '@/utils/session'
 import { IDENTIFIER_MAX_LEN, loginIdentifierRules, loginPasswordRules } from '@/utils/accountRules'
@@ -134,12 +206,37 @@ interface LoginForm {
   password: string
 }
 
+/** 登录页当前处在哪一步 */
+type LoginStep = 'credentials' | 'second-factor'
+
+/** 第二步交的是 App 动态码还是一次性恢复码 */
+type CodeMode = 'totp' | 'recovery'
+
 const formData = ref<LoginForm>({
   username: '',
   password: '',
 })
 
 const rememberMe = ref(false)
+
+const step = ref<LoginStep>('credentials')
+const codeMode = ref<CodeMode>('totp')
+const otpCode = ref('')
+const recoveryCode = ref('')
+const verifying = ref(false)
+
+/**
+ * 挑战令牌
+ *
+ * **只放内存，不落任何存储**：它等价于"口令已通过"的临时凭据，
+ * 写在磁盘上等于给本机留一个能换正式令牌的把柄。
+ */
+let challengeToken: string | null = null
+
+/** 位数不足时先拦在本地，省一次注定失败的往返 */
+const codeReady = computed(() =>
+  codeMode.value === 'totp' ? otpCode.value.length === 6 : recoveryCode.value.trim().length >= 6,
+)
 
 // ── 表单校验规则 ────────────────────────────────────────────────
 //
@@ -195,21 +292,63 @@ async function handleLogin(): Promise<void> {
     // 保存记住密码状态
     saveRemembered()
 
-    // 调用 user store 登录（内部做 SHA-256 哈希）
+    // 提交口令（后端用 Argon2 校验）
     const result = await userStore.login({
       username: formData.value.username,
       password: formData.value.password,
     })
 
-    if (result) {
-      showSuccess('登录成功')
-      router.push('/')
+    if (!result) return
+
+    // 需要第二道因子：留在本页，切到第二步
+    if (result.requires_2fa) {
+      challengeToken = result.challenge_token
+      // 挑战令牌必然随 requires_2fa 一起下发；缺了就当口令没过，
+      // 让用户重来一次，好过带着空令牌停在第二步反复失败
+      if (!challengeToken) {
+        showError('二次验证信息缺失，请重新登录')
+        return
+      }
+      step.value = 'second-factor'
+      return
     }
+
+    showSuccess('登录成功')
+    router.push('/')
   } catch (e) {
     console.error('登录失败:', e)
   } finally {
     submitting.value = false
   }
+}
+
+// ── 第二步验证 ─────────────────────────────────────────────────
+
+async function handleVerify(): Promise<void> {
+  if (verifying.value || !challengeToken || !codeReady.value) return
+  verifying.value = true
+  try {
+    const code = codeMode.value === 'totp' ? otpCode.value.trim() : recoveryCode.value.trim()
+    const result = await userStore.completeTwoFactorLogin(challengeToken, code)
+    if (!result) return
+    // 用掉即弃：挑战令牌一次性，不清掉会在"换个账号"之后
+    // 又能拿它去换一次令牌
+    challengeToken = null
+    showSuccess('登录成功')
+    router.push('/')
+  } catch (e) {
+    console.error('二次验证失败:', e)
+  } finally {
+    verifying.value = false
+  }
+}
+
+/** 回到第一步：丢掉挑战令牌，避免换个账号后还能拿它换令牌 */
+function backToCredentials(): void {
+  challengeToken = null
+  step.value = 'credentials'
+  otpCode.value = ''
+  recoveryCode.value = ''
 }
 
 // ── 初始化 ──────────────────────────────────────────────────────
