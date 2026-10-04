@@ -6225,3 +6225,16 @@ model/router/docs 接线、前端 profile + login + router。
 另有一轮 API 层 12 步端到端（含挑战令牌一次性、同码不可重放）全过。
 
 门禁（修复后复跑）：前端 lint 0 error / typecheck / **225 passed** / build。
+
+---
+
+## 2026-10-04 推送 v0.23.0 ~ v0.25.0
+
+用户指令"推送"。`b10a56dc..abc76b30 master -> master`，
+12 个提交一次性推上 origin（v0.23.0 三个功能版 + v0.24.0 部门树与两处修复
++ v0.25.0 两步验证与可视化修复）。推送后 `git fetch` 复核，
+本地与 origin/master 无差异。
+
+**没有打 tag，也没抬版号。** 当前 `Cargo.toml` 仍是 0.23.0，
+`package.json` 仍是 0.23.0，而代码里已经含 v0.24.0 与 v0.25.0 的功能——
+发布动作（抬版号 + `CHANGELOG` + 打 tag）等用户单独下指令时再做。
