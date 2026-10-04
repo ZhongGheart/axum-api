@@ -6084,3 +6084,17 @@ v0.24.0 是 B1 部门树，单独占一版。
 三条 SQL 是一起执行的，而 `backfill_late_added_menus` 只补写了菜单，漏了授权。
 
 **门禁**：fmt / clippy 0 warning / 单测 114 / 集成 **198 passed 0 failed**。
+
+---
+
+## 2026-10-04 v0.24.0 前端：用户管理支持分配部门
+
+**问题**：后端已支持 `dept_id`，但前端用户管理页面没有部门选择功能。
+
+**改动**：
+- `frontend/src/views/system/user/index.vue`：编辑表单加了 `n-tree-select` 部门选择器，
+  新建/编辑时加载部门列表，提交时传 `dept_id`。
+- `frontend/src/api/user.ts`：`create` 和 `update` 方法加了 `dept_id` 字段。
+- 导入 `departmentApi`，新增 `loadDepts` 函数。
+
+**门禁**：前端 lint 0 error / typecheck / 203 passed / build。

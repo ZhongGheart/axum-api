@@ -94,6 +94,17 @@
             {{ rolesUnavailable }}
           </div>
         </n-form-item>
+        <n-form-item label="部门" path="dept_id">
+          <n-tree-select
+            v-model:value="formData.dept_id"
+            :options="deptOptions"
+            key-field="id"
+            label-field="name"
+            children-field="children"
+            placeholder="选择部门（不选则无部门）"
+            clearable
+          />
+        </n-form-item>
         <n-form-item label="状态">
           <n-switch v-model:value="formData.is_active" />
         </n-form-item>
@@ -209,12 +220,13 @@ import { computed, ref, h, onMounted, watch } from 'vue'
 import type { VNode } from 'vue'
 import { NAvatar, NImage, NTag, NSwitch } from 'naive-ui'
 import { AddOutline as AddIcon } from '@vicons/ionicons5'
-import type { DataTableColumn, FormInst, FormRules, SelectOption } from 'naive-ui'
+import type { DataTableColumn, FormInst, FormRules, SelectOption, TreeOption } from 'naive-ui'
 import type { ImportUsersResult, UserInfo, UserSession } from '@/api/types/response'
 import { displayLabel } from '@/api/types/response'
 import { resolveAvatarUrl } from '@/utils/avatar'
 import { formatDateTime } from '@/utils/time'
 import { userApi } from '@/api/user'
+import { departmentApi } from '@/api/department'
 import { showConfirm, showSuccess, showWarning } from '@/utils/message'
 import BaseTable from '@/components/common/BaseTable.vue'
 import SearchForm from '@/components/common/SearchForm.vue'
@@ -272,6 +284,7 @@ const statusFilter = ref<string | null>(null)
 const formRef = ref<FormInst | null>(null)
 
 const roleOptions = ref<RoleSelectOption[]>([])
+const deptOptions = ref<TreeOption[]>([])
 const availableRoles = ref<RoleListItem[]>([])
 const rolesUnavailable = ref<string | null>(null)
 
@@ -292,12 +305,28 @@ async function ensureRolesLoaded() {
   }
 }
 
+async function loadDepts() {
+  if (deptOptions.value.length > 0) return
+  try {
+    const list = await departmentApi.flatList()
+    deptOptions.value = list.map((d) => ({
+      id: d.id,
+      name: d.path,
+      children: [],
+    }))
+  } catch {
+    // 错误提示已由响应拦截器统一弹出
+  }
+}
+
 interface UserForm {
   username: string
   email: string
   password: string
   /** 权威字段：多角色。v0.6.0 之前是单数 `role`，见后端 UserManageRequest */
   roles: string[]
+  /** 所属部门 ID（v0.24.0）；null 表示无部门 */
+  dept_id: string | null
   is_active: boolean
 }
 
@@ -306,6 +335,7 @@ const formData = ref<UserForm>({
   email: '',
   password: '',
   roles: [],
+  dept_id: null,
   is_active: true,
 })
 
@@ -529,6 +559,7 @@ watch([roleFilter, statusFilter], () => {
 
 async function openCreate() {
   await ensureRolesLoaded()
+  await loadDepts()
   isEditing.value = false
   editingId.value = ''
   roleOptions.value = buildRoleSelectOptions(availableRoles.value)
@@ -537,6 +568,7 @@ async function openCreate() {
     email: '',
     password: '',
     roles: pickDefaultRoles(availableRoles.value),
+    dept_id: null,
     is_active: true,
   }
   showModal.value = true
@@ -544,6 +576,7 @@ async function openCreate() {
 
 async function openEdit(user: UserInfo) {
   await ensureRolesLoaded()
+  await loadDepts()
   isEditing.value = true
   editingId.value = user.id
   // 必须取**全部**真实角色，不能用 user.role：后者是非 admin 一律塌缩成 "user"
@@ -556,6 +589,7 @@ async function openEdit(user: UserInfo) {
     email: user.email,
     password: '',
     roles: current,
+    dept_id: user.dept_id,
     is_active: user.is_active,
   }
   showModal.value = true
@@ -571,6 +605,7 @@ async function handleSubmit() {
         username: formData.value.username,
         email: formData.value.email,
         roles: formData.value.roles,
+        dept_id: formData.value.dept_id,
         is_active: formData.value.is_active,
       })
       showSuccess('用户更新成功')
@@ -580,6 +615,7 @@ async function handleSubmit() {
         email: formData.value.email,
         password: formData.value.password || undefined,
         roles: formData.value.roles,
+        dept_id: formData.value.dept_id,
       })
       showSuccess('用户创建成功')
     }

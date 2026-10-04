@@ -51,6 +51,8 @@ export const userApi = {
     password?: string
     /** 多角色。v0.6.0 起为权威字段（后端另有单数 `role` 兼容别名） */
     roles: string[]
+    /** 所属部门 ID（v0.24.0）；null 表示无部门 */
+    dept_id?: string | null
     is_active?: boolean
   }) {
     return http.post<UserInfo>('/admin/users', data)
@@ -63,6 +65,8 @@ export const userApi = {
       username: string
       email: string
       roles: string[]
+      /** 所属部门 ID（v0.24.0）；null 表示清空，不传表示不修改 */
+      dept_id?: string | null
       is_active?: boolean
     },
   ) {
