@@ -5650,3 +5650,60 @@ ERROR: duplicate key value violates unique constraint "users_username_lower_key"
 轮次之间后端与 vite 进程会被重置。后端 session 用 exec 长驻方式启动（`nohup` 会被回收）。
 必须带 `RATE_LIMIT_IP_MAX=100000` / `RATE_LIMIT_USER_MAX=100000`，否则整轮 e2e 因限流假红。
 JWT 密钥在 `/tmp/axum_jwt_secret.txt`。文档端点总数是 **50**，不是早前 handoff 里写的 39。
+
+---
+
+## 2026-10-04 缺口复核与 v0.23.0/v0.24.0 重排（文档，无代码改动）
+
+**目标**：回答"还缺哪些功能"，基于实测而非记忆重排后续计划。
+**起始 git 状态**：`b10a56dc feat(v0.22.0): 系统参数配置表 + 口令复杂度与过期策略`
+（v0.22.0 已推送 + 已打 tag），仅 `docs/ROADMAP.md` 有未提交改动。
+
+### 实测推翻的两条旧 ROADMAP 断言（已标注 ✅，保留推翻记录而非删除）
+
+1. 「v0.19.0 无 tag / 版号仍是 0.18.0」→ 早已解决，tag 现在到 v0.22.0。
+2. 「BaseUpload 悬空 / 后端没开 multipart」→ v0.20.0 已解决：
+   `frontend/src/views/profile/index.vue:41` 在用，Cargo.toml 已开 `multipart` + `tower-http` 的 `fs`。
+
+### 新发现的真缺口（grep 证据已写进 ROADMAP 第 3 节）
+
+- **C2 开放注册开关**：`/api/auth/register` 挂 `public_routes`（`src/router/mod.rs:174`）
+  **无条件开放**，注册成功自动分配 `user` 角色（`src/service/auth.rs:218`）；
+  grep `allow_register|registration_enabled` 零命中。**这是唯一"现在就在敞开"的缺口**，
+  且 v0.22.0 参数表已就位 → 加 `security.registration.enabled` 一条即可。
+- **A1 用户自助会话管理**：会话端点只有管理员侧 `/api/admin/users/{id}/sessions`
+  （`router/mod.rs:399-405`），用户**没有** `GET /api/auth/sessions`。
+  改密会吊销全部会话，但用户无法只吊销可疑的那一个。
+- **A2 并发登录上限**：grep `max_session|concurrent|session_limit` 零命中。
+- **B1 部门/组织树**：grep `dept|department|organization` 在 src/migrations/frontend 零命中。
+  量级大，且本仓已写明理由（递归删除的父子循环、跨部门授权需独立测试预算），
+  v0.22.0 因此顺延过一次，**理由到今天依然成立**。
+- **D1 审计明细结构化查询**：`utils/audit.rs` 的 `diff_summary`/`permission_change`
+  能力已有且已接进 4 处 handler（`controller/user.rs:422`、`controller/menu.rs:270,480`），
+  但只产出人类可读 `result` 字符串；列表端点只能按 `action`（即 `"PUT /api/..."`）筛，
+  **答不出"谁改过 role:3 的权限"**。
+- 2FA/TOTP、邮件通道、对象存储：均零命中。
+
+### 确认**不是**缺口（有意不做，别再排期）
+
+软删除/回收站（有意不做：删除应即时且可审计，"已删除"状态本身不该再审计一层）、
+审计日志被篡改（无删除端点，正确）、国际化/WebSocket/数据备份（本仓定位不需要）。
+
+### 排期结论（已写入 ROADMAP 第 4 节）
+
+- **v0.23.0 账号安全闭环** = C2 开放注册开关 + A1 自助会话管理 + A2 并发登录上限。
+  三项都落在 v0.22.0 刚铺好的「参数表 + 会话」地基上，无新表无新依赖。
+  若只做一项先做 **C2**。
+- **v0.24.0** = B1 部门树**单独占一版**，不搭配项。
+- 未排期：C1 2FA、A3 自助改邮箱（依赖邮件通道 = 增加部署前置条件）、D1、D2。
+- 一句话顺序：**C2 →（A1+A2）→ B1 → C1**。
+
+### 本轮同时修掉的 ROADMAP 文档缺陷
+
+章节编号被我改乱（重复 `## 4.`/`## 5.` 标题）+ 1 个 U+FFFD 替换字符 +
+速查表停留在已过期的 v0.23.0「规模化与通知」描述。已修为连续编号
+`0 先说三件不是功能的事 / 1 v0.20.0 / 2 v0.22.0 / 3 缺口全景 / 4 版本排期 / 5 已确认不是缺口 / 6 一页速查`，
+速查表补上 v0.23.0 / v0.24.0 两行；`grep -c $'\xef\xbf\xbd'` → 0。
+
+**改动文件**：仅 `docs/ROADMAP.md`（+ `docs/AI_HANDOFF.md` 本节）。无代码改动，未跑门禁（纯文档）。
+**约定**：本地提交，**不推送**。
