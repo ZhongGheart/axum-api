@@ -292,7 +292,9 @@ impl RedisClient {
                 break;
             }
         }
-        out.sort_by(|a, b| b.login_at_ms.cmp(&a.login_at_ms));
+        // 按登录时间**倒序**（最近的会话排前面），用 `Reverse` 表达而不是
+        // `sort_by(|a, b| b.cmp(a))`——后者在新版 clippy 下是 `unnecessary_sort_by`
+        out.sort_by_key(|s| std::cmp::Reverse(s.login_at_ms));
         Ok(out)
     }
 

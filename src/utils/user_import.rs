@@ -105,7 +105,7 @@ pub fn parse_user_csv(text: &str) -> Result<Vec<ParsedUserRow>, AppError> {
         let username = get(idx_username);
         let email = get(idx_email);
         let password = get(idx_password);
-        let display_name = idx_display.map(&get).filter(|s| !s.is_empty());
+        let display_name = idx_display.map(get).filter(|s| !s.is_empty());
         let roles: Vec<String> = get(idx_roles)
             .split('|')
             .map(|s| s.trim().to_string())

@@ -163,7 +163,7 @@ pub fn build_tree(all: &[Department]) -> Vec<DepartmentNode> {
     }
 
     // 根部门按 sort_order 升序
-    roots.sort_by(|a, b| a.sort_order.cmp(&b.sort_order));
+    roots.sort_by_key(|d| d.sort_order);
     roots
 }
 
@@ -179,7 +179,7 @@ fn build_children(all: &[Department], parent: &mut DepartmentNode) {
         build_children(all, child);
     }
 
-    children.sort_by(|a, b| a.sort_order.cmp(&b.sort_order));
+    children.sort_by_key(|d| d.sort_order);
     parent.children = children;
 }
 

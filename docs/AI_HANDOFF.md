@@ -3,6 +3,55 @@
 本文件是跨会话的交接日志。任何非平凡改动在**动手前**先写这里，达成里程碑后更新。
 接手者必须先把它与 `git status` / `git diff` / 实际文件系统对账。
 
+## CI 失败排查：Rust 1.99 的 clippy 告警（2026-10-04 会话 · ✅ 已修，未推送）
+
+### 结论先说
+
+`docs: 记录 v0.23.0~v0.25.0 已推送 #37` 挂在 **Rust job 的 `Clippy (deny warnings)`**，exit code 101，Frontend job 是绿的。**不是 CI 配置坏了，是本地 clippy 版本太旧没提前抓到**：本地 `clippy 0.1.94 / rustc 1.94.1`，CI 跑 `rust-1.99.0`。仓库**没有** `rust-toolchain.toml`，workflow 用 `dtolnay/rust-toolchain@stable` 拉最新 stable，所以工具链一漂移就会冒出本地看不见的告警。从 `37132068490`（v0.19.0）之后每次 push 都红，v0.22.0 / v0.23.0~v0.25.0 全被卡在 clippy，**从未真正通过 CI**。run id：`37203074046`，commit `df4b21c6`。
+
+4 处告警（行号与 CI 日志逐字一致）：
+
+| 文件:行 | lint |
+|---|---|
+| `src/model/department.rs:166` | `unnecessary_sort_by` |
+| `src/model/department.rs:182` | `unnecessary_sort_by` |
+| `src/utils/redis.rs:295` | `unnecessary_sort_by` |
+| `src/utils/user_import.rs:108` | `needless_borrows_for_generic_args` |
+
+### 装 1.99 的办法（值得复用）
+
+官方 `static.rust-lang.org` 实测只有 ~18KB/s，rustup 单线程下 10 分钟才 47M，不可用。镜像实测：USTC 403（JS 挑战页，返回 HTML）、清华/nju/rsproxy 404 或 504，**只有 SJTU `https://mirror.sjtu.edu.cn/rust-static/dist` 可用，约 1.3MB/s**。
+
+1. 下官方 `channel-rust-1.99.0.toml`，解析 `cargo` / `clippy-preview` / `pkg.rust`（1.99 的 manifest 把 rustc+std 合并成一个 `pkg.rust`）三个组件的 URL 与 sha256
+2. `aria2c -x16 -s16 -k1M` 从 SJTU 镜像下，223MB 用了 71 秒（2.9MiB/s）
+3. 三个包**全部通过官方 manifest 的 sha256 校验**
+4. `rustup toolchain install` 仍会去下两个不在 manifest 里的组件并卡住，改为直接 `tar xzf` + 包内 `install.sh --prefix=~/.rustup/toolchains/1.99.0-x86_64-apple-darwin --disable-ldconfig` 离线安装，10 秒装完（clippy 本就含在 rust 包里）
+
+调用时**绕开 rustup proxy**，用绝对路径：
+
+```bash
+TC="$HOME/.rustup/toolchains/1.99.0-x86_64-apple-darwin"
+export PATH="$TC/bin:$PATH"
+export CARGO_TARGET_DIR=/tmp/target199   # 勿污染 stable 的 target
+cargo clippy --locked --all-targets --all-features -- -D warnings
+```
+
+### 改动与验证
+
+- `department.rs`：两处 `sort_by(|a, b| a.sort_order.cmp(&b.sort_order))` → `sort_by_key(|d| d.sort_order)`
+- `redis.rs`：倒序排序不能用 `sort_by(|a, b| b.cmp(a))`（新版 clippy 同样报 `unnecessary_sort_by`），改 `sort_by_key(|s| std::cmp::Reverse(s.login_at_ms))`，并留注释说明原因
+- `user_import.rs`：`idx_display.map(&get)` → `idx_display.map(get)`
+
+三处都是 stable sort，`sort_by_key` 与原 `cmp` 升降序语义等价。
+
+验证（1.99）：clippy `-D warnings` 0 error ✓、`cargo fmt --all --check` ✓、`cargo test --locked --lib` **130 passed 0 failed**（含 `build_tree` 排序单测）、覆盖改动路径的集成测试 4 条全绿（会话列表倒序、部门树 CRUD 写审计、2FA 吊销审计）。另外用 stable 1.94 复跑一次 clippy，同样 0 error。
+
+**缺陷注入**：`git stash` 掉这 3 个文件后重跑 clippy，精确复现 CI 的 4 个错误、行号完全一致，随后 `git stash pop` 恢复。
+
+### 后续风险
+
+没有 `rust-toolchain.toml` 意味着下次 stable 漂移还会重演。想彻底止血就锁一个 `rust-toolchain.toml`（含 clippy/rustfmt 组件），但那会让本地 1.94 环境不再匹配 CI，**属于单独一版的事，本轮没做**。
+
 ## v0.22.0 系统参数配置表 + 口令策略（2026-10-04 会话 · ✅ 已完成，未推送）
 
 ### 当前目标
