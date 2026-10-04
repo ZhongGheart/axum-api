@@ -1,22 +1,17 @@
 <template>
-  <div class="register-page">
-    <div class="register-card">
-      <!-- Logo & 标题 -->
-      <div class="register-header">
-        <div class="logo">
-          <span class="logo-icon">⚡</span>
-          <span class="logo-text">创建账号</span>
-        </div>
-        <p class="register-subtitle">注册 Axum Admin 账号</p>
-      </div>
+  <AuthShell>
+    <div class="register">
+      <header class="register-header">
+        <h1 class="register-title">创建账号</h1>
+        <p class="register-subtitle">注册后可自行修改资料与密码</p>
+      </header>
 
       <!-- 注册表单 -->
       <n-form
         ref="formRef"
         :model="formData"
         :rules="formRules"
-        label-placement="left"
-        label-width="auto"
+        label-placement="top"
         size="large"
         @submit.prevent="handleRegister"
       >
@@ -26,6 +21,7 @@
             :placeholder="USERNAME_PLACEHOLDER"
             :maxlength="USERNAME_MAX_LEN"
             clearable
+            :input-props="{ autocomplete: 'username' }"
           >
             <template #prefix>
               <n-icon><UserIcon /></n-icon>
@@ -39,6 +35,7 @@
             placeholder="请输入邮箱地址"
             :maxlength="255"
             clearable
+            :input-props="{ autocomplete: 'email' }"
           >
             <template #prefix>
               <n-icon><MailIcon /></n-icon>
@@ -54,6 +51,7 @@
             :placeholder="PASSWORD_PLACEHOLDER"
             :maxlength="PASSWORD_MAX_LEN"
             clearable
+            :input-props="{ autocomplete: 'new-password' }"
           >
             <template #prefix>
               <n-icon><LockIcon /></n-icon>
@@ -69,6 +67,7 @@
             placeholder="请再次输入密码"
             :maxlength="PASSWORD_MAX_LEN"
             clearable
+            :input-props="{ autocomplete: 'new-password' }"
           >
             <template #prefix>
               <n-icon><LockIcon /></n-icon>
@@ -80,19 +79,18 @@
           type="primary"
           block
           size="large"
-          :loading="submitting"
           attr-type="submit"
-          class="register-btn"
+          :loading="submitting"
         >
-          注 册
+          注册
         </n-button>
 
-        <div class="login-link-wrap">
-          <router-link to="/login">已有账号？去登录</router-link>
+        <div class="register-footer">
+          已有账号？<router-link to="/login">去登录</router-link>
         </div>
       </n-form>
     </div>
-  </div>
+  </AuthShell>
 </template>
 
 <script setup lang="ts">
@@ -128,6 +126,7 @@ import {
   usernameRules,
 } from '@/utils/accountRules'
 import { PASSWORD_MAX_LEN } from '@/utils/password'
+import AuthShell from '@/components/common/AuthShell.vue'
 
 // ── 状态 ────────────────────────────────────────────────────────
 
@@ -198,67 +197,34 @@ async function handleRegister(): Promise<void> {
 </script>
 
 <style scoped>
-.register-page {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 100vh;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-}
-
-.register-card {
-  width: 440px;
-  padding: 40px;
-  background: var(--bg-card, #ffffff);
-  border-radius: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
-}
-
 .register-header {
-  text-align: center;
-  margin-bottom: 32px;
+  margin-bottom: 24px;
 }
 
-.logo {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.logo-icon {
-  font-size: 28px;
-}
-
-.logo-text {
-  font-size: 24px;
-  font-weight: 700;
-  color: var(--text-primary, #1a1a2e);
+.register-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-primary);
 }
 
 .register-subtitle {
-  font-size: 14px;
-  color: var(--text-secondary, #888);
-}
-
-.login-link-wrap {
-  text-align: center;
-  margin-top: 20px;
-}
-
-.login-link-wrap a {
+  margin-top: 4px;
   font-size: 13px;
-  color: #2080f0;
-  text-decoration: none;
+  color: var(--text-secondary);
 }
 
-.login-link-wrap a:hover {
+.register-footer {
+  margin-top: 20px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.register-footer a {
+  color: var(--primary-color);
+}
+
+.register-footer a:hover {
   text-decoration: underline;
-}
-
-.register-btn {
-  font-size: 16px;
-  letter-spacing: 4px;
 }
 </style>

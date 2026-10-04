@@ -65,6 +65,19 @@ const routes: RouteRecordRaw[] = [
     name: 'Root',
     component: () => import('@/layouts/MainLayout.vue'),
     children: [
+      // 首页：静态注册，**不走后端菜单**
+      //
+      // 菜单里确实有一条 `/` 指向 `home/index`，但那条记录不能作为
+      // 绝对子路径挂在同为 `/` 的 Root 之下（见 menuRoutes.ts 里的说明）：
+      // 那样它永远匹配不到，登录后首页会是空白。这里用空路径子路由承载，
+      // 侧栏入口仍然由后端菜单驱动，指向同一个 `/`。
+      {
+        path: '',
+        name: 'Home',
+        component: () => import('@/views/home/index.vue'),
+        meta: { title: '首页' },
+      },
+
       // 个人中心：静态注册，**不走后端菜单**
       //
       // 菜单是按角色授权的，而个人中心（改密）对**所有**登录用户都该存在。

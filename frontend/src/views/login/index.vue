@@ -1,33 +1,29 @@
 <template>
-  <div class="login-page">
-    <div class="login-card">
+  <AuthShell>
+    <div class="login">
       <!-- 会话失效原因：被踢回登录页时说明为什么，否则用户面对的是一个空登录框 -->
       <n-alert
         v-if="sessionEndedMessage"
         type="warning"
         :show-icon="true"
-        class="session-ended-alert"
+        class="login-alert"
       >
         {{ sessionEndedMessage }}
       </n-alert>
 
-      <!-- Logo & 标题 -->
-      <div class="login-header">
-        <div class="logo">
-          <span class="logo-icon">⚡</span>
-          <span class="logo-text">Axum Admin</span>
-        </div>
-        <p class="login-subtitle">企业级后台管理系统</p>
-      </div>
+      <header class="login-header">
+        <h1 class="login-title">登录 Axum Admin</h1>
+        <p class="login-subtitle">使用你的账号登录</p>
+      </header>
 
       <!-- 登录表单 -->
       <n-form
         ref="formRef"
         :model="formData"
         :rules="formRules"
-        label-placement="left"
-        label-width="auto"
+        label-placement="top"
         size="large"
+        @submit.prevent="handleLogin"
       >
         <n-form-item label="用户名" path="username">
           <n-input
@@ -35,7 +31,7 @@
             placeholder="请输入用户名或邮箱"
             :maxlength="IDENTIFIER_MAX_LEN"
             clearable
-            @keyup.enter="handleLogin"
+            :input-props="{ autocomplete: 'username' }"
           >
             <template #prefix>
               <n-icon><UserIcon /></n-icon>
@@ -51,7 +47,7 @@
             placeholder="请输入密码"
             :maxlength="128"
             clearable
-            @keyup.enter="handleLogin"
+            :input-props="{ autocomplete: 'current-password' }"
           >
             <template #prefix>
               <n-icon><LockIcon /></n-icon>
@@ -59,25 +55,26 @@
           </n-input>
         </n-form-item>
 
-        <!-- 记住密码 & 去注册 -->
+        <!-- 记住用户名 & 去注册 -->
         <div class="login-options">
-          <n-checkbox v-model:checked="rememberMe">记住密码</n-checkbox>
-          <router-link to="/register" class="register-link">还没有账号？去注册</router-link>
+          <n-checkbox v-model:checked="rememberMe">记住用户名</n-checkbox>
+          <router-link to="/register" class="login-link">没有账号？立即注册</router-link>
         </div>
 
         <n-button
           type="primary"
           block
           size="large"
+          attr-type="submit"
           :loading="submitting"
-          class="login-btn"
-          @click="handleLogin"
         >
-          登 录
+          登录
         </n-button>
       </n-form>
+
+      <p class="login-footnote">口令经 HTTPS 提交，服务端只存 Argon2 哈希</p>
     </div>
-  </div>
+  </AuthShell>
 </template>
 
 <script setup lang="ts">
@@ -87,7 +84,7 @@
  * - 表单规则取自共享校验器 `utils/accountRules.ts`
  *   （这个字段收的是"用户名或邮箱"，所以刻意不套用户名字符集规则；
  *    口令只判空——后端登录验的是 Argon2 哈希，不套明文复杂度策略）
- * - 记住登录：只记忆用户名，口令不落盘
+ * - 记住登录：只记忆用户名，口令不落盘（所以界面上的复选框写"记住用户名"）
  * - 口令经 HTTPS 明文提交，后端 Argon2 校验
  */
 import { ref, computed, onMounted } from 'vue'
@@ -99,6 +96,7 @@ import { showSuccess } from '@/utils/message'
 import { getStorage, setStorage, removeStorage } from '@/utils/storage'
 import { buildSessionEndedMessage, takeSessionEnded } from '@/utils/session'
 import { IDENTIFIER_MAX_LEN, loginIdentifierRules, loginPasswordRules } from '@/utils/accountRules'
+import AuthShell from '@/components/common/AuthShell.vue'
 
 // ── 状态 ────────────────────────────────────────────────────────
 
@@ -123,7 +121,7 @@ const sessionEndedReason = ref<string | null>(null)
 /** 提示全文（拼接规则与单测见 utils/session.buildSessionEndedMessage） */
 const sessionEndedMessage = computed(() => buildSessionEndedMessage(sessionEndedReason.value))
 
-/** 记住密码标识 */
+/** 记住用户名的存储键 */
 const REMEMBER_KEY = 'remember_login'
 
 interface RememberData {
@@ -161,7 +159,7 @@ const formRules: FormRules = {
   password: loginPasswordRules,
 }
 
-// ── 记住密码 ────────────────────────────────────────────────────
+// ── 记住用户名 ──────────────────────────────────────────────────
 
 function loadRemembered(): void {
   const saved = getStorage<RememberData>(REMEMBER_KEY)
@@ -224,73 +222,60 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.login-page {
+.login {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 100vh;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  flex-direction: column;
 }
 
-.login-card {
-  width: 420px;
-  padding: 40px;
-  background: var(--bg-card, #ffffff);
-  border-radius: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
-}
-
-.session-ended-alert {
-  margin-bottom: 20px;
+.login-alert {
+  margin-bottom: 16px;
 }
 
 .login-header {
-  text-align: center;
-  margin-bottom: 32px;
+  margin-bottom: 24px;
 }
 
-.logo {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.logo-icon {
-  font-size: 28px;
-}
-
-.logo-text {
-  font-size: 24px;
-  font-weight: 700;
-  color: var(--text-primary, #1a1a2e);
+/*
+ * 标签从"左侧固定宽度"改为置于输入框上方：
+ * 左边距着一列固定宽度的文字，窄屏下会把输入框挤窄，
+ * 竖排读起来也更像登录表单而不是设置页。
+ *
+ * 按钮文案也从"登 录"（加空格凑字距）改回"登录"——
+ * 靠字符间空格撑开字距是排版手法，复制粘贴时会带上多余的空白。
+ */
+.login-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-primary);
 }
 
 .login-subtitle {
-  font-size: 14px;
-  color: var(--text-secondary, #888);
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--text-secondary);
 }
 
 .login-options {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 24px;
+  gap: 12px;
+  margin-bottom: 20px;
 }
 
-.register-link {
+.login-link {
   font-size: 13px;
-  color: #2080f0;
-  text-decoration: none;
+  color: var(--primary-color);
 }
 
-.register-link:hover {
+.login-link:hover {
   text-decoration: underline;
 }
 
-.login-btn {
-  font-size: 16px;
-  letter-spacing: 4px;
+.login-footnote {
+  margin-top: 20px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  text-align: center;
 }
 </style>

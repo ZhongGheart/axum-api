@@ -108,6 +108,7 @@ import { buildGrantTreeOptions, authorizedMenuIds, menuTypeLabel, filterKnownMen
 import { isBuiltinRole } from '@/constants/builtin'
 import { PERM } from '@/constants/permission'
 import { showConfirm, showSuccess } from '@/utils/message'
+import { formatDateTime } from '@/utils/time'
 import PermissionButton from '@/components/common/PermissionButton.vue'
 
 // ── 状态 ────────────────────────────────────────────────────────
@@ -186,8 +187,12 @@ const columns: DataTableColumn[] = [
     title: '创建时间',
     key: 'created_at',
     width: 180,
+    // 此前是手写的 `.replace('T', ' ').slice(0, 19)`：
+    // 那是按"字符串本来就长得像 UTC 且没有小数秒"来截的，
+    // 一旦后端带上时区偏移（如 `+08:00`），截出来的就是**差了一个时区**的时刻，
+    // 而且看起来完全正常。统一走 formatDateTime 按真实时刻换算。
     render(row: Record<string, unknown>) {
-      return h('span', String(row.created_at ?? '').replace('T', ' ').slice(0, 19))
+      return formatDateTime(row.created_at as string)
     },
   },
   {

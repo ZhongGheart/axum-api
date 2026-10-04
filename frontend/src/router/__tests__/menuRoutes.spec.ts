@@ -90,12 +90,23 @@ describe('buildRoutesFromMenus', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const routes = buildRoutesFromMenus([
       node({ name: '坏菜单', path: '/broken', component: 'does/not/exist' }),
+      node({ name: '用户管理', path: '/system/user', component: 'system/user/index' }),
+    ])
+
+    expect(routes.map((r) => r.path)).toEqual(['/system/user'])
+    expect(warn).toHaveBeenCalledOnce()
+    warn.mockRestore()
+  })
+
+  it('首页（/）不作为绝对子路径注册——它由 Root 的空路径子路由承载', () => {
+    // 布局壳 Root 的路径也是 '/'。若把菜单里的 '/' 再注册成绝对子路径，
+    // vue-router 会得到一条与父级同路径的子记录：父级先命中、子级永不命中，
+    // 表现是登录后首页空白而菜单与面包屑都正常。首页因此必须静态注册。
+    const routes = buildRoutesFromMenus([
       node({ name: '首页', path: '/', component: 'home/index' }),
     ])
 
-    expect(routes.map((r) => r.path)).toEqual(['/'])
-    expect(warn).toHaveBeenCalledOnce()
-    warn.mockRestore()
+    expect(routes).toEqual([])
   })
 
   it('无 path 的菜单（如按钮型权限标记）不生成路由', () => {

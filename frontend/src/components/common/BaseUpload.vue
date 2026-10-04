@@ -20,9 +20,9 @@
     >
       <n-upload-dragger>
         <div style="padding:24px;text-align:center">
-          <n-icon size="48" color="#2080f0"><CloudUploadIcon /></n-icon>
+          <n-icon size="48" class="base-upload__icon"><CloudUploadIcon /></n-icon>
           <p>点击或拖拽文件到此处上传</p>
-          <p style="font-size:12px;color:#888;margin-top:4px">
+          <p class="base-upload__hint">
             支持 {{ accept || '所有格式' }}，单文件不超过 {{ (maxSize / 1024 / 1024).toFixed(0) }}MB
           </p>
         </div>
@@ -55,7 +55,7 @@
     <!-- 自定义进度条（分片上传用） -->
     <div v-if="chunkProgress > 0 && chunkProgress < 100" class="base-upload__chunk-progress">
       <n-progress :percentage="chunkProgress" :indicator-placement="'inside'" processing />
-      <p style="font-size:12px;color:#888;margin-top:4px">分片上传中... {{ uploadSpeed }}</p>
+      <p class="base-upload__hint">分片上传中... {{ uploadSpeed }}</p>
     </div>
   </div>
 </template>
@@ -153,5 +153,16 @@ function onProgress({ percent }: { percent: number }) {
 }
 .base-upload__chunk-progress {
   margin-top: 12px;
+}
+
+/* 图标与提示文字走主题变量：此前写死 hex，切到暗色主题后仍然亮着 */
+.base-upload__icon {
+  color: var(--primary-color);
+}
+
+.base-upload__hint {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-tertiary);
 }
 </style>

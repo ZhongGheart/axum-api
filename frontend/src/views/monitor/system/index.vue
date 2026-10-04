@@ -47,7 +47,12 @@
       <n-gi>
         <n-card title="数据库">
           <n-descriptions :column="1" size="small">
-            <n-descriptions-item label="状态">{{ data?.database.connected ? '🟢 已连接' : '🔴 断开' }}</n-descriptions-item>
+            <n-descriptions-item label="状态">
+              <span class="status">
+                <span class="dot" :class="data?.database.connected ? 'dot--ok' : 'dot--bad'" />
+                {{ data?.database.connected ? '已连接' : '断开' }}
+              </span>
+            </n-descriptions-item>
             <n-descriptions-item label="活跃连接">{{ data?.database.active_connections }}</n-descriptions-item>
             <n-descriptions-item label="最大连接">{{ data?.database.max_connections }}</n-descriptions-item>
             <n-descriptions-item label="数据库大小">{{ dbSize }}</n-descriptions-item>
@@ -57,7 +62,12 @@
       <n-gi>
         <n-card title="Redis">
           <n-descriptions :column="1" size="small">
-            <n-descriptions-item label="状态">{{ data?.redis.connected ? '🟢 已连接' : '🔴 断开' }}</n-descriptions-item>
+            <n-descriptions-item label="状态">
+              <span class="status">
+                <span class="dot" :class="data?.redis.connected ? 'dot--ok' : 'dot--bad'" />
+                {{ data?.redis.connected ? '已连接' : '断开' }}
+              </span>
+            </n-descriptions-item>
             <n-descriptions-item label="客户端数">{{ data?.redis.connected_clients }}</n-descriptions-item>
             <n-descriptions-item label="内存">{{ redisMem }}</n-descriptions-item>
             <n-descriptions-item label="执行命令">{{ data?.redis.total_commands_processed }}</n-descriptions-item>
@@ -86,18 +96,18 @@ let timer: ReturnType<typeof setInterval> | null = null
 
 // ── 主题色适配 ──────────────────────────────────────────────
 
-const railColor = computed(() => (appStore.isDark ? '#333' : '#f0f0f0'))
+const railColor = computed(() => (appStore.isDark ? '#2e333d' : '#eef0f3'))
 
 const memColor = computed(() => {
-  if (!data.value) return '#2080f0'
+  if (!data.value) return '#2b5fd9'
   const pct = data.value.system.memory.usage_percent
-  return pct > 80 ? '#e8802a' : pct > 60 ? '#f0a020' : '#18a058'
+  return pct > 80 ? '#c8373d' : pct > 60 ? '#b8730c' : '#1f9254'
 })
 
 const diskColor = computed(() => {
   const d = data.value?.system.disks?.[0]
-  if (!d) return '#2080f0'
-  return d.usage_percent > 90 ? '#d03050' : d.usage_percent > 75 ? '#e8802a' : '#18a058'
+  if (!d) return '#2b5fd9'
+  return d.usage_percent > 90 ? '#c8373d' : d.usage_percent > 75 ? '#b8730c' : '#1f9254'
 })
 
 // ── CPU ─────────────────────────────────────────────────────
@@ -178,3 +188,26 @@ async function handleExport() {
   }
 }
 </script>
+
+<style scoped>
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot--ok {
+  background: var(--success-color);
+}
+
+.dot--bad {
+  background: var(--danger-color);
+}
+</style>

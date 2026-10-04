@@ -24,16 +24,22 @@
 
 .not-found h1 {
   font-size: 72px;
-  color: #d03050;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text-tertiary);
 }
 
 .not-found p {
-  font-size: 18px;
-  color: #666;
+  font-size: 16px;
+  color: var(--text-secondary);
 }
 
 .not-found a {
-  color: #2080f0;
+  font-size: 14px;
+  color: var(--primary-color);
+}
+
+.not-found a:hover {
   text-decoration: underline;
 }
 </style>

@@ -3,6 +3,105 @@
 本文件是跨会话的交接日志。任何非平凡改动在**动手前**先写这里，达成里程碑后更新。
 接手者必须先把它与 `git status` / `git diff` / 实际文件系统对账。
 
+## v0.21.0 UI 梳理与优化（2026-10-04 会话 · 当前）
+
+### 当前目标
+
+用户指令：**全面梳理一下系统的 UI，优化一下界面交互及配色**。纯前端改造，未动后端 Rust。
+
+### 状态：已完成，本地提交（**未推送**）
+
+### 起始 git 状态
+
+- 分支 `master`，工作区干净，`HEAD == 596ee068`，ahead origin/master 4 个提交
+- 后端 `127.0.0.1:8080`；前端 vite `localhost:3000`；PG 55432 / Redis 56379
+
+### 顺手修掉的两个真缺陷（视觉验证才发现，代码读不出来）
+
+**1. 首页路由从来没渲染过**（`/`）
+
+布局壳 `Root` 的 `path` 是 `/`，而菜单种子数据里首页也是 `path='/'` +
+`component='home/index'`。`buildRoutesFromMenus` 把它当成**绝对子路径**注册，
+于是 vue-router 里出现一条与父级同路径的子记录：父级先命中、子级永不命中。
+表现是**登录后首页一片空白**（router-view 只渲染出 `<!---->`），
+而侧栏菜单、面包屑、`/system/user` 等全部正常——所以一直没人发现，
+`views/home/index.vue` 那句"后续替换为 Dashboard"的占位卡片其实**一次都没显示过**。
+
+修法：`menuRoutes.ts` 跳过 `path === '/'`，改由 `router/index.ts` 里 Root 的
+**空路径子路由**静态承载首页。侧栏入口仍由后端菜单驱动，指向同一个 `/`。
+
+> 判定手法：`git stash` 后看原代码下 `.layout-content` 的 DOM，
+> 确认原代码同样是空的 —— 排除了"是我改坏的"。选择器要用 `.layout-content`
+> 作用域，`document.querySelector('.n-scrollbar-content')` 会先命中**侧栏**的滚动条。
+
+**2. 侧栏菜单显示函数源码**
+
+`renderMenuLabel` 写成了"返回一个函数"，而 naive-ui 要求它**本身就是**渲染器。
+naive 把那个函数当成待渲染内容，侧栏于是显示
+`() => appStore.collapsed ? h("span", ...) : option.label`。
+
+### 本轮改动
+
+| 类别 | 内容 |
+|---|---|
+| 配色 | `stores/app.ts` 收敛主色为偏青靛蓝 `#2b5fd9`（避开 naive 默认蓝 + 登录页紫蓝打架），补 `Card/DataTable/Button/Menu/Input/InternalSelection/Layout` **组件级** theme-overrides；暗色 `placeholderColor` 由 `#666` 提到 `#848b98`（原值对比度约 3.4:1） |
+| 设计令牌 | `global.css` 补齐表面/文本/状态/边框/圆角语义变量、`focus-visible`、`prefers-reduced-motion`；`.page-container` 与 Card 的圆角边框统一 |
+| 布局 | Logo 由 emoji ⚡ 换成图标；顶栏用上 v0.20.0 的 `avatar_url`（此前硬编码蓝底首字母）；面包屑按菜单树回溯祖先链补全层级；折叠/主题按钮加 tooltip；折叠态菜单项补 `title`；`.user-info:hover` 由写死的 `rgba(0,0,0,.05)` 改走变量（暗色下原本几乎不可见） |
+| 菜单图标 | `MENU_ICONS` 扩到 20+ 键；新增 `PATH_ICONS` **按路径兜底**——后端给 6 个菜单都种了 `settings`，侧栏曾有六排一模一样的齿轮。改的是显示，不动菜单表的 `icon` 字段（那是管理员的数据） |
+| 首页 | 占位页 → 真实仪表盘：4 个指标卡 + 最近操作 + 运行状态 + 刷新按钮。**按 `permissionsStore` 逐项降级**：没权限的指标**不发请求也不渲染**（不是渲染成 0 或报错），全无权限时给单个空状态 |
+| 认证页 | 新增 `AuthShell.vue` 供登录/注册共用，抽掉两份重复的紫渐变；标签从左侧固定宽改顶部；去掉 `letter-spacing: 4px` 与"登 录/注 册"加空格；标签文案由"记住密码"改为**"记住用户名"**（实现本来就只记用户名） |
+| 数据展示 | 新增 `utils/time.ts` 统一时间格式化；用户页时间列原先直出 RFC3339 且在列宽不足时折行；角色页原先手写 `.replace('T',' ').slice(0,19)`，**带时区偏移时会算错一个时区且看起来完全正常**；日志页同样处理 |
+| 头像 | 抽出 `utils/avatar.ts`，顶栏/个人中心/用户列表三处共用；用户列表此前 `n-image` + 空 `fallbackSrc` 在加载失败时**画出碎图图标**，28px 的碎图比留白更像故障，改为回退首字母圆形 |
+| emoji | 监控页/仪表盘的 🟢🔴 状态 emoji 换成 CSS 圆点（emoji 在不同系统上字形与基线都不一致） |
+
+新增文件：`utils/avatar.ts`、`utils/time.ts`、`components/common/AuthShell.vue`、
+`utils/__tests__/{avatar,time}.spec.ts`
+
+### 门禁结果（全绿）
+
+| 项 | 结果 |
+|---|---|
+| `pnpm typecheck`（vue-tsc） | ✅ 0 error |
+| `pnpm lint` | ✅ 0 errors（`env.d.ts:5` 1 个历史 warning） |
+| `pnpm test` | ✅ **180 passed**（原 161，新增 19） |
+| `pnpm build` | ✅ built in 16.12s |
+
+### 视觉验证（Chrome 扩展报 "Codex auth token is unavailable"，改用 Codex 内置浏览器）
+
+登录页 / 首页亮色 / 首页暗色 / 系统监控 / 用户表格 / 普通用户首页，逐一截图核对；
+控制台无 error。**普通用户（`user` 角色）实测零 403**——仪表盘不发它无权请求的接口。
+
+> 验证用的 `uidemo` 测试账号已删除，演示库恢复为 2 个用户。
+
+### 踩过的坑（留给下一个人）
+
+- **`.vue` 导入必须带显式后缀**：`@/components/common/AuthShell` 解析不到，
+  `@/components/common/AuthShell.vue` 才行。项目里所有 `.vue` 导入都带后缀。
+- **`vue` 文件里有嵌套 `<template>`（slot）时**，`s.index('</template>')`
+  会截到**内层**插槽，留下游离的旧模板尾部。Vue 不报错、tsc 也不报错，
+  但页面渲染成空白。**必须用 `rindex`**。这个坑在 `login/index.vue` 和
+  `MainLayout.vue` 各踩了一次。
+- 中文写入必须 `python3` + `io.open(encoding='utf-8')`；本轮又踩了一次替换字符
+  （`docs/AI_HANDOFF.md`、`utils/avatar.ts`、`router/index.ts` 各一次），写完要 grep 查。
+- 改完颜色要去 grep 硬编码：`#2080f0` / `#d03050` / `letter-spacing` /
+  `color: #888` 之类，散落在 `BaseUpload` / `demo` / `NotFound` / `monitor` 等处。
+- 仪表盘的跳转路径**不能写死**：真实路径是 `/system/monitor/system`（不是
+  `/monitor/system`），而且菜单路径是管理员可改的数据。已改为按 component
+  标识从菜单树反查，查不到就不渲染按钮。
+
+### 后续可做（未做，供下一轮取舍）
+
+- `BaseTable` 与 `EnhancedBaseTable` 功能大量重叠，且**只有 user 页与 demo 页在用**，
+  其余页面各自裸写 `n-data-table`。要统一交互得先决定这两个组件的取舍。
+- `SearchForm` 没有展开/收起，筛选项多时会撑满一行。
+- 各页面空态/错误态仍未统一（仪表盘与登录/注册已统一）。
+- 表格密度、列宽、批量选择交互未系统梳理。
+
+### 约束提醒
+
+- 用户规矩：**本地提交不推送**，等明确指令才推
+- 视觉验证默认 **Google Chrome**；本轮 Chrome 扩展不可用，改用 Codex 内置浏览器
+
 ## v0.20.0 规划（2026-10-03 会话 · 当前）
 
 ### 当前目标

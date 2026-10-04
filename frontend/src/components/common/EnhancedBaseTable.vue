@@ -225,6 +225,6 @@ const onSearch = debounce((val: string) => {
 }
 .enhanced-table__total {
   font-size: 13px;
-  color: #888;
+  color: var(--text-tertiary);
 }
 </style>

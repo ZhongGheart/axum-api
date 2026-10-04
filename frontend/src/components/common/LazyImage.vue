@@ -97,7 +97,7 @@ function onError() {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #f5f5f5;
+  background: var(--bg-subtle, #f5f5f5);
   border-radius: 4px;
   overflow: hidden;
 }

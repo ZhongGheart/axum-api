@@ -179,6 +179,7 @@ import { authApi } from '@/api/auth'
 import { showError, showSuccess, showWarning } from '@/utils/message'
 import { passwordIssues } from '@/utils/password'
 import BaseUpload from '@/components/common/BaseUpload.vue'
+import { resolveAvatarUrl } from '@/utils/avatar'
 import type { UserInfo } from '@/api/types/response'
 
 const router = useRouter()
@@ -202,14 +203,11 @@ const avatarMaxSize = 2 * 1024 * 1024
 /**
  * 头像展示 URL
  *
- * 后端存的是站内相对路径（`/uploads/avatars/xxx.png`），
- * 直接塞进 `src` 会指向前端 dev server 的端口，因此要补上 API 前缀。
+ * 拼接规则（站内相对路径要补 API 前缀）收在 `@/utils/avatar` 里，
+ * 顶栏头像与这里走同一个函数——两处各写一份时，改了一处就会留下
+ * "个人中心能看到头像、顶栏还是首字母"的分裂。
  */
-const avatarSrc = computed(() => {
-  const url = userStore.userInfo?.avatar_url
-  if (!url) return ''
-  return `${import.meta.env.VITE_API_BASE_URL || '/api'}${url}`
-})
+const avatarSrc = computed(() => resolveAvatarUrl(userStore.userInfo?.avatar_url))
 
 /**
  * naive-ui 的上传组件直接把响应体塞进 `file.response`，

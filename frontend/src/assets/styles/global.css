@@ -6,26 +6,80 @@
  */
 
 /* ============================================
-   CSS 变量
-   ============================================ */
+   设计令牌
+   ============================================
+   色值与 `stores/app.ts` 的 theme-overrides 保持一致，改一处要改两处。
+   组件里凡是用得到主题色的地方一律走这里的变量，不再写死 hex。 */
 
 :root,
 [data-theme='light'] {
-  --bg-color: #f5f7fa;
+  /* 表面 */
+  --bg-color: #f4f5f7;
   --bg-card: #ffffff;
-  --text-primary: #1a1a2e;
-  --text-secondary: #666;
-  --border-color: #e5e7eb;
-  --shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+  --bg-elevated: #ffffff;
+  --bg-subtle: #fafbfc;
+  --bg-hover: #f0f2f6;
+  --bg-active: #e8eefc;
+
+  /* 文本 */
+  --text-primary: #1c1f26;
+  --text-secondary: #5a6070;
+  --text-tertiary: #8b909e;
+  --text-inverse: #ffffff;
+
+  /* 品牌与状态 */
+  --primary-color: #2b5fd9;
+  --primary-color-hover: #3f74f0;
+  --primary-color-soft: #e8eefc;
+  --success-color: #1f9254;
+  --success-color-soft: #e6f5ec;
+  --warning-color: #b8730c;
+  --warning-color-soft: #fdf3e2;
+  --danger-color: #c8373d;
+  --danger-color-soft: #fbeaea;
+
+  /* 描边与投影 */
+  --border-color: #e3e5e9;
+  --border-color-strong: #d5d9e0;
+  --shadow: 0 1px 2px rgba(20, 24, 34, 0.05);
+  --shadow-raised: 0 4px 16px rgba(20, 24, 34, 0.08);
+
+  --radius-sm: 5px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
 }
 
 [data-theme='dark'] {
-  --bg-color: #101014;
-  --bg-card: #1e1e22;
-  --text-primary: #e5e5e5;
-  --text-secondary: #999;
-  --border-color: #333;
-  --shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+  --bg-color: #14161a;
+  --bg-card: #1c1f25;
+  --bg-elevated: #232730;
+  --bg-subtle: #22262e;
+  --bg-hover: #252a33;
+  --bg-active: #24304f;
+
+  --text-primary: #e8eaee;
+  --text-secondary: #a8aeb9;
+  --text-tertiary: #7e8593;
+  --text-inverse: #14161a;
+
+  --primary-color: #5b8cf5;
+  --primary-color-hover: #7aa5f8;
+  --primary-color-soft: #24304f;
+  --success-color: #3fb877;
+  --success-color-soft: #1e3328;
+  --warning-color: #e0a23c;
+  --warning-color-soft: #362a18;
+  --danger-color: #e2666c;
+  --danger-color-soft: #38201f;
+
+  --border-color: #2e333d;
+  --border-color-strong: #3a414d;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.32);
+  --shadow-raised: 0 4px 16px rgba(0, 0, 0, 0.42);
+
+  --radius-sm: 5px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
 }
 
 /* ============================================
@@ -99,13 +153,63 @@ a {
    通用工具类
    ============================================ */
 
+/*
+ * 页面容器 = 一张卡片。
+ *
+ * 此前是硬编码的 `background: var(--bg-card)` + `border-radius: 8px`，
+ * 与 n-card 的圆角/边框各自为政。现在圆角和投影都走变量，
+ * 和主题里 Card 的 8px 对齐，页面卡与组件卡看起来是同一套。
+ */
 .page-container {
-  padding: 24px;
+  padding: 20px 22px;
   background: var(--bg-card);
-  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow);
 }
 
 .page-header {
   margin-bottom: 16px;
+}
+
+/* 卡片内的分节标题：小标题 + 右侧操作区，比每个区块各写一个 n-page-header 轻 */
+.section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* 次要说明文字：表格计数、字段下方提示等 */
+.text-secondary {
+  color: var(--text-secondary);
+}
+
+.text-tertiary {
+  color: var(--text-tertiary);
+}
+
+/* 危险操作提示（表单字段下方的红字说明） */
+.text-danger {
+  font-size: 12px;
+  color: var(--danger-color);
+}
+
+/* 键盘可达性：naive-ui 自带 focus ring，这里补一条浏览器默认的轮廓兜底 */
+:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: 2px;
+}
+
+/* 尊重系统的"减少动效"偏好 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

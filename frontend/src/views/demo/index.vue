@@ -118,7 +118,7 @@ const lineOptions = {
 const barOptions = {
   xAxis: { type: 'category' as const, data: months },
   yAxis: { type: 'value' as const },
-  series: [{ type: 'bar' as const, data: [30, 45, 60, 35, 50, 40], itemStyle: { color: '#2080f0' } }],
+  series: [{ type: 'bar' as const, data: [30, 45, 60, 35, 50, 40], itemStyle: { color: '#2b5fd9' } }],
 }
 
 // ── 表格 ────────────────────────────────────────────────────

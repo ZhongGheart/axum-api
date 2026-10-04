@@ -89,6 +89,7 @@ import {
   rangeStartsBeforeOldest,
 } from '@/utils/auditRetention'
 import { showSuccess, showError, showWarning } from '@/utils/message'
+import { formatDateTime } from '@/utils/time'
 import { PERM } from '@/constants/permission'
 
 const loading = ref(false)
@@ -157,7 +158,15 @@ const columns: DataTableColumn[] = [
   },
   { title: 'IP', key: 'client_ip', width: 140 },
   { title: '耗时(ms)', key: 'duration_ms', width: 80 },
-  { title: '时间', key: 'created_at', width: 180 },
+  {
+    title: '时间',
+    key: 'created_at',
+    width: 180,
+    // 后端给的是 RFC3339（`2026-10-03T23:18:48.344131Z`），直接铺开难读且会被折行
+    render(row: Record<string, unknown>) {
+      return h('span', { title: String(row.created_at ?? '') }, formatDateTime(row.created_at as string))
+    },
+  },
   {
     title: '变更摘要',
     key: 'result',

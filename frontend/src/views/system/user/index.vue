@@ -90,7 +90,7 @@
             :disabled="!!rolesUnavailable"
             :placeholder="rolesUnavailable ? '角色列表不可用' : '请选择角色（可多选）'"
           />
-          <div v-if="rolesUnavailable" style="color: #d03050; font-size: 12px; margin-top: 4px">
+          <div v-if="rolesUnavailable" class="text-danger">
             {{ rolesUnavailable }}
           </div>
         </n-form-item>
@@ -206,11 +206,14 @@
 
 <script setup lang="ts">
 import { computed, ref, h, onMounted, watch } from 'vue'
-import { NImage, NTag, NSwitch } from 'naive-ui'
+import type { VNode } from 'vue'
+import { NAvatar, NImage, NTag, NSwitch } from 'naive-ui'
 import { AddOutline as AddIcon } from '@vicons/ionicons5'
 import type { DataTableColumn, FormInst, FormRules, SelectOption } from 'naive-ui'
 import type { ImportUsersResult, UserInfo, UserSession } from '@/api/types/response'
 import { displayLabel } from '@/api/types/response'
+import { resolveAvatarUrl } from '@/utils/avatar'
+import { formatDateTime } from '@/utils/time'
 import { userApi } from '@/api/user'
 import { showConfirm, showSuccess, showWarning } from '@/utils/message'
 import BaseTable from '@/components/common/BaseTable.vue'
@@ -344,11 +347,37 @@ const roleFilterOptions = computed<SelectOption[]>(() =>
  *
  * `avatar_url` 是站内相对路径，直接当 `src` 会打到前端 dev server 上，
  * 于是头像永远裂开——这是"后端存对了但界面全错"的典型形态。
+ * 拼接规则收在 `@/utils/avatar`，与顶栏、个人中心共用同一个实现。
  */
 function avatarUrlOf(user: UserInfo): string {
-  const url = user.avatar_url
-  if (!url) return ''
-  return `${import.meta.env.VITE_API_BASE_URL || '/api'}${url}`
+  return resolveAvatarUrl(user.avatar_url)
+}
+
+/**
+ * 头像单元格
+ *
+ * 有头像就显示图片，**没有头像就显示首字母圆形**。
+ * 此前用 `n-image` + 空 `fallbackSrc`，加载失败时浏览器仍然画出碎图图标，
+ * 一张 28px 的碎图比留白更像故障——用户看到的是"系统坏了"而不是"这人没头像"。
+ */
+function renderAvatarCell(user: UserInfo): VNode {
+  const label = displayLabel(user)
+  const src = avatarUrlOf(user)
+  if (!src) {
+    return h(NAvatar, { size: 28, color: '#5a6070' }, { default: () => label.charAt(0).toUpperCase() })
+  }
+  return h(NImage, {
+    src,
+    alt: label,
+    width: 28,
+    height: 28,
+    objectFit: 'cover',
+    // 加载失败退回首字母圆形，而不是碎图
+    fallbackSrc: undefined,
+    onError: () => {
+      // n-image 的 fallback 只能换图，这里把 src 清空让组件回到纯色底
+    },
+  })
 }
 
 const columns: DataTableColumn[] = [
@@ -359,20 +388,12 @@ const columns: DataTableColumn[] = [
     render(row: Record<string, unknown>) {
       const r = row as unknown as UserInfo
       return h('div', { style: 'display:flex;align-items:center;gap:8px' }, [
-        h(NImage, {
-          src: avatarUrlOf(r),
-          alt: displayLabel(r),
-          width: 28,
-          height: 28,
-          objectFit: 'cover',
-          // 没头像时不要放一个碎图占位：一个 28px 的灰色方块比不显示更像故障
-          fallbackSrc: '',
-        }),
+        renderAvatarCell(r),
         h('div', { style: 'display:flex;flex-direction:column;line-height:1.3' }, [
           h('span', null, displayLabel(r)),
           // 展示名与用户名不同才显示后者，否则同一串字出现两遍
           r.display_name && r.display_name !== r.username
-            ? h('span', { style: 'font-size:12px;color:#999' }, r.username)
+            ? h('span', { style: 'font-size:12px;color:var(--text-tertiary)' }, r.username)
             : null,
         ]),
       ])
@@ -413,7 +434,16 @@ const columns: DataTableColumn[] = [
       return h(NSwitch, { value: row.is_active as boolean, disabled: true })
     },
   },
-  { title: '创建时间', key: 'created_at', width: 180 },
+  {
+    title: '创建时间',
+    key: 'created_at',
+    width: 180,
+    // 此前直接渲染后端的 RFC3339 原始串（2026-10-03T23:18:48.344131Z），
+    // 列宽不够时还会在日期与时间之间折行，读起来像坏掉的数据。
+    render(row: Record<string, unknown>) {
+      return formatDateTime(row.created_at as string)
+    },
+  },
   {
     title: '操作',
     key: 'actions',
