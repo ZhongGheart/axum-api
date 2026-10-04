@@ -5,6 +5,7 @@
 use serde::Deserialize;
 
 use crate::error::AppError;
+use crate::model::setting::PasswordPolicy;
 
 /// 校验结果类型
 pub type ValidationResult<T> = Result<T, AppError>;
@@ -95,6 +96,8 @@ pub fn normalize_login_input(raw: &str) -> String {
 pub const PASSWORD_MIN_LEN: usize = 8;
 /// 口令最大长度
 pub const PASSWORD_MAX_LEN: usize = 128;
+/// 口令至少要命中的字符类别数
+pub const PASSWORD_MIN_CHAR_CLASSES: usize = 2;
 
 /// 口令复杂度校验
 ///
@@ -103,24 +106,41 @@ pub const PASSWORD_MAX_LEN: usize = 128;
 /// 而复杂度是**明文**规则；若把它塞进登录路径，
 /// 抬高门槛的当天，所有存量弱口令用户会被当场锁在门外。
 ///
-/// 规则：长度 8–128，且至少命中 2 类字符。
+/// 规则：**由 [`PasswordPolicy`] 给定**（v0.22.0 起）。本函数本身
+/// 保留下来是为了给"没有 AppState 的纯函数调用点"（契约测试、
+/// 迁移校验脚本）一个走默认策略的入口；线上真实路径一律走
+/// [`validate_password_with`]，它吃的是从参数表读出来的策略。
+///
+/// 默认策略下规则是长度 8–128、且至少命中 2 类字符——
+/// 这与 v0.21.0 及此前的硬编码常量逐字一致。
 ///
 /// 五类分别是：ASCII 大写、ASCII 小写、数字、符号、**非 ASCII 字母**。
 /// 2 类而非 3 类是为了不误伤 `admin123` —— 它是 README 与 e2e 的
 /// 默认账号，卡住它等于卡住首次部署和整个测试套件。
 pub fn validate_password(password: &str) -> ValidationResult<()> {
+    validate_password_with(password, &PasswordPolicy::default())
+}
+
+/// 按给定策略校验口令复杂度
+///
+/// 与 [`validate_password`] 的唯一区别是策略来源：一个是代码里的默认常量，
+/// 一个是管理员在「系统参数」页改出来的运行时取值。
+/// **两条路径都只在设置口令时调用**，理由同上。
+pub fn validate_password_with(password: &str, policy: &PasswordPolicy) -> ValidationResult<()> {
     // 按**字符数**而非字节数判定：多字节口令（如中文）不该按字节被算得更长，
     // 也不该因长度差异产生"同样的密码在不同语言环境判定不同"的结果。
     let len = password.chars().count();
 
-    if len < PASSWORD_MIN_LEN {
+    if len < policy.min_length {
         return Err(AppError::BadRequest(format!(
-            "密码长度不能少于 {PASSWORD_MIN_LEN} 个字符"
+            "密码长度不能少于 {} 个字符",
+            policy.min_length
         )));
     }
-    if len > PASSWORD_MAX_LEN {
+    if len > policy.max_length {
         return Err(AppError::BadRequest(format!(
-            "密码长度不能超过 {PASSWORD_MAX_LEN} 个字符"
+            "密码长度不能超过 {} 个字符",
+            policy.max_length
         )));
     }
 
@@ -156,10 +176,26 @@ pub fn validate_password(password: &str) -> ValidationResult<()> {
     .filter(|hit| **hit)
     .count();
 
-    if classes < 2 {
+    if classes < policy.min_char_classes {
         return Err(AppError::BadRequest(
-            "密码复杂度不足：需至少包含大写字母、小写字母、数字、符号中的两类（纯中文口令请至少加一个数字）"
-                .into(),
+            format!(
+                "密码复杂度不足：需至少包含大写字母、小写字母、数字、符号中的 {} 类（纯中文口令请至少加一个数字）",
+                policy.min_char_classes
+            ),
+        ));
+    }
+
+    // 大小写混合是**独立的一条**，而不是把"类别数"的算法改掉。
+    //
+    // 为什么不折进类别计数：一个 12 字符口令 `password123` 命中
+    // "小写 + 数字"两类，按 `min_char_classes = 2` 是**合法**的——
+    // 而它完全不含大写。若把"大小写混合"折进类别数，
+    // 开启开关后这类口令仍要再判一次，两条规则会互相掩盖，
+    // 报错文案也会说不清到底是哪一条不满足。
+    // 分开判，两条规则的失败原因各自可读。
+    if policy.require_mixed_case && !(has_upper && has_lower) {
+        return Err(AppError::BadRequest(
+            "密码必须同时包含大写字母和小写字母".into(),
         ));
     }
     Ok(())
@@ -525,6 +561,135 @@ mod tests {
             validate_password(&"a1".repeat(65)), // 130 位，超一
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    /// 抬高最小长度只影响**设置口令**，不影响存量口令的登录
+    ///
+    /// 这是 v0.22.0 把策略参数化之后最容易写错的地方：策略一旦可配，
+    /// 管理员当天就能把 min_length 从 8 抬到 20。若这条约束被破坏，
+    /// 抬高策略会**当场把所有存量用户锁在门外**。
+    #[test]
+    fn raising_min_length_never_blocks_existing_users_from_logging_in() {
+        let strict = PasswordPolicy {
+            min_length: 20,
+            ..Default::default()
+        };
+        // 弱口令过不了"设置口令"这一关
+        assert!(matches!(
+            validate_password_with("abcd1234", &strict),
+            Err(AppError::BadRequest(_))
+        ));
+        // 但它的哈希仍应能被 check_password 认出来（登录不校验复杂度）
+        let hash = crate::utils::password::hash_password("abcd1234").expect("哈希应成功");
+        assert!(matches!(
+            crate::utils::password::check_password("abcd1234", &hash).expect("校验应成功"),
+            crate::utils::password::PasswordCheck::Valid
+        ));
+    }
+
+    /// 策略化之后，"至少 2 类"必须仍然是 2 而不是别的数
+    #[test]
+    fn default_policy_keeps_two_character_classes() {
+        assert!(validate_password_with("abcd1234", &PasswordPolicy::default()).is_ok());
+        assert!(matches!(
+            validate_password_with("abcdefgh", &PasswordPolicy::default()),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    /// 把类别数调到 3 必须真的多要求一类，否则这个参数就是个摆设
+    #[test]
+    fn raising_min_char_classes_actually_tightens_the_rule() {
+        let strict = PasswordPolicy {
+            min_char_classes: 3,
+            ..Default::default()
+        };
+        // 默认策略下合法（"小写 + 数字"两类）
+        assert!(validate_password_with("abcd1234", &PasswordPolicy::default()).is_ok());
+        // 三类策略下必须拒
+        assert!(matches!(
+            validate_password_with("abcd1234", &strict),
+            Err(AppError::BadRequest(_))
+        ));
+        // 补上符号后三类齐了，放行
+        assert!(validate_password_with("abcd1234!", &strict).is_ok());
+    }
+
+    /// 「强制大小写混合」必须真的生效
+    ///
+    /// `password123` 命中"小写 + 数字"两类，在默认类别数下合法，
+    /// 但完全不含大写——若这条开关被实现成"只改错误文案"，
+    /// 它就会变成 v0.16.0 那种"写入成功但无效果"的开关。
+    #[test]
+    fn require_mixed_case_actually_rejects_single_case_passwords() {
+        let mixed = PasswordPolicy {
+            require_mixed_case: true,
+            ..Default::default()
+        };
+        // 默认策略下放行
+        assert!(validate_password_with("password123", &PasswordPolicy::default()).is_ok());
+        // 开启后必须拒，且理由要说清是哪一条
+        assert!(matches!(
+            validate_password_with("password123", &mixed),
+            Err(AppError::BadRequest(msg)) if msg.contains("大写")
+        ));
+        // 反向也要拒：只有大写同样不合法
+        assert!(matches!(
+            validate_password_with("PASSWORD123", &mixed),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(validate_password_with("Password123", &mixed).is_ok());
+    }
+
+    /// 大小写混合用的是 **ASCII** 判定，不能被汉字"顶替"
+    ///
+    /// 汉字既不是 ASCII 大写也不是 ASCII 小写。若这里不限定 ASCII，
+    /// "密码密码密码1" 会被算成"含小写"，开关就完全失效。
+    #[test]
+    fn mixed_case_uses_ascii_not_unicode_case_categories() {
+        let mixed = PasswordPolicy {
+            require_mixed_case: true,
+            ..Default::default()
+        };
+        // 8 个汉字 + 1 个数字 = 9 个字符：长度必须先过线，
+        // 否则这条断言测到的是"长度不足"而不是"汉字不算 ASCII 大小写"。
+        let chinese = "密码密码密码密码1";
+        assert_eq!(chinese.chars().count(), 9);
+        assert!(
+            matches!(
+                validate_password_with(chinese, &mixed),
+                Err(AppError::BadRequest(msg)) if msg.contains("大写")
+            ),
+            "汉字不应被算作 ASCII 大写或小写"
+        );
+        // 前提自检：同一串在默认策略下（不要求大小写混合）必须能过，
+        // 否则上面的失败可能来自长度或类别数，而测不到 ASCII 判定
+        assert!(
+            validate_password_with(chinese, &PasswordPolicy::default()).is_ok(),
+            "前提：这串口令只该被大小写混合这条规则拒"
+        );
+    }
+
+    /// 报错文案必须引用**实际生效的策略值**，不能是写死的数字
+    ///
+    /// 与 `username_length_message_quotes_the_constants` 同理：
+    /// 参数化之后文案里的数字若与策略脱钩，管理员调了参数
+    /// 而用户看到的还是"至少 8 个字符"，就会去猜哪里出了问题。
+    #[test]
+    fn password_length_message_quotes_the_active_policy() {
+        let strict = PasswordPolicy {
+            min_length: 20,
+            max_length: 32,
+            ..Default::default()
+        };
+        let msg = match validate_password_with("abcd1234", &strict) {
+            Err(AppError::BadRequest(m)) => m,
+            other => panic!("期望长度报错，实得 {other:?}"),
+        };
+        assert!(
+            msg.contains("20"),
+            "报错应引用当前策略的最小长度，实际文案：{msg}"
+        );
     }
 
     /// 单字符类必须拒绝：`12345678` 长度够但只有一个字符类，

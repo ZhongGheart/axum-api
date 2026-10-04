@@ -48,8 +48,8 @@
             v-model:value="formData.password"
             type="password"
             show-password-on="click"
-            :placeholder="PASSWORD_PLACEHOLDER"
-            :maxlength="PASSWORD_MAX_LEN"
+            :placeholder="passwordPlaceholderText"
+            :maxlength="passwordMaxLen"
             clearable
             :input-props="{ autocomplete: 'new-password' }"
           >
@@ -65,7 +65,7 @@
             type="password"
             show-password-on="click"
             placeholder="请再次输入密码"
-            :maxlength="PASSWORD_MAX_LEN"
+            :maxlength="passwordMaxLen"
             clearable
             :input-props="{ autocomplete: 'new-password' }"
           >
@@ -106,7 +106,7 @@
  * - 密码确认校验
  * - 注册成功后自动跳转登录页
  */
-import { ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   PersonOutline as UserIcon,
@@ -119,13 +119,14 @@ import { showSuccess } from '@/utils/message'
 import { handleError } from '@/api/helper'
 import {
   emailRules,
-  PASSWORD_PLACEHOLDER,
+  passwordMaxLength,
+  passwordPlaceholder,
   passwordPolicyRules,
   USERNAME_MAX_LEN,
   USERNAME_PLACEHOLDER,
   usernameRules,
 } from '@/utils/accountRules'
-import { PASSWORD_MAX_LEN } from '@/utils/password'
+import { useSettingStore } from '@/stores/setting'
 import AuthShell from '@/components/common/AuthShell.vue'
 
 // ── 状态 ────────────────────────────────────────────────────────
@@ -154,10 +155,18 @@ const formData = ref<RegisterForm>({
 // `passwordIssues`，也就是后端契约测试 `password_policy_agrees_with_the_frontend_copy`
 // 绑定的那个实现。这里不再自己写 min/max——v0.18.0 的缺陷正是"自己写了一份"。
 
-const formRules: FormRules = {
+// 口令策略来自服务端（`GET /api/settings/password-policy`）：
+// 管理员能在系统参数页改规则，前端仍按 8 位 / 两类来提示就会
+// 「界面说合规、后端说不合规」。取不到时 store 保留与后端默认值
+// 一致的回落策略，提示偏保守但不会把合规口令拦在门外。
+const settingStore = useSettingStore()
+const passwordPlaceholderText = computed(() => passwordPlaceholder(settingStore.passwordPolicy))
+const passwordMaxLen = computed(() => passwordMaxLength(settingStore.passwordPolicy))
+
+const formRules = computed<FormRules>(() => ({
   username: usernameRules,
   email: emailRules,
-  password: passwordPolicyRules,
+  password: passwordPolicyRules(settingStore.passwordPolicy),
   confirmPassword: [
     { required: true, message: '请再次输入密码', trigger: 'blur' },
     {
@@ -170,7 +179,7 @@ const formRules: FormRules = {
       trigger: 'blur',
     },
   ],
-}
+}))
 
 // ── 注册提交 ────────────────────────────────────────────────────
 
@@ -194,6 +203,11 @@ async function handleRegister(): Promise<void> {
     submitting.value = false
   }
 }
+
+onMounted(() => {
+  // 公开端点，未登录也能取。失败不阻塞注册（后端才是裁决方）
+  void settingStore.loadPasswordPolicy()
+})
 </script>
 
 <style scoped>

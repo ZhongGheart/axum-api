@@ -77,8 +77,8 @@
           <n-input
             v-model:value="formData.password"
             type="password"
-            :placeholder="PASSWORD_PLACEHOLDER"
-            :maxlength="PASSWORD_MAX_LEN"
+            :placeholder="passwordPlaceholderText"
+            :maxlength="passwordMaxLen"
           />
         </n-form-item>
         <n-form-item label="角色" path="roles">
@@ -230,13 +230,14 @@ import {
 } from '@/utils/role'
 import {
   emailRules,
-  PASSWORD_PLACEHOLDER,
+  passwordMaxLength,
+  passwordPlaceholder,
   passwordPolicyRules,
   USERNAME_MAX_LEN,
   USERNAME_PLACEHOLDER,
   usernameRules,
 } from '@/utils/accountRules'
-import { PASSWORD_MAX_LEN } from '@/utils/password'
+import { useSettingStore } from '@/stores/setting'
 
 // ── 状态 ────────────────────────────────────────────────────────
 
@@ -313,15 +314,21 @@ const formData = ref<UserForm>({
 // v0.18.0 之前这里是自己写的：`password: [{ min: 6 }]` 且**完全没有用户名字符集
 // 规则**。管理员在对话框里输入 `user@name` 能过前端校验，保存后才收到
 // "用户名只能包含字母、数字、下划线和连字符"。
-const formRules: FormRules = {
+// 管理员建号用的口令规则必须与被建的人**将来在注册页看到的**同源，
+// 而注册页读的是服务端策略——所以这里也读，不能各拿一份常量。
+const settingStore = useSettingStore()
+const passwordPlaceholderText = computed(() => passwordPlaceholder(settingStore.passwordPolicy))
+const passwordMaxLen = computed(() => passwordMaxLength(settingStore.passwordPolicy))
+
+const formRules = computed<FormRules>(() => ({
   username: usernameRules,
   email: emailRules,
-  password: passwordPolicyRules,
+  password: passwordPolicyRules(settingStore.passwordPolicy),
   // 多选：naive-ui 的 `required` 对数组不生效，必须配 `type:'array'` + `min`
   roles: [
     { required: true, type: 'array', min: 1, message: '请至少选择一个角色' },
   ],
-}
+}))
 
 // ── 筛选选项 ────────────────────────────────────────────────────
 
@@ -725,5 +732,6 @@ async function handleDelete(id: string) {
 
 onMounted(() => {
   fetchUsers()
+  void settingStore.loadPasswordPolicy()
 })
 </script>

@@ -3,6 +3,154 @@
 本文件是跨会话的交接日志。任何非平凡改动在**动手前**先写这里，达成里程碑后更新。
 接手者必须先把它与 `git status` / `git diff` / 实际文件系统对账。
 
+## v0.22.0 系统参数配置表 + 口令策略（2026-10-04 会话 · ✅ 已完成，未推送）
+
+### 当前目标
+
+用户指令：**执行 v0.22.0**。
+
+### 起始 git 状态
+
+- 分支 `master`，工作区干净，`HEAD == ded82c37`，与 origin/master 同步（v0.21.0 已发布）
+- 后端 `127.0.0.1:8080`；前端 vite `localhost:3000`；PG 55432 / Redis 56379
+
+### 范围取舍：只做 C2 + C3，C1 推到 v0.23.0
+
+ROADMAP 的 v0.22.0 表格列了 C1/C2/C3/C4 四项，但**它自己的排序理由否掉了其中两项**：
+
+- 「C1 独立但量大，可以和 C2 并行，但**不要同版**——树形递归删除的边界情况
+  （父子循环、跨部门角色授权）需要独立的测试预算」
+- 「C4 ... 建议单独占一版而不是塞进 v0.22.0」
+
+所以本版 = **C2（系统参数配置表）+ C3（口令复杂度与过期策略）**。
+C3 硬依赖 C2（策略要可配），两者同版是自洽的；C1 顺延到 v0.23.0。
+这是按路线图**最经得起推敲的那句**执行，不是自行缩小范围。
+
+### 计划
+
+1. 迁移 `016_system_settings.sql`：参数表 + 存量口令时间戳列
+2. `model/setting.rs`：参数定义的**单一数据源**（照抄 `permission.rs` 的 const 表模式）
+3. `repository/setting.rs`：读写 + Redis 缓存与失效
+4. `service/setting.rs`：类型化读取、范围校验
+5. `controller/setting.rs`：管理端 CRUD + 面向登录页的公开读取
+6. `utils/validation.rs`：口令策略改为**由参数驱动**，不再是写死常量
+7. 前端：系统参数页 + 登录/注册页实时策略提示 + 口令强度指示
+8. 测试：参数契约、缓存失效、口令策略边界、**缺陷注入**
+
+### 硬约束（沿用）
+
+- 口令策略**绝不能**进入登录校验路径（`password_policy_is_not_applied_to_login_verification` 已钉住）
+- 抬高口令强度门槛的当天，**存量弱口令用户不能被锁在门外**
+- 每个修复都要做缺陷注入验证
+
+### 环境注意
+
+必须带 `RATE_LIMIT_IP_MAX=100000` / `RATE_LIMIT_USER_MAX=100000` 起后端，否则整轮 e2e 因限流假红。
+
+### 里程碑：后端完成（迁移 016 + 参数表 + 口令策略接线）
+
+后端 7 个新文件 + 16 个改动文件已落地，`cargo test --lib` 108 passed。
+新增 13 条集成测试逐条单跑均通过。
+
+**本轮踩到并已修掉的坑（写下来是因为它会再犯）**：
+
+1. **参数表种子值静默盖掉了部署配置。** 首次集成时 `LOGIN_MAX_FAILURES=3`
+   被种子值 10 盖掉，于是「失败 3 次应锁定」变成 200，**日志里一个字都没有**。
+   修法确立为：判定「管理员显式改过」靠 `updated_by IS NOT NULL`，
+   改过 → 参数表；没改 → 环境变量。判定由数据本身承载，不依赖内存状态。
+2. **存量库拿不到新权限码。** `seed_menus_if_empty` 只在 `menus` 表为空时写整棵树，
+   而已存在的部署 `menus` 非空，于是 `/system/setting` 永远种不进去；
+   权限码按 `parent_path` 解析父菜单，解析不到就**只打一行 warn 然后跳过**——
+   管理员手动授权也授权不了。新增 `backfill_late_added_menus` 补齐。
+3. **两条测试自身有缺陷**（不是产品缺陷，但会让整轮结果不可信）：
+   `put_setting_raw(...)` 漏 `.await` 导致清理不执行、状态串味；
+   `the_settings_endpoints_require_their_permission_codes` 撤销 admin 授权后
+   未恢复，污染了后续两条测试。均已修（加了 `grant_permission_code()` helper）。
+
+### 里程碑：前端完成（参数页 + 策略驱动的口令校验）
+
+新增 `frontend/src/api/setting.ts`（5 个接口）、`frontend/src/stores/setting.ts`、
+`frontend/src/views/system/setting/index.vue`。
+
+**本轮最重要的前端决定：口令策略从常量变成运行时取值。**
+
+管理员能在参数页改最小长度/类别数/大小写混合，而前端原先把 8 位 / 两类
+写死在 `utils/password.ts` 与 `accountRules.ts` 里。若不改，后果是
+**界面提示的规则与后端实际执行的规则分叉**：用户按提示填一个合规口令、
+提交后被拒，而报错在说另一件事——界面在主动误导人。
+
+改法：
+- `passwordIssues(password, policy)` 吃传入策略；省略参数时用
+  `DEFAULT_PASSWORD_POLICY`（与后端 `PasswordPolicy::default()` 逐字一致）
+- `passwordPolicyRules` / `PASSWORD_PLACEHOLDER` / `PASSWORD_MAX_LEN`
+  **从常量变成函数**，由注册页、改密页、管理员建号三处传入 store 里的策略
+- 判定失败原因（`passwordIssues`）与界面要求提示（`describePasswordPolicy`）
+  **共用同一个 `classRequirementText`**——两处各写一份时漏改的那处会开始说另一件事
+- `stores/setting` 的降级路径：取不到策略时保留回落值且**不抛、不弹错**。
+  它是纯提示性增强，为它弹红字会让「服务端暂时不可达」看起来像「注册坏了」
+
+前端门禁全绿：`typecheck` ✓、`lint` 0 error（余 1 个 env.d.ts 既有 warning）、
+`test` 203 passed（21 个文件）。后端 4 条前后端契约测试重跑仍绿。
+
+### 里程碑：缺陷注入验证完成（5 处，1 处暴露了真实测试缺口）
+
+| 注入 | 结果 |
+|---|---|
+| 删掉注册时的 `password_changed_at` 写入 | **首次全绿 —— 暴露真实缺口** |
+| 口令过期改成拒绝登录 | ✅ 红 |
+| 参数表无条件优先于部署配置 | ✅ 红 |
+| 去掉 `backfill_late_added_menus` | ✅ 红 |
+| `require_mixed_case` 只改文案不改判定 | ✅ 红 |
+
+**第一条是本轮最有价值的产出。** 注入后
+`an_expired_password_yields_a_restricted_token_...` **依然通过**，
+因为它自己用 `UPDATE` 把时间戳改成 100 天前——它验的是**判定逻辑**，
+从不验**写入路径有没有写**。而 `is_expired(None)` 按设计判为未过期，
+于是这个漏表现为**过期策略对每一个新用户永久静默失效**：
+参数页显示着 90 天，界面无任何异常，只有安全策略不在了。
+
+补了 `every_path_that_sets_a_new_password_records_when_it_was_set`
+（注册 / 自助改密 / 管理员重置三条路径），重跑注入即红。
+**教训：一条测试只能钉住它设计时要验的那一层。**
+
+写这条测试时踩了两个自己的坑：路由是 `POST /api/admin/users/{id}/reset-password`
+（不是 `PUT .../password`），请求体字段是 `password`（不是 `new_password`）——
+第一次写成 404 才改对。
+
+**注入型红测会留脏数据**（中途 FAILED 的用例不会执行清理）：
+`expiry_days` 被留在 30、`require_mixed_case` 被留在 true、
+`mixedon_*` / `expiring_*` / `stamped_*` 账号残留。收尾必须查一遍
+`system_settings` 的 `updated_by` 与测试账号前缀。
+
+### 状态：v0.22.0 已完成，本地提交，**未推送**
+
+门禁全绿：
+
+| 项 | 结果 |
+|---|---|
+| `cargo fmt --check` | ✓ |
+| `cargo clippy --all-targets -- -D warnings` | ✓ 0 warning |
+| `cargo test --lib` | 108 passed |
+| `cargo test --test api_integration -- --ignored --test-threads=1` | **176 passed / 0 failed** |
+| `pnpm lint` | 0 error（余 1 个 env.d.ts 既有 warning） |
+| `pnpm typecheck` | ✓ |
+| `pnpm test` | 203 passed / 21 文件 |
+| `pnpm build` | ✓ |
+
+文档已更新：CHANGELOG 0.22.0 条目、README（API 表 / 权限码表 / 环境变量降级说明 /
+「从 v0.21 升级到 v0.22」）、ROADMAP（v0.22.0 标记完成，C1 顺延 v0.23.0 并写明取舍）。
+版号：Cargo.toml + frontend/package.json 均抬到 `0.22.0`。
+
+**按用户既定规矩：本地提交，不推送。** 等明确指令再推 + 打 tag。
+
+### 下一版（v0.23.0）建议顺序
+
+ROADMAP 已重排为「组织结构 + 规模化」，并把 C1 部门树从 v0.22.0 移进来了。
+若只做一项：**D4 审计日志导出 / 更细检索**（后端明细能力已写好，只差端点 + 前端检索页，
+性价比最高）。若做两项：**D4 + C1**（C1 需独立测试预算，不要与其他功能混）。
+
+---
+
 ## v0.21.0 UI 梳理与优化（2026-10-04 会话 · 当前）
 
 ### 当前目标

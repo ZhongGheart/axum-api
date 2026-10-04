@@ -31,7 +31,8 @@ INSERT INTO menus (id, parent_id, name, path, component, icon, sort_order, type,
   ('7f000000-0000-4000-8000-000000000011', '7f000000-0000-4000-8000-000000000006', '接口文档', '/system/api-docs',       'system/api-docs/index','settings', 5, 'menu',      NULL, TRUE),
   ('7f000000-0000-4000-8000-000000000012', '7f000000-0000-4000-8000-000000000006', '系统监控', '/system/monitor/system', 'monitor/system/index', 'settings', 6, 'menu',      NULL, TRUE),
   ('7f000000-0000-4000-8000-000000000013', '7f000000-0000-4000-8000-000000000006', '接口监控', '/system/monitor/api',    'monitor/api/index',    'settings', 7, 'menu',      NULL, TRUE),
-  ('7f000000-0000-4000-8000-000000000014', '7f000000-0000-4000-8000-000000000006', '字典管理', '/system/dict',           'system/dict/index',    'settings', 8, 'menu',      NULL, TRUE)
+  ('7f000000-0000-4000-8000-000000000014', '7f000000-0000-4000-8000-000000000006', '字典管理', '/system/dict',           'system/dict/index',    'settings', 8, 'menu',      NULL, TRUE),
+  ('7f000000-0000-4000-8000-000000000015', '7f000000-0000-4000-8000-000000000006', '系统参数', '/system/setting',        'system/setting/index', 'settings', 9, 'menu',      NULL, TRUE)
 ON CONFLICT (id) DO NOTHING
 "#;
 
@@ -210,7 +211,87 @@ impl RbacService {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<(), AppError> {
         self.seed_menus_if_empty(tx).await?;
+        self.backfill_late_added_menus(tx).await?;
         self.seed_permission_codes(tx).await
+    }
+
+    /// 补写「后加的」页面菜单（幂等，每次启动执行）
+    ///
+    /// ── 为什么需要这一步 ──────────────────────────────────
+    /// [`Self::seed_menus_if_empty`] 只在 `menus` 表为空时写整棵树，
+    /// 那对"全新库"是对的。但**已存在的部署** `menus` 非空，
+    /// 于是 v0.22.0 新增的 `/system/setting` 页面菜单永远不会被写进去。
+    ///
+    /// 后果不是"少一个菜单"，而是连锁的：
+    /// `seed_permission_codes` 按 `parent_path` 解析父菜单，
+    /// 解析不到就**只打一行 warn 然后跳过**——于是
+    /// `system:setting:list` / `system:setting:update` 这两个码
+    /// 在存量库上根本没种出来，管理员就算手动授权也授权不了，
+    /// 访问参数页直接 403。
+    ///
+    /// 那种失败没有任何报错：权限码表里就是没有这两条，
+    /// 看起来像"功能没做完"而不是"种子漏了一步"。
+    ///
+    /// 所以凡是**跨版本新增**的页面菜单都必须登记在这里，
+    /// 不能指望 `seed_menus_if_empty` —— 它的语义是"尊重管理员的增删"。
+    async fn backfill_late_added_menus(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), AppError> {
+        // (id, 父菜单 path, name, path, component, sort_order)
+        const LATE_MENUS: &[(&str, &str, &str, &str, &str, i32)] = &[(
+            "7f000000-0000-4000-8000-000000000015",
+            "/system",
+            "系统参数",
+            "/system/setting",
+            "system/setting/index",
+            9,
+        )];
+
+        for (id, parent_path, name, path, component, sort) in LATE_MENUS {
+            // 父菜单不存在就整体跳过：那是"管理员删了系统管理目录"，
+            // 此时不该擅自把它连同子菜单一起塞回来。
+            let parent_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM menus WHERE path = $1 AND type <> 'button' LIMIT 1",
+            )
+            .bind(parent_path)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| {
+                AppError::InternalServerError(format!("解析 {parent_path} 父菜单失败: {e}"))
+            })?;
+
+            let Some(parent_id) = parent_id else {
+                tracing::warn!(
+                    "补写页面菜单 {path} 失败：父菜单 {parent_path} 不存在，跳过（管理员可能已删除该目录）"
+                );
+                continue;
+            };
+
+            // `ON CONFLICT (id) DO NOTHING` 保证不覆盖管理员的改名与排序调整
+            let inserted: Option<(Uuid,)> = sqlx::query_as(
+                r#"
+                INSERT INTO menus (id, parent_id, name, path, component, sort_order, type, is_visible)
+                VALUES ($1, $2, $3, $4, $5, $6, 'menu', TRUE)
+                ON CONFLICT (id) DO NOTHING
+                RETURNING id
+                "#,
+            )
+            .bind(Uuid::parse_str(id).expect("种子 UUID 必须合法"))
+            .bind(parent_id)
+            .bind(name)
+            .bind(path)
+            .bind(component)
+            .bind(*sort)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("补写页面菜单 {path} 失败: {e}")))?;
+
+            if inserted.is_some() {
+                tracing::info!("补写页面菜单: {path}");
+            }
+        }
+        Ok(())
     }
 
     /// 菜单树种子数据（幂等：仅在 `menus` 为空时写入）

@@ -21,7 +21,8 @@
  */
 
 import type { FormItemRule } from 'naive-ui'
-import { PASSWORD_MIN_LEN, passwordIssues } from './password'
+import { DEFAULT_PASSWORD_POLICY, describePasswordPolicy, passwordIssues } from './password'
+import type { PasswordPolicy } from './password'
 
 /** 用户名最小长度（按**字符**计，须与后端 `USERNAME_MIN_LEN` 一致） */
 export const USERNAME_MIN_LEN = 3
@@ -126,11 +127,25 @@ export const emailRules: FormItemRule[] = [
  *
  * 注册页与管理员建号对话框都用它。v0.18.0 之前这两处写的是 `min: 6`，
  * 那是 v0.10 的策略化石——现在委托给 `passwordIssues`，与改密页同源。
+ *
+ * ## v0.22.0：它从常量变成了函数
+ *
+ * 此前这里是**一个常量数组**，规则写死为 8 位 / 两类字符。
+ * 而管理员能在「系统参数」页改这两个值，于是规则一旦分叉，
+ * 用户按界面提示填一个合规口令、提交后被后端拒——界面在主动误导人。
+ *
+ * 所以策略必须**由调用方传入**：页面从 `stores/setting` 拿到服务端策略，
+ * 再用它构造规则。省略参数只为让契约测试与降级路径有入口，
+ * 省略时用的是与后端默认值逐字一致的回落策略。
  */
-export const passwordPolicyRules: FormItemRule[] = [
-  { required: true, message: '请输入密码', trigger: TRIGGER },
-  { trigger: TRIGGER, validator: toValidator(passwordIssues) },
-]
+export function passwordPolicyRules(
+  policy: PasswordPolicy = DEFAULT_PASSWORD_POLICY,
+): FormItemRule[] {
+  return [
+    { required: true, message: '请输入密码', trigger: TRIGGER },
+    { trigger: TRIGGER, validator: toValidator((v) => passwordIssues(v ?? '', policy)) },
+  ]
+}
 
 /**
  * 口令字段规则：**登录**时只要求非空，刻意不套用策略
@@ -172,8 +187,26 @@ export const loginIdentifierRules: FormItemRule[] = [
 /** 用户名输入框的 placeholder 文案（与上面的规则同源，别再各写各的） */
 export const USERNAME_PLACEHOLDER = `${USERNAME_MIN_LEN}-${USERNAME_MAX_LEN} 个字符，字母、数字、下划线或连字符`
 
-/** 口令输入框在**设置**口令时的 placeholder */
-export const PASSWORD_PLACEHOLDER = `至少 ${PASSWORD_MIN_LEN} 位，含大写、小写、数字、符号中的两类`
+/**
+ * 口令输入框在**设置**口令时的 placeholder
+ *
+ * 从策略**生成**而不是写死：界面上印着的数字必须是当前真正生效的那一份，
+ * 否则管理员把下限从 8 调到 12、界面仍提示 8 位，这条提示就从
+ * 「说明规则」变成了「教用户填一个会被拒的口令」。
+ */
+export function passwordPlaceholder(policy: PasswordPolicy = DEFAULT_PASSWORD_POLICY): string {
+  return describePasswordPolicy(policy)
+}
+
+/**
+ * 口令输入框的 maxlength
+ *
+ * 取策略的上界。写死 128 时，管理员把上界调低到 16 也不生效——
+ * 用户照样能敲进 128 个字符，提交后才被拒。
+ */
+export function passwordMaxLength(policy: PasswordPolicy = DEFAULT_PASSWORD_POLICY): number {
+  return policy.max_length
+}
 
 /**
  * 跨语言契约样例（用户名）

@@ -20,7 +20,7 @@ use sqlx::PgPool;
 /// 守卫见 `tests/api_integration.rs` 的
 /// `every_documented_endpoint_is_called_by_a_test`：新增 SELECT 手写列名会红。
 pub const USER_COLUMNS: &str =
-    "id, username, email, password_hash, is_active, must_change_password, display_name, avatar_url, created_at, updated_at";
+    "id, username, email, password_hash, is_active, must_change_password, display_name, avatar_url, password_changed_at, created_at, updated_at";
 
 /// 用户列表的筛选条件
 ///
@@ -425,17 +425,26 @@ impl UserRepository {
     }
 
     /// 更新密码哈希（用于改密与 v0.1 旧口令格式升级）
+    ///
+    /// 顺带刷新 `password_changed_at`：这是它唯一的更新点，
+    /// 漏掉的话用户改完口令仍按旧时刻算过期，改密完立刻又被要求改一次。
+    ///
+    /// v0.1 旧格式的**自动升级**也会刷新它——那是一次真实的重新哈希，
+    /// 而它并不改变口令强度，把它算作"刚设过"会轻微推迟过期判定，
+    /// 方向是安全的（不会提前锁人），可以接受。
     pub async fn update_password_hash(
         &self,
         id: Uuid,
         password_hash: &str,
     ) -> Result<(), AppError> {
-        sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
-            .bind(id)
-            .bind(password_hash)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| AppError::InternalServerError(format!("更新密码失败: {e}")))?;
+        sqlx::query(
+            "UPDATE users SET password_hash = $2, password_changed_at = NOW() WHERE id = $1",
+        )
+        .bind(id)
+        .bind(password_hash)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("更新密码失败: {e}")))?;
         Ok(())
     }
 
@@ -486,8 +495,12 @@ impl UserRepository {
     ) -> Result<User, AppError> {
         sqlx::query_as::<_, User>(&format!(
             r#"
-            INSERT INTO users (id, username, email, password_hash, is_active, must_change_password)
-            VALUES ($1, $2, $3, $4, true, $5)
+            -- `password_changed_at` 显式写 NOW()：不写的话这一列是 NULL，
+            -- 而 NULL 在过期判定里被当作"无法判断" = 不强制过期。
+            -- 结果是**每个新建用户都天生比存量用户多活一个周期**，
+            -- 过期策略对新账号完全失效——而这恰恰是最该被管住的那批人。
+            INSERT INTO users (id, username, email, password_hash, is_active, must_change_password, password_changed_at)
+            VALUES ($1, $2, $3, $4, true, $5, NOW())
             RETURNING {USER_COLUMNS}
             "#
         ))

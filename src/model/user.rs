@@ -70,6 +70,13 @@ pub struct User {
     /// v0.20.0 新增。DB 层 CHECK 只允许站内 `/uploads/` 前缀，
     /// 见迁移 014 注释里"为什么不给它开外链"的理由。
     pub avatar_url: Option<String>,
+    /// 口令最近一次被设置的时刻（v0.22.0）
+    ///
+    /// 口令过期策略的判据。**不能用 `updated_at` 顶替**：
+    /// v0.20.0 的自助改资料、管理员改显示名都会刷新 `updated_at`，
+    /// 于是"改了个头像"会被算成"刚换过口令"，过期策略被无限推迟——
+    /// 一个安全策略被另一个无关功能静默关掉。
+    pub password_changed_at: Option<DateTime<Utc>>,
     /// 创建时间
     pub created_at: DateTime<Utc>,
     /// 更新时间

@@ -129,7 +129,8 @@
                 v-model:value="form.newPassword"
                 type="password"
                 show-password-on="click"
-                placeholder="至少 8 位，含大写/小写/数字/符号中的两类"
+                :placeholder="passwordPlaceholderText"
+                :maxlength="passwordMaxLen"
                 @keyup.enter="submit"
               />
             </n-form-item>
@@ -178,6 +179,8 @@ import { useUserStore } from '@/stores/user'
 import { authApi } from '@/api/auth'
 import { showError, showSuccess, showWarning } from '@/utils/message'
 import { passwordIssues } from '@/utils/password'
+import { passwordMaxLength, passwordPlaceholder } from '@/utils/accountRules'
+import { useSettingStore } from '@/stores/setting'
 import BaseUpload from '@/components/common/BaseUpload.vue'
 import { resolveAvatarUrl } from '@/utils/avatar'
 import type { UserInfo } from '@/api/types/response'
@@ -297,6 +300,7 @@ async function saveProfile() {
 onMounted(() => {
   savedDisplayName.value = userStore.userInfo?.display_name ?? ''
   profileForm.displayName = savedDisplayName.value
+  void settingStore.loadPasswordPolicy()
 })
 
 const createdAt = computed(() => {
@@ -310,14 +314,22 @@ const formRef = ref<FormInst | null>(null)
 const submitting = ref(false)
 const form = reactive({ oldPassword: '', newPassword: '', confirmPassword: '' })
 
-const rules: FormRules = {
+// 新口令规则来自服务端（`GET /api/settings/password-policy`）。
+// **「当前密码」不套策略**：它不是新设的口令，后端登录校验验的是
+// Argon2 哈希、压根不看明文复杂度，给它挂策略会在策略被抬高后
+// 把存量弱口令用户锁在改密页外——而他们连旧密码都提交不了。
+const settingStore = useSettingStore()
+const passwordPlaceholderText = computed(() => passwordPlaceholder(settingStore.passwordPolicy))
+const passwordMaxLen = computed(() => passwordMaxLength(settingStore.passwordPolicy))
+
+const rules = computed<FormRules>(() => ({
   oldPassword: [{ required: true, message: '请输入当前密码', trigger: ['input', 'blur'] }],
   newPassword: [
     { required: true, message: '请输入新密码', trigger: ['input', 'blur'] },
     {
       trigger: ['input', 'blur'],
       validator: (_rule, value: string) => {
-        const problems = passwordIssues(value ?? '')
+        const problems = passwordIssues(value ?? '', settingStore.passwordPolicy)
         // naive-ui 的 validator 返回 Error 对象，不是字符串
         return problems.length === 0 ? true : new Error(problems.join('；'))
       },
@@ -331,14 +343,14 @@ const rules: FormRules = {
         value === form.newPassword ? true : new Error('两次输入的新密码不一致'),
     },
   ],
-}
+}))
 
 const canSubmit = computed(
   () =>
     !submitting.value &&
     form.oldPassword.length > 0 &&
     form.newPassword.length > 0 &&
-    passwordIssues(form.newPassword).length === 0 &&
+    passwordIssues(form.newPassword, settingStore.passwordPolicy).length === 0 &&
     form.newPassword === form.confirmPassword,
 )
 

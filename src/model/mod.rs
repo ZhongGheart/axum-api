@@ -6,6 +6,7 @@ pub mod menu;
 pub mod permission;
 pub mod response;
 pub mod role;
+pub mod setting;
 pub mod user;
 
 pub use audit_log::*;
@@ -14,4 +15,5 @@ pub use menu::*;
 pub use permission::*;
 pub use response::*;
 pub use role::*;
+pub use setting::*;
 pub use user::*;

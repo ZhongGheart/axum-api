@@ -11,6 +11,7 @@ use crate::model::{LoginRequest, LoginResponse, RegisterRequest, Role, UserInfo}
 use crate::repository::audit_log::{AuditEntry, AuditLogRepository};
 use crate::repository::role::RoleRepository;
 use crate::repository::user::UserRepository;
+use crate::service::setting::SettingService;
 use crate::utils::jwt::JwtUtil;
 use crate::utils::password::{check_password, hash_password, PasswordCheck};
 use crate::utils::redis::RedisClient;
@@ -74,10 +75,8 @@ pub struct AuthService {
     pub jwt_util: JwtUtil,
     /// JWT 过期时间（秒）
     pub jwt_expiration_seconds: u64,
-    /// 登录失败锁定阈值（账号维度与 IP 维度各自独立计数）
-    pub login_max_failures: u64,
-    /// 登录失败计数窗口（秒）
-    pub login_failure_window_seconds: u64,
+    /// 系统参数服务（v0.22.0）：登录失败阈值与窗口从这里**动态**读
+    pub setting_service: SettingService,
     /// 审计仓储（登录/注册审计；见 [`Self::login`]）
     pub audit_repo: AuditLogRepository,
 }
@@ -142,17 +141,15 @@ impl AuthService {
         role_repo: RoleRepository,
         jwt_util: JwtUtil,
         jwt_expiration_seconds: u64,
-        login_max_failures: u64,
-        login_failure_window_seconds: u64,
         audit_repo: AuditLogRepository,
+        setting_service: SettingService,
     ) -> Self {
         Self {
             user_repo,
             role_repo,
             jwt_util,
             jwt_expiration_seconds,
-            login_max_failures,
-            login_failure_window_seconds,
+            setting_service,
             audit_repo,
         }
     }
@@ -170,7 +167,9 @@ impl AuthService {
         // 下面的查重用的就是归一后的值，于是查重自动变成"归一后比较"——
         // 不必再单独写一条大小写不敏感的查重，那样两处规则迟早会走偏。
         let username = validation::normalize_username(&req.username)?;
-        validation::validate_password(&req.password)?;
+        // 策略来自参数表（v0.22.0），管理员改完立即生效
+        let policy = self.setting_service.password_policy().await;
+        validation::validate_password_with(&req.password, &policy)?;
         let email = validation::normalize_email(&req.email)?;
 
         if (self.user_repo.find_by_username(&username).await?).is_some() {
@@ -361,6 +360,22 @@ impl AuthService {
         // 主角色由角色集合推导，不再读取冗余的 users.role 列
         let primary_role = Role::primary_from(&roles);
 
+        // ── 口令过期判定（v0.22.0）────────────────────────────────
+        //
+        // **过期不影响登录本身**，只是把令牌降级成 v0.11.0 那套"受限令牌"。
+        //
+        // 刻意复用已有的受限令牌机制而不是新增一种拒绝：
+        // 拒绝会让过期用户**直接登不进**，而他们已经无法自助恢复
+        // （本仓没有邮件通道，改邮箱也验证不了归属）。
+        // 那等于把"口令过期"变成"账号永久锁死，且只能找管理员重置"。
+        // 降级令牌则给出一条确定能走完的路：登录 → 改密 → 令牌恢复完整。
+        //
+        // 与 `must_change_password` 取或：管理员重置的口令本来就要求改，
+        // 而过期是另一条独立原因，两者都不该互相覆盖。
+        let policy = self.setting_service.password_policy().await;
+        let expired = policy.is_expired(user.password_changed_at);
+        let must_change_password = user.must_change_password || expired;
+
         let (token, token_jti) = self
             .jwt_util
             .sign_with_jti(
@@ -369,7 +384,7 @@ impl AuthService {
                 &primary_role.to_string(),
                 &roles,
                 self.jwt_expiration_seconds,
-                user.must_change_password,
+                must_change_password,
             )
             .map_err(|e| AppError::InternalServerError(format!("JWT 签发失败: {e}")))?;
 
@@ -404,10 +419,11 @@ impl AuthService {
             client_ip,
             username: &user.username,
             user_id: Some(user.id),
-            result: if user.must_change_password {
-                "登录成功（受限令牌：待改密）"
-            } else {
-                "登录成功"
+            result: match (user.must_change_password, expired) {
+                (true, true) => "登录成功（受限令牌：管理员要求改密 + 口令已过期）",
+                (true, false) => "登录成功（受限令牌：待改密）",
+                (false, true) => "登录成功（受限令牌：口令已过期）",
+                (false, false) => "登录成功",
             },
         })
         .await?;
@@ -417,7 +433,7 @@ impl AuthService {
         Ok(LoginResponse {
             token,
             token_type: "Bearer".to_string(),
-            must_change_password: user.must_change_password,
+            must_change_password,
         })
     }
 
@@ -634,7 +650,12 @@ impl AuthService {
 
         // 先校验新口令复杂度，再验旧口令：复杂度不依赖任何数据库读取，
         // 便宜且能避免为一个必然失败的请求去做 Argon2（刻意昂贵）运算
-        validation::validate_password(new_password)?;
+        // 策略来自参数表（v0.22.0）。
+        //
+        // 注意这条路径**只在设置口令时**校验复杂度。登录校验的是 Argon2 哈希，
+        // 与策略无关——所以管理员抬高门槛不会把存量用户锁在门外。
+        let policy = self.setting_service.password_policy().await;
+        validation::validate_password_with(new_password, &policy)?;
 
         match check_password(old_password, &user.password_hash)
             .map_err(|e| AppError::InternalServerError(e.to_string()))?
@@ -708,10 +729,15 @@ impl AuthService {
         account_scope: &str,
         ip_scope: &str,
     ) -> Result<(), AppError> {
+        // 阈值每次登录现读，而不是构造时固化：
+        // 固化的话管理员在参数页把阈值从 10 调到 3，
+        // 必须重启进程才生效——而"改一个数字要重启"正是
+        // 参数表要解决的那个问题。
+        let max_failures = self.setting_service.login_max_failures().await;
         let account_failures = redis_client.login_failure_count(account_scope).await?;
         let ip_failures = redis_client.login_failure_count(ip_scope).await?;
 
-        if account_failures >= self.login_max_failures || ip_failures >= self.login_max_failures {
+        if account_failures >= max_failures || ip_failures >= max_failures {
             tracing::warn!(
                 "登录已锁定: account_failures={account_failures}, ip_failures={ip_failures}"
             );
@@ -731,11 +757,9 @@ impl AuthService {
         account_scope: &str,
         ip_scope: &str,
     ) {
+        let window = self.setting_service.login_failure_window_seconds().await;
         for scope in [account_scope, ip_scope] {
-            if let Err(e) = redis_client
-                .record_login_failure(scope, self.login_failure_window_seconds)
-                .await
-            {
+            if let Err(e) = redis_client.record_login_failure(scope, window).await {
                 tracing::warn!("登录失败计数写入失败 ({scope}): {e}");
             }
         }

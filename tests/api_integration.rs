@@ -688,6 +688,25 @@ async fn revoke_permission_code(role_name: &str, code: &str) -> bool {
     result.rows_affected() > 0
 }
 
+/// 恢复角色对某个权限码的授权
+///
+/// 撤销类用例**必须**在结尾调用它：测试库是跨轮次长期存在的共享库，
+/// 漏掉恢复会让后续用例（乃至下一轮运行）莫名 403 ——
+/// 而报错只会说"缺少权限"，完全指不出真因是上一条用例没收拾干净。
+async fn grant_permission_code(role_name: &str, code: &str) {
+    sqlx::query(
+        "INSERT INTO role_menus (role_id, menu_id) \
+         SELECT r.id, m.id FROM roles r, menus m \
+         WHERE r.name = $1 AND m.permission = $2 \
+         ON CONFLICT (role_id, menu_id) DO NOTHING",
+    )
+    .bind(role_name)
+    .bind(code)
+    .execute(&pool().await)
+    .await
+    .expect("恢复权限码授权失败");
+}
+
 #[tokio::test]
 #[ignore = "需要真实 Postgres + Redis"]
 async fn permission_codes_are_seeded_and_returned_to_admin() {
@@ -8323,6 +8342,11 @@ fn every_documented_write_operation_is_covered_by_the_audit_test() {
         "POST /api/auth/profile/avatar",
         "POST /api/admin/users/{id}/unlock",
         "POST /api/admin/users/{id}/sessions/{jti}/revoke",
+        // v0.22.0 系统参数：三个写端点各自在
+        // `changing_a_setting_is_audited_with_both_the_old_and_the_new_value` 里断言
+        "PUT /api/admin/settings/{key}",
+        "POST /api/admin/settings/{key}/reset",
+        "POST /api/admin/settings/refresh-cache",
     ];
 
     /// 明确豁免的写端点：**每一条都要写出理由**，否则豁免就变成了漏测的挡箭牌
@@ -12072,4 +12096,994 @@ async fn user_id_by_name(username: &str) -> Option<uuid::Uuid> {
         .fetch_optional(&pool().await)
         .await
         .expect("查询用户失败")
+}
+
+// ──────────────────────────────────────────────
+// v0.22.0 系统参数配置表 + 口令策略
+// ──────────────────────────────────────────────
+
+/// 直接写参数表（绕过后端），用来构造"管理员显式改过"的状态
+async fn put_setting_raw(key: &str, value: &str, updated_by: Option<uuid::Uuid>) {
+    sqlx::query(
+        r#"
+        INSERT INTO system_settings (key, value, updated_by)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by
+        "#,
+    )
+    .bind(key)
+    .bind(value)
+    .bind(updated_by)
+    .execute(&pool().await)
+    .await
+    .expect("写入参数失败");
+}
+
+async fn get_setting_row(key: &str) -> Option<(String, Option<uuid::Uuid>)> {
+    sqlx::query_as("SELECT value, updated_by FROM system_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(&pool().await)
+        .await
+        .expect("查询参数失败")
+}
+
+/// 清掉 Redis 里的参数缓存，让下一次读回源查库
+async fn flush_settings_cache() {
+    let mut conn =
+        redis::aio::ConnectionManager::new(redis::Client::open(test_redis_url()).unwrap())
+            .await
+            .expect("连接 Redis 失败");
+    let _: i64 = redis::cmd("DEL")
+        .arg("settings:all")
+        .query_async(&mut conn)
+        .await
+        .expect("清理参数缓存失败");
+}
+
+const KEY_MIN_LENGTH: &str = "security.password.min_length";
+const KEY_MIXED_CASE: &str = "security.password.require_mixed_case";
+const KEY_EXPIRY_DAYS: &str = "security.password.expiry_days";
+const KEY_MAX_FAILURES: &str = "security.login.max_failures";
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn settings_are_seeded_and_every_one_is_editable_by_an_admin() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/settings", Some(&admin), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let list = body["data"].as_array().expect("参数列表应是数组").clone();
+    assert!(!list.is_empty(), "参数表不该是空的");
+
+    // 迁移必须给每个定义的参数都种上种子行：少一个就会出现
+    // "界面显示默认值、而实际走的是另一条路"的偏差
+    let keys: Vec<String> = list
+        .iter()
+        .map(|v| v["key"].as_str().unwrap_or_default().to_string())
+        .collect();
+    for expected in [
+        KEY_MIN_LENGTH,
+        KEY_MIXED_CASE,
+        KEY_EXPIRY_DAYS,
+        KEY_MAX_FAILURES,
+    ] {
+        assert!(
+            keys.iter().any(|k| k == expected),
+            "参数列表缺少 {expected}"
+        );
+    }
+
+    // 每个参数都要能说明自己被谁消费——这是 v0.16.0 教训的机械化
+    for item in &list {
+        let consumed = item["consumed_by"].as_str().unwrap_or_default();
+        assert!(consumed.len() > 8, "参数 {} 没有写明消费方", item["key"]);
+    }
+}
+
+/// 抬高最小长度后，新口令按新策略判定，而**存量用户仍能登录**
+///
+/// 这是本版最关键的一条：策略一旦可配，管理员当天就能抬高门槛。
+/// 若复杂度被误接到登录校验路径上，这个测试会当场红。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn raising_min_length_tightens_new_passwords_but_never_locks_out_existing_users() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let victim = unique("policyvictim");
+    let weak_old = "oldpass123"; // 8 字符、2 类字符：旧策略下合法
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": victim,
+                "email": format!("{victim}@example.com"),
+                "password": weak_old
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "注册应成功: {body}");
+
+    // 把最小长度抬到 20
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MIN_LENGTH}"),
+            Some(&admin),
+            Some(json!({ "value": "20" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "修改参数失败: {body}");
+    flush_settings_cache().await;
+
+    // 新口令按新策略：8 字符的必须被拒
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": unique("policynew"),
+                "email": format!("{}@example.com", unique("pe")),
+                "password": weak_old
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "抬高到 20 之后 8 字符口令必须被拒: {body}"
+    );
+
+    // **存量用户必须仍能登录**
+    let (status, body) = login(&app, &victim, weak_old).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "抬高策略不得把存量用户锁在门外: {body}"
+    );
+
+    // 复原
+    put_setting_raw(KEY_MIN_LENGTH, "8", None).await;
+    flush_settings_cache().await;
+}
+
+/// 「强制大小写混合」必须真的改变判定，而不只是多一条错误文案
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn require_mixed_case_flag_actually_changes_the_verdict() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    // 默认关闭：`password123` 合法（小写 + 数字两类）
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": unique("mixedoff"),
+                "email": format!("{}@example.com", unique("mo")),
+                "password": "password123"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "默认策略下应放行");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MIXED_CASE}"),
+            Some(&admin),
+            Some(json!({ "value": "true" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "开启开关失败: {body}");
+    flush_settings_cache().await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": unique("mixedon"),
+                "email": format!("{}@example.com", unique("mn")),
+                "password": "password123"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "开启大小写混合后全小写口令必须被拒: {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("大写"),
+        "报错要说明是大小写这条: {body}"
+    );
+
+    put_setting_raw(KEY_MIXED_CASE, "false", None).await;
+    flush_settings_cache().await;
+}
+
+/// 口令过期：登录**仍然成功**，只是拿到受限令牌
+///
+/// 关键在于"不阻断登录"。若实现成直接拒绝登录，过期用户会彻底
+/// 登不进来——而本仓没有邮件通道，他无法自助恢复，只能找管理员。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_expired_password_yields_a_restricted_token_instead_of_a_rejected_login() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let user = unique("expiring");
+    let password = "Expire123!";
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": user,
+                "email": format!("{user}@example.com"),
+                "password": password
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "注册失败: {body}");
+
+    // 把口令的设置时刻推到 100 天前
+    sqlx::query(
+        "UPDATE users SET password_changed_at = NOW() - INTERVAL '100 days' WHERE username = $1",
+    )
+    .bind(&user)
+    .execute(&pool().await)
+    .await
+    .expect("改口令时间失败");
+
+    // 有效期设为 30 天 → 已过期
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_EXPIRY_DAYS}"),
+            Some(&admin),
+            Some(json!({ "value": "30" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "设置有效期失败: {body}");
+    flush_settings_cache().await;
+
+    // 登录**必须成功**
+    let (status, body) = login(&app, &user, password).await;
+    assert_eq!(status, StatusCode::OK, "口令过期不应阻断登录本身: {body}");
+    assert_eq!(
+        body["data"]["must_change_password"],
+        Value::Bool(true),
+        "过期必须下发受限令牌: {body}"
+    );
+
+    // 受限令牌只能改密/登出/me，其余一律 403
+    let token = body["data"]["token"].as_str().unwrap().to_string();
+    let (status, body) = send(&app, request("GET", "/api/admin/users", Some(&token), None)).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "受限令牌不该能调管理接口: {body}"
+    );
+
+    // 改密后恢复完整权限——过期用户有一条确定能走完的路
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/password",
+            Some(&token),
+            Some(json!({ "old_password": password, "new_password": "BrandNew456!" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "过期用户应能自助改密: {body}");
+
+    let fresh = login_token(&app, &user, "BrandNew456!").await;
+    let (status, _) = send(&app, request("GET", "/api/auth/me", Some(&fresh), None)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    put_setting_raw(KEY_EXPIRY_DAYS, "0", None).await;
+    flush_settings_cache().await;
+}
+
+/// 参数值越界与类型错误必须在**写入前**被拒
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn out_of_range_and_mistyped_setting_values_are_rejected() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    // 越界
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MIN_LENGTH}"),
+            Some(&admin),
+            Some(json!({ "value": "999" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "999 超出 8-128，应拒");
+
+    // 类型错误
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MIN_LENGTH}"),
+            Some(&admin),
+            Some(json!({ "value": "abc" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "非整数应拒");
+
+    // 布尔参数只收 true/false
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MIXED_CASE}"),
+            Some(&admin),
+            Some(json!({ "value": "1" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "布尔参数收 1 应拒");
+
+    // 未定义的参数不许凭空创建
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/admin/settings/evil.injected",
+            Some(&admin),
+            Some(json!({ "value": "1" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "未定义的参数应拒");
+
+    let stored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM system_settings WHERE key = 'evil.injected'")
+            .fetch_one(&pool().await)
+            .await
+            .expect("查询失败");
+    assert_eq!(stored, 0, "被拒的参数不该落库");
+}
+
+/// 跨字段约束：min >= max 会配出**空区间**，此后任何口令都过不了
+///
+/// 单字段范围校验（8<=min<=128、8<=max<=1024）**完全看不出**这个问题。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_password_length_window_that_can_never_be_satisfied_is_refused() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    // 先把上界压到 10
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/admin/settings/security.password.max_length",
+            Some(&admin),
+            Some(json!({ "value": "10" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "设置上界失败: {body}");
+    flush_settings_cache().await;
+
+    // 再把下界抬到 12 —— min(12) >= max(10)
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MIN_LENGTH}"),
+            Some(&admin),
+            Some(json!({ "value": "12" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "空区间必须被拒，否则系统从此收不了任何口令: {body}"
+    );
+
+    // 确认没有落库
+    let (value, _) = get_setting_row(KEY_MIN_LENGTH).await.expect("参数应仍存在");
+    assert_ne!(value, "12", "被拒的取值不该落库");
+
+    put_setting_raw("security.password.max_length", "128", None).await;
+    put_setting_raw(KEY_MIN_LENGTH, "8", None).await;
+    flush_settings_cache().await;
+}
+
+/// 部署配置与管理员显式修改的**优先级**
+///
+/// 顺序是：管理员改过 → 参数表；否则 → 环境变量。
+/// 这条测试钉住它，因为反过来的话部署时设的值会被静默忽略，
+/// 而日志里一个字都没有（v0.22.0 首次集成时真的踩到过）。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deployment_config_governs_until_an_admin_explicitly_overrides_it() {
+    // 用 test_config(7) 构建：部署侧把阈值设成 7
+    let (app, _state) = create_router(test_config(7)).await.unwrap();
+    let admin = admin_token(&app).await;
+
+    // 种子行的 updated_by 是 NULL → 部署配置说了算
+    put_setting_raw(KEY_MAX_FAILURES, "10", None).await;
+    flush_settings_cache().await;
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/settings", Some(&admin), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let max_failures = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["key"] == KEY_MAX_FAILURES)
+        .expect("缺少登录阈值参数");
+    assert_eq!(
+        max_failures["value"], "7",
+        "没人改过时必须用部署配置的值，而不是参数表里的 10: {body}"
+    );
+    assert_eq!(max_failures["source"], "env", "来源应标为 env: {body}");
+
+    // 管理员显式改过 → 参数表的值接管
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MAX_FAILURES}"),
+            Some(&admin),
+            Some(json!({ "value": "4" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "管理员改参数失败: {body}");
+    flush_settings_cache().await;
+
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/settings", Some(&admin), None),
+    )
+    .await;
+    let max_failures = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["key"] == KEY_MAX_FAILURES)
+        .unwrap();
+    assert_eq!(
+        max_failures["value"], "4",
+        "管理员改过之后必须用参数表的值: {body}"
+    );
+    assert_eq!(max_failures["source"], "admin", "来源应标为 admin: {body}");
+
+    // 改密后的锁定阈值确实按 4 走：失败 4 次后第 5 次被锁
+    let probe = unique("threshprobe");
+    for _ in 0..4 {
+        let _ = login(&app, &probe, "wrong-password").await;
+    }
+    let (status, _) = login(&app, &probe, "wrong-password").await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "管理员把阈值改成 4 之后应立即生效（不需要重启）"
+    );
+
+    put_setting_raw(KEY_MAX_FAILURES, "10", None).await;
+    flush_settings_cache().await;
+}
+
+/// 参数变更必须留下"从什么改成什么"的审计
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn changing_a_setting_is_audited_with_both_the_old_and_the_new_value() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MIN_LENGTH}"),
+            Some(&admin),
+            Some(json!({ "value": "10" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 审计是异步写的，轮询等它落库
+    let mut found = false;
+    for _ in 0..50 {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT action, result FROM audit_logs \
+             WHERE path = '/api/admin/settings/security.password.min_length' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&pool().await)
+        .await
+        .expect("查询审计失败");
+        if let Some((action, result)) = row {
+            assert!(action.contains("PUT"), "审计动作应记方法: {action}");
+            assert!(
+                result.contains("10") && result.contains('8'),
+                "审计必须同时记下新旧两个值，只记新值的话事后答不出谁改的: {result}"
+            );
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(found, "参数变更没有落审计");
+
+    // ── 复位也要审计，且必须记下复位成什么 ──
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/settings/{KEY_MIN_LENGTH}/reset"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut reset_found = false;
+    for _ in 0..50 {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT action, result FROM audit_logs \
+             WHERE path = '/api/admin/settings/security.password.min_length/reset' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&pool().await)
+        .await
+        .expect("查询审计失败");
+        if let Some((action, result)) = row {
+            assert!(action.contains("POST"), "复位审计动作应记方法: {action}");
+            assert!(
+                result.contains('8'),
+                "复位审计必须记下复位成的默认值，否则事后只知道「有人按了按钮」: {result}"
+            );
+            reset_found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(reset_found, "参数复位没有落审计");
+
+    // ── 清理缓存也要审计 ──
+    // 它不改变任何参数，但它是**管理员手动干预生效链路**的动作：
+    // 出事时「谁在什么时候清过缓存」是必须能回答的问题，
+    // 而一个不记审计的运维按钮和「有人偷偷改了配置」在事后无法区分。
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/settings/refresh-cache",
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut cache_found = false;
+    for _ in 0..50 {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT action, result FROM audit_logs \
+             WHERE path = '/api/admin/settings/refresh-cache' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&pool().await)
+        .await
+        .expect("查询审计失败");
+        if let Some((action, result)) = row {
+            assert!(action.contains("POST"), "清缓存审计动作应记方法: {action}");
+            assert!(!result.trim().is_empty(), "清缓存审计必须有摘要: {result}");
+            cache_found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(cache_found, "清理参数缓存没有落审计");
+
+    put_setting_raw(KEY_MIN_LENGTH, "8", None).await;
+    flush_settings_cache().await;
+}
+
+/// 参数管理端点必须受权限码保护
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_settings_endpoints_require_their_permission_codes() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+    let plain = unique("setplain");
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin),
+            Some(json!({
+                "username": plain,
+                "email": format!("{plain}@example.com"),
+                "password": "PlainUser123",
+                "roles": ["user"]
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = activated_token(&app, &plain, "PlainUser123").await;
+
+    // 普通用户既不能读也不能写
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/settings", Some(&token), None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "普通用户不该能读参数: {body}"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MIN_LENGTH}"),
+            Some(&token),
+            Some(json!({ "value": "12" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "普通用户不该能改参数: {body}"
+    );
+
+    // 撤销权限码后 admin 也该被挡
+    assert!(revoke_permission_code("admin", "system:setting:update").await);
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MIN_LENGTH}"),
+            Some(&admin),
+            Some(json!({ "value": "9" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "撤销权限码后应 403: {body}");
+
+    let (id, _) = get_setting_row(KEY_MIN_LENGTH).await.unwrap();
+    assert_eq!(id, "8", "被拒的写入不该落库");
+
+    // 恢复授权：测试库是长期存在的共享库，漏掉会让后续用例莫名 403
+    grant_permission_code("admin", "system:setting:update").await;
+}
+
+/// 口令策略对**未登录**页面公开，且不含锁定阈值
+///
+/// 注册页需要它来提示要求；而把"多久被锁一次"暴露给未登录端点
+/// 等于给爆破者一个可直接调的参数面板。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_password_policy_endpoint_is_public_but_leaks_no_lockout_thresholds() {
+    let app = app().await;
+
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/settings/password-policy", None, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "口令策略应对未登录开放: {body}");
+
+    let data = &body["data"];
+    for field in [
+        "min_length",
+        "max_length",
+        "min_char_classes",
+        "require_mixed_case",
+    ] {
+        assert!(!data[field].is_null(), "缺少字段 {field}: {body}");
+    }
+    let raw = body.to_string();
+    for leaked in ["max_failures", "failure_window", "expiry_days", "login_max"] {
+        assert!(!raw.contains(leaked), "公开端点不该泄露 {leaked}: {raw}");
+    }
+}
+
+/// 每条写入新口令的路径都必须落 `password_changed_at`
+///
+/// ## 这条测试是被缺陷注入逼出来的
+///
+/// 注入验证时把 `repository::user::create` 里的 `password_changed_at = NOW()`
+/// 删掉，`an_expired_password_yields_a_restricted_token_...` **依然全绿**——
+/// 因为那条测试自己用 `UPDATE users SET password_changed_at = ...` 把时间戳
+/// 改成了 100 天前，它验的是「判定逻辑」，从不验「写入路径有没有写」。
+///
+/// 而这正是最危险的一种漏：字段为 NULL 时 `PasswordPolicy::is_expired(None)`
+/// 按设计判为**未过期**（理由见 model/setting.rs），
+/// 于是「注册路径漏写时间戳」表现为**过期策略对每一个新用户永久静默失效**——
+/// 参数页显示着 90 天，界面上没有任何异常，只有安全策略不在了。
+/// 一个不会报错的失效，比一个会报错的失效更难发现得多。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn every_path_that_sets_a_new_password_records_when_it_was_set() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    async fn stamp_of(username: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT password_changed_at FROM users WHERE username = $1",
+        )
+        .bind(username)
+        .fetch_one(&pool().await)
+        .await
+        .expect("查询口令时间戳失败")
+    }
+
+    // ── 1. 注册 ──
+    let user = unique("stamped");
+    let password = "Stamp123!";
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/register",
+            None,
+            Some(json!({
+                "username": user,
+                "email": format!("{user}@example.com"),
+                "password": password
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "注册失败: {body}");
+
+    let at_register = stamp_of(&user).await;
+    assert!(
+        at_register.is_some(),
+        "注册后 password_changed_at 仍为 NULL：过期策略对该用户将永久不生效"
+    );
+
+    // ── 2. 自助改密（带令牌） ──
+    let token = login(&app, &user, password).await.1["data"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/password",
+            Some(&token),
+            Some(json!({ "old_password": password, "new_password": "Stamp456!" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "改密失败: {body}");
+
+    let after_change = stamp_of(&user).await.expect("改密后时间戳不该为 NULL");
+    assert!(
+        after_change >= at_register.expect("前置断言失败"),
+        "改密必须刷新口令时间戳，否则「有效期」永远是注册后那一天算起: {at_register:?} → {after_change:?}"
+    );
+
+    // ── 3. 管理员重置口令 ──
+    let (_, list) = send(
+        &app,
+        request(
+            "GET",
+            "/api/admin/users?page=1&page_size=200",
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    let uid = list["data"]["items"]
+        .as_array()
+        .expect("用户列表不是数组")
+        .iter()
+        .find(|u| u["username"] == user)
+        .and_then(|u| u["id"].as_str())
+        .expect("用户列表里找不到刚注册的用户")
+        .to_string();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{uid}/reset-password"),
+            Some(&admin),
+            Some(json!({ "password": "Stamp789!" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "管理员重置口令失败: {body}");
+
+    let after_reset = stamp_of(&user).await.expect("重置后时间戳不该为 NULL");
+    assert!(
+        after_reset >= after_change,
+        "管理员重置口令也必须刷新时间戳: {after_change:?} → {after_reset:?}"
+    );
+}
+
+/// 缓存不能成为"改了不生效"的理由
+///
+/// 参数写路径会删缓存；这条测试在**没有**手动清缓存的情况下
+/// 验证改动立刻可见——正是 v0.16.0「刷新缓存」那类缺陷的反面。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_setting_change_takes_effect_without_any_manual_cache_refresh() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    // 先读一次把缓存捂热
+    let _ = send(
+        &app,
+        request("GET", "/api/admin/settings", Some(&admin), None),
+    )
+    .await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{KEY_MIXED_CASE}"),
+            Some(&admin),
+            Some(json!({ "value": "true" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // **不** flush_settings_cache：写路径自己必须失效缓存
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/settings", Some(&admin), None),
+    )
+    .await;
+    let mixed = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["key"] == KEY_MIXED_CASE)
+        .unwrap();
+    assert_eq!(
+        mixed["value"], "true",
+        "改了之后立刻可读，不该需要手动刷新缓存: {body}"
+    );
+
+    put_setting_raw(KEY_MIXED_CASE, "false", None).await;
+    flush_settings_cache().await;
+}
+
+/// 「刷新参数缓存」必须真的动 Redis
+///
+/// v0.16.0 的字典「刷新缓存」点了没反应：返回成功、键没动、读到的还是旧值。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_refresh_cache_endpoint_really_drops_the_cache_key() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    // 捂热缓存
+    let _ = send(
+        &app,
+        request("GET", "/api/admin/settings", Some(&admin), None),
+    )
+    .await;
+    let mut conn =
+        redis::aio::ConnectionManager::new(redis::Client::open(test_redis_url()).unwrap())
+            .await
+            .expect("连接 Redis 失败");
+    let exists: i64 = redis::cmd("EXISTS")
+        .arg("settings:all")
+        .query_async(&mut conn)
+        .await
+        .expect("查询缓存键失败");
+    assert_eq!(exists, 1, "前提：缓存键应已存在");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/settings/refresh-cache",
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let exists: i64 = redis::cmd("EXISTS")
+        .arg("settings:all")
+        .query_async(&mut conn)
+        .await
+        .expect("查询缓存键失败");
+    assert_eq!(exists, 0, "刷新缓存后键必须真的消失");
+}
+
+/// 存量库升级后必须能种出新的权限码
+///
+/// 关键在 [`RbacService::backfill_late_added_menus`]：页面菜单只在 `menus` 表为空时
+/// 写整棵树的特性，会让**已存在的部署**永远拿不到 `/system/setting`，
+/// 于是新权限码解析不到父菜单 → 只打一行 warn 跳过 → 管理员无法授权 → 403。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_settings_permission_codes_are_seeded_even_on_an_existing_database() {
+    // 构建路由本身就是这个测试的被测行为：`create_router` 内部会跑迁移与
+    // RBAC 种子（含 `backfill_late_added_menus`）。不构建就等于没执行被测代码。
+    let _ = app().await;
+
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT permission FROM menus WHERE permission IN ('system:setting:list','system:setting:update')",
+    )
+    .fetch_all(&pool().await)
+    .await
+    .expect("查询权限码失败");
+    assert_eq!(rows.len(), 2, "两个参数权限码都必须种出来: {rows:?}");
+
+    // 页面菜单本身也必须在（否则权限码没有父节点）
+    let menu: Option<(String, String)> =
+        sqlx::query_as("SELECT path, component FROM menus WHERE path = '/system/setting' LIMIT 1")
+            .fetch_optional(&pool().await)
+            .await
+            .expect("查询页面菜单失败");
+    let (path, component) = menu.expect("系统参数页面菜单必须存在");
+    assert_eq!(path, "/system/setting");
+    // 前端必须真的有这个文件，否则菜单点得进去、页面是空白
+    assert_eq!(
+        component, "system/setting/index",
+        "component 必须对应前端真实存在的 .vue 文件"
+    );
 }

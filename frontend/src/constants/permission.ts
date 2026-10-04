@@ -39,6 +39,10 @@ export const PERM = {
   DICT_DELETE: 'system:dict:delete',
   DICT_REFRESH: 'system:dict:refresh',
 
+  // 系统参数（v0.22.0）
+  SETTING_LIST: 'system:setting:list',
+  SETTING_UPDATE: 'system:setting:update',
+
   // 审计日志
   LOG_LIST: 'system:log:list',
   LOG_EXPORT: 'system:log:export',

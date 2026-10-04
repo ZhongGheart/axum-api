@@ -7,4 +7,5 @@ pub mod menu;
 pub mod monitor;
 pub mod rbac;
 pub mod role;
+pub mod setting;
 pub mod user;

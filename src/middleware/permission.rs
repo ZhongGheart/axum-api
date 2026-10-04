@@ -253,6 +253,9 @@ permission_guards! {
     PermDictUpdate => permission::DICT_UPDATE,
     PermDictDelete => permission::DICT_DELETE,
     PermDictRefresh => permission::DICT_REFRESH,
+    // 系统参数
+    PermSettingList => permission::SETTING_LIST,
+    PermSettingUpdate => permission::SETTING_UPDATE,
     // 审计日志
     PermLogList => permission::LOG_LIST,
     PermLogExport => permission::LOG_EXPORT,

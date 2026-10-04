@@ -291,7 +291,8 @@ pub async fn create_user(
     .await?;
 
     let password = req.password.as_deref().unwrap_or("password123");
-    validation::validate_password(password)?;
+    // 策略来自参数表（v0.22.0），管理员改完立即对新建账号生效
+    validation::validate_password_with(password, &state.setting_service.password_policy().await)?;
 
     if state
         .auth_service
@@ -830,7 +831,10 @@ pub async fn reset_user_password(
         .await?;
     ensure_can_grant_roles(&state, perm.guard(), &target_roles, "重置该用户口令").await?;
 
-    validation::validate_password(&req.password)?;
+    validation::validate_password_with(
+        &req.password,
+        &state.setting_service.password_policy().await,
+    )?;
 
     let hashed =
         hash_password(&req.password).map_err(|e| AppError::InternalServerError(e.to_string()))?;
@@ -973,6 +977,12 @@ pub async fn import_users(
     )
     .await?;
 
+    // 策略在循环外读一次：它在内部会打一次 Redis，
+    // 逐行读会让一个 500 行的 CSV 多出 500 次往返。
+    // 导入是一次快照语义——同一批里的所有行用同一份策略判定，
+    // 这也是管理员能预期的（不会出现"前 10 行按旧策略、后 10 行按新策略"）。
+    let password_policy = state.setting_service.password_policy().await;
+
     let mut created = 0usize;
     let mut created_usernames: Vec<String> = Vec::new();
     let mut failures: Vec<ImportRowFailure> = Vec::new();
@@ -1004,7 +1014,7 @@ pub async fn import_users(
                 continue;
             }
         };
-        if let Err(e) = validation::validate_password(&row.password) {
+        if let Err(e) = validation::validate_password_with(&row.password, &password_policy) {
             fail(e.to_string());
             continue;
         }

@@ -70,6 +70,12 @@ pub const DICT_DELETE: &str = "system:dict:delete";
 /// 刷新字典缓存
 pub const DICT_REFRESH: &str = "system:dict:refresh";
 
+// ── 系统参数 ────────────────────────────────────────────────
+/// 查看系统参数
+pub const SETTING_LIST: &str = "system:setting:list";
+/// 修改系统参数
+pub const SETTING_UPDATE: &str = "system:setting:update";
+
 // ── 审计日志 ────────────────────────────────────────────────
 /// 查看审计日志
 pub const LOG_LIST: &str = "system:log:list";
@@ -219,6 +225,16 @@ pub const PERMISSION_DEFS: &[PermissionDef] = &[
         parent_path: "/system/dict",
     },
     // 系统日志
+    PermissionDef {
+        code: SETTING_LIST,
+        name: "查询系统参数",
+        parent_path: "/system/setting",
+    },
+    PermissionDef {
+        code: SETTING_UPDATE,
+        name: "修改系统参数",
+        parent_path: "/system/setting",
+    },
     PermissionDef {
         code: LOG_LIST,
         name: "查询日志",

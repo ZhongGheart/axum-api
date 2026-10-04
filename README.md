@@ -196,8 +196,8 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | `RATE_LIMIT_IP_MAX` / `RATE_LIMIT_IP_WINDOW` | 否 | `100` / `60` | IP 限流阈值与窗口 |
 | `RATE_LIMIT_USER_MAX` / `RATE_LIMIT_USER_WINDOW` | 否 | `30` / `60` | 已登录用户的限流阈值与窗口（与 IP 维度并存，任一超限即拒） |
 | `TRUST_PROXY_HEADERS` | 否 | `false` | 是否信任 `X-Forwarded-For`（仅置于可信代理后时开启） |
-| `LOGIN_MAX_FAILURES` | 否 | `10` | 登录失败锁定阈值 |
-| `LOGIN_FAILURE_WINDOW` | 否 | `300` | 登录失败计数窗口（秒） |
+| `LOGIN_MAX_FAILURES` | 否 | `10` | 登录失败锁定阈值。**v0.22.0 起降级为回落值**：管理员在「系统参数」页显式改过该参数后以参数表为准 |
+| `LOGIN_FAILURE_WINDOW` | 否 | `300` | 登录失败计数窗口（秒）。**v0.22.0 起降级为回落值**，理由同上 |
 | `AUDIT_LOG_RETENTION_DAYS` | 否 | `90` | 操作日志保留天数。**超期行会被后台任务无条件删除**，设为 `0` 关闭自动清理（改由运维自行处理） |
 | `AUDIT_LOG_CLEANUP_INTERVAL_SECONDS` | 否 | `3600` | 清理任务的运行间隔（秒） |
 | `AUDIT_LOG_CLEANUP_BATCH_SIZE` | 否 | `10000` | 单批删除行数上限：把长事务切碎，避免长时间持锁与 WAL 膨胀 |
@@ -232,7 +232,8 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 |--------|------|------|
 | GET | `/api/health` | 健康检查（真实探测 DB + Redis，异常返回 503） |
 | POST | `/api/auth/register` | 用户注册 |
-| POST | `/api/auth/login` | 登录（返回 JWT） |
+| POST | `/api/auth/login` | 登录（返回 JWT）。口令过期时返回**受限令牌**（`must_change_password=true`），只能改密 / 登出 / 查看自己 |
+| GET | `/api/settings/password-policy` | **当前口令策略**（v0.22.0）。未登录可读，供注册页 / 改密页显示规则。**刻意不含**有效期与锁定阈值——把「账号多久被锁一次」暴露给未登录端点等于给爆破者一个可调的参数面板 |
 
 ### 需登录
 
@@ -267,6 +268,10 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | GET/POST | `/api/admin/dict/types`、`PUT/DELETE /api/admin/dict/types/{id}` | 字典类型管理 |
 | GET/POST | `/api/admin/dict/items`、`PUT/DELETE /api/admin/dict/items/{id}` | 字典项管理 |
 | POST | `/api/admin/dict/refresh` | 刷新字典缓存 |
+| GET | `/api/admin/settings` | **系统参数列表**（v0.22.0）。参数名 / 类型 / 取值范围 / 默认值 / 说明 / **消费方**全部由服务端下发，前端不硬编码清单 |
+| PUT | `/api/admin/settings/{key}` | 修改单个参数（写入前校验类型与范围，并检查跨字段约束；越界或与另一参数冲突即 400） |
+| POST | `/api/admin/settings/{key}/reset` | 复位参数。有部署配置兜底的参数会**交还控制权给环境变量**，而不是钉死在代码默认值上 |
+| POST | `/api/admin/settings/refresh-cache` | 清理参数缓存 |
 | GET | `/api/admin/audit-logs?page=&username=&action=&status_code=&start_time=&end_time=` | 操作日志查询（分页 + 真筛选） |
 | GET | `/api/admin/logs/audit/export`（同上筛选参数） | 操作日志导出；响应头带 `x-export-row-count` / `x-export-truncated` / `x-export-max-rows` |
 | GET | `/api/admin/export/users` | 导出用户列表 |
@@ -288,6 +293,7 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | 菜单 | `system:menu:list` `system:menu:create` `system:menu:update` `system:menu:delete` `system:menu:grant` |
 | 字典 | `system:dict:list` `system:dict:create` `system:dict:update` `system:dict:delete` `system:dict:refresh` |
 | 日志 | `system:log:list` `system:log:export` |
+| 系统参数（v0.22.0） | `system:setting:list` `system:setting:update` |
 | 监控 | `system:monitor:system` `system:monitor:api` `system:monitor:alert` `system:monitor:reset` `system:monitor:export` |
 | 其他 | `system:export:user` `system:test:access` `system:validate:test` |
 
@@ -532,6 +538,79 @@ export RATE_LIMIT_USER_MAX=100000
 而不是 404。这是为了与 `GET /api/admin/users/{id}/roles` 保持一致——
 同一个 `{id}` 在两个"查这个人的附属信息"的端点上不该给出两种相反的答案。
 副作用是：一个写错或已删除的 id 与"这个人确实没在线"在响应上分不开。
+
+## 从 v0.21 升级到 v0.22
+
+**有数据库迁移**（`016_system_settings.sql`），**新增 5 个 API**、**2 个权限码**。
+默认配置下**没有任何用户行为变化**——所有新参数的默认值都等于 v0.21 的硬编码常量。
+
+### 迁移做了什么
+
+1. 新增表 `system_settings`（7 个参数种子行）
+2. `users` 新增列 `password_changed_at`，并**回填成 `created_at`**
+
+第 2 条回填是刻意的，且方向不能反：
+
+- 回填成 `created_at` → 一旦管理员把「口令有效期」从 `0` 调成非 `0`，
+  存量口令按其设置时刻算起，多数会被要求改密。**这正是启用该策略的目的。**
+- 回填成 `now()`（或干脆留 `NULL`）→ 所有存量用户在管理员开启策略后
+  又白白多活一个完整周期，**策略形同虚设**。
+
+默认 `expiry_days = 0`（永不过期），所以**默认部署下没有任何人被影响**。
+迁移注释里写明了这一点，因为「一开策略全员被要求改密」是很强的行为，
+运维需要提前知情而不是升级后才发现。
+
+### 环境变量降级为回落值
+
+`LOGIN_MAX_FAILURES` 与 `LOGIN_FAILURE_WINDOW` 仍然有效，但语义变了：
+
+> **管理员在「系统参数」页显式改过 → 用参数表的值；没人改过 → 用环境变量的值。**
+
+这个顺序是本版踩过坑之后定的，两个方向都会出事：
+
+- 参数表无条件优先 → 部署时设的环境变量被**静默忽略**。
+  实测：靠 `LOGIN_MAX_FAILURES=3` 构造低阈值的部署里，种子值 10 直接盖掉它，
+  于是「失败 3 次应被锁定」变成 200，**日志里一个字都没有**。
+- 环境变量无条件优先 → 管理员在界面上改了参数，重启后又变回去，
+  「写入成功」却永远不生效。
+
+参数页会显示每个值的来源（`管理员设置` / `部署配置` / `代码默认值`）。
+「复位」一个有部署配置兜底的参数，会把控制权**交还环境变量**，
+而不是把参数钉死在代码默认值上。
+
+**如果你此前靠环境变量调这两个值**：升级后行为不变，无需改动。
+
+### 新增权限码需要授权
+
+`system:setting:list`（读）与 `system:setting:update`（改 / 复位 / 清缓存）。
+**默认 `admin` 角色自动拥有**；其他角色若需要访问参数页，请手动授权。
+
+存量库也会自动补齐这两个码与 `/system/setting` 页面菜单——
+新增的 `backfill_late_added_menus` 专门解决「页面菜单只在 `menus` 表为空时写入」
+导致已存在部署永远拿不到新菜单、进而新权限码解析不到父菜单而无法授权的问题。
+
+### 用户可见的两处行为
+
+- **口令过期的用户仍能登录**，但拿到的是**受限令牌**：只能改密 / 登出 / 查看自己。
+  这是刻意设计的——本仓没有邮件通道，拒绝登录等于账号永久锁死，
+  而用户连「为什么被拒」都看不到。
+- **注册页与改密页的口令提示现在跟着服务端走**。管理员调高门槛后，
+  界面提示会同步变化，而不是继续印着旧数字。
+  （此前界面印的是写死的 8 位 / 两类，与后端实际执行的规则会分叉。）
+
+### 升级步骤
+
+```bash
+# 1. 后端（含迁移，MIGRATE_ON_STARTUP=true 时自动执行）
+cargo build --release
+
+# 2. 前端
+cd frontend && pnpm install && pnpm build
+```
+
+迁移是**向后兼容的**：先跑新二进制、后跑新前端没有顺序要求。
+唯一的注意事项是别在旧二进制还活着时用新前端改参数——
+旧版本不认识 `system_settings`，改了也不会生效。
 
 ## 从 v0.20 升级到 v0.21
 

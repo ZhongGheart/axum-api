@@ -55,9 +55,13 @@ pub struct RateLimitConfig {
 pub struct SecurityConfig {
     /// 是否信任上游代理的转发头（决定客户端 IP 取值方式）
     pub trust_proxy_headers: bool,
-    /// 登录失败锁定阈值（账号与 IP 各自独立计数）
+    /// 登录失败锁定阈值（账号与 IP 各自独立计数）——**回落值**
+    ///
+    /// v0.22.0 起正常路径读 `system_settings` 表里的
+    /// `security.login.max_failures`，这里只在参数表读不到时兜底。
+    /// 改它仍然有效，但要重启进程；要在运行时生效请用「系统参数」页。
     pub login_max_failures: u64,
-    /// 登录失败计数窗口（秒）
+    /// 登录失败计数窗口（秒）——**回落值**，同上
     pub login_failure_window_seconds: u64,
 }
 

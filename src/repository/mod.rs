@@ -7,4 +7,5 @@ pub mod db;
 pub mod dict;
 pub mod menu;
 pub mod role;
+pub mod setting;
 pub mod user;

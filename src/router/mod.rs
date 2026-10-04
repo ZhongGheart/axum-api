@@ -14,7 +14,7 @@ use tower_http::trace::TraceLayer;
 // Swagger UI 通过前端 iframe + CDN 渲染
 
 use crate::config::{AuditLogConfig, Config, UploadConfig};
-use crate::controller::{auth, demo, dict, menu, monitor, rbac, role, user};
+use crate::controller::{auth, demo, dict, menu, monitor, rbac, role, setting, user};
 use crate::docs::swagger_ui_handler;
 use crate::error::AppError;
 use crate::middleware::api_metrics::{api_metrics_mw, MetricsCollector};
@@ -27,9 +27,11 @@ use crate::repository::db::DatabasePool;
 use crate::repository::dict::DictRepository;
 use crate::repository::menu::MenuRepository;
 use crate::repository::role::RoleRepository;
+use crate::repository::setting::SettingRepository;
 use crate::repository::user::UserRepository;
 use crate::service::auth::AuthService;
 use crate::service::rbac::RbacService;
+use crate::service::setting::SettingService;
 use crate::utils::jwt::JwtUtil;
 use crate::utils::redis::RedisClient;
 use crate::utils::upload;
@@ -53,6 +55,11 @@ pub struct AppState {
     pub audit_log_config: AuditLogConfig,
     /// 头像上传配置（v0.20.0）
     pub upload_config: UploadConfig,
+    /// 系统参数服务（v0.22.0）
+    ///
+    /// 口令策略与登录防护阈值从这里读，**不再**从 `Config` 读常量——
+    /// 那样改一次要重启进程，且容器编排里根本没法改。
+    pub setting_service: SettingService,
 }
 
 /// 构建应用路由
@@ -91,14 +98,24 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
     let menu_repo = MenuRepository::new(pool.clone());
     let dict_repo = DictRepository::new(pool.clone(), Some(redis_client.as_ref().clone()));
     let audit_log_repo = AuditLogRepository::new(pool.clone());
+    // 参数仓储与字典仓储同构：DB 权威 + Redis 缓存
+    let setting_repo = SettingRepository::new(pool.clone(), Some(redis_client.as_ref().clone()));
+    let setting_service = SettingService::new(
+        setting_repo,
+        // 部署配置作为"没人改过时的生效值"；管理员显式改过则以参数表为准。
+        // 理由见 `service::setting::EnvFallbacks`。
+        crate::service::setting::EnvFallbacks {
+            login_max_failures: config.security.login_max_failures,
+            login_failure_window_seconds: config.security.login_failure_window_seconds,
+        },
+    );
     let auth_service = AuthService::new(
         user_repo,
         role_repo.clone(),
         jwt_util.as_ref().clone(),
         config.jwt_expiration_seconds,
-        config.security.login_max_failures,
-        config.security.login_failure_window_seconds,
         audit_log_repo.clone(),
+        setting_service.clone(),
     );
     let rbac_service = RbacService::new(pool.clone());
 
@@ -115,6 +132,7 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         metrics_collector: metrics_collector.clone(),
         audit_log_config: config.audit_log.clone(),
         upload_config: config.upload.clone(),
+        setting_service: setting_service.clone(),
     };
 
     // 上传目录必须在挂 ServeDir 之前存在：ServeDir 只在请求到达时才去解析路径，
@@ -154,7 +172,40 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
     let public_routes = Router::new()
         .route("/api/health", get(auth::health))
         .route("/api/auth/register", post(auth::register))
-        .route("/api/auth/login", post(auth::login));
+        .route("/api/auth/login", post(auth::login))
+        // 口令策略对**未登录**页面公开：注册页需要它来提示要求，
+        // 否则用户只能在提交失败后从报错里反推。
+        // 返回体只含四条"设口令时必须知道"的规则，不含锁定阈值。
+        .route(
+            "/api/settings/password-policy",
+            get(setting::public_password_policy),
+        );
+
+    // ── 系统参数管理路由 ────────────────────────────────────
+    let setting_routes = Router::new()
+        .route("/api/admin/settings", get(setting::list_settings))
+        // 静态段必须排在 `{key}` 之前：`refresh-cache` 若被当成 key，
+        // 下一个请求就变成"没有名为 refresh-cache 的系统参数"（400）。
+        .route(
+            "/api/admin/settings/refresh-cache",
+            post(setting::refresh_cache),
+        )
+        .route(
+            "/api/admin/settings/{key}",
+            axum::routing::put(setting::update_setting),
+        )
+        .route(
+            "/api/admin/settings/{key}/reset",
+            axum::routing::post(setting::reset_setting),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            audit_log_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // ── 需要认证的路由 ─────────────────────────────────────────
     let protected_routes = Router::new()
@@ -404,6 +455,7 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         .merge(dict_routes)
         .merge(dict_read_routes)
         .merge(monitor_routes)
+        .merge(setting_routes)
         // 上传目录的静态访问。**刻意挂在鉴权之外**：
         // 头像要能被 `<img src>` 直接取，而 `<img>` 无法附带 Authorization 头。
         // 换来的是这些图是公开可读的——头像本来就在用户列表页展示，
