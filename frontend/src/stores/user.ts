@@ -99,6 +99,19 @@ export const useUserStore = defineStore('user', () => {
 
   // ── 获取用户信息 ──────────────────────────────────────────────
 
+  /**
+   * 用服务端返回的 UserInfo 覆盖本地状态
+   *
+   * 供改资料这类"后端已经返回了改完之后的完整信息"的场景复用。
+   * 不重新 GET：`fetchUserInfo` 那一次往返拿的是同一份数据，
+   * 而这里的目的恰恰是**用服务端的值**替换掉界面上乐观改过的值。
+   */
+  function applyUserInfo(info: UserInfo) {
+    userInfo.value = info
+    mustChangePassword.value = info.must_change_password === true
+    setUserInfo(info as unknown as Record<string, unknown>)
+  }
+
   async function fetchUserInfo() {
     try {
       const res = await authApi.me()
@@ -120,6 +133,7 @@ export const useUserStore = defineStore('user', () => {
     login,
     logout,
     clearLocalSession,
+    applyUserInfo,
     fetchUserInfo,
   }
 })

@@ -13,6 +13,11 @@ export const PERM = {
   USER_CREATE: 'system:user:create',
   USER_UPDATE: 'system:user:update',
   USER_DELETE: 'system:user:delete',
+  /** 解锁被临时锁定的账号（v0.20.0）——与 USER_UPDATE 分开，见后端权限码注释 */
+  USER_UNLOCK: 'system:user:unlock',
+
+  /** 在线会话列举与单会话吊销（v0.20.0） */
+  SESSION_MANAGE: 'system:session:manage',
 
   // 角色管理
   ROLE_LIST: 'system:role:list',

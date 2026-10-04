@@ -2,7 +2,7 @@
   <div class="page-container">
     <n-page-header
       title="个人中心"
-      subtitle="查看本人账号信息并修改登录密码"
+      subtitle="维护本人资料与登录密码"
     />
 
     <!-- 受限令牌：把"为什么只能待在这一页"说清楚，而不是让用户自己撞 403 -->
@@ -21,6 +21,32 @@
           <n-descriptions :column="1" label-placement="left" bordered size="small">
             <n-descriptions-item label="用户名">
               {{ userStore.userInfo?.username || '—' }}
+            </n-descriptions-item>
+            <n-descriptions-item label="展示名">
+              {{ userStore.userInfo?.display_name || '未设置' }}
+              <div class="hint">
+                列表与页面上优先显示这一项；留空则回退为用户名。
+              </div>
+            </n-descriptions-item>
+            <n-descriptions-item label="头像">
+              <n-avatar
+                v-if="avatarSrc"
+                :src="avatarSrc"
+                :alt="userStore.userInfo?.display_name || userStore.userInfo?.username"
+                round
+                size="small"
+                style="margin-right: 8px"
+              />
+              <span v-else class="hint">未设置</span>
+              <BaseUpload
+                mode="button"
+                list-type="text"
+                accept="image/png,image/jpeg,image/webp,image/gif"
+                :max-size="avatarMaxSize"
+                :action="uploadAction"
+                @success="onAvatarUploaded"
+                @error="onAvatarFailed"
+              />
             </n-descriptions-item>
             <n-descriptions-item label="邮箱">
               {{ userStore.userInfo?.email || '—' }}
@@ -46,6 +72,43 @@
               {{ createdAt }}
             </n-descriptions-item>
           </n-descriptions>
+        </n-card>
+      </n-grid-item>
+
+      <n-grid-item span="2 m:1">
+        <n-card title="展示名" size="small">
+          <n-form
+            ref="profileFormRef"
+            :model="profileForm"
+            :rules="profileRules"
+            label-placement="left"
+            label-width="80px"
+          >
+            <n-form-item label="展示名" path="displayName">
+              <n-input
+                v-model:value="profileForm.displayName"
+                placeholder="例如：张三"
+                :maxlength="DISPLAY_NAME_MAX_LEN"
+                clearable
+              />
+            </n-form-item>
+            <n-space align="center">
+              <n-button
+                type="primary"
+                :loading="profileSaving"
+                :disabled="!profileDirty"
+                @click="saveProfile"
+              >
+                保存
+              </n-button>
+              <n-button v-if="profileDirty" quaternary @click="resetProfileForm">
+                放弃修改
+              </n-button>
+            </n-space>
+          </n-form>
+          <div class="hint" style="margin-top: 8px">
+            留空即清空。展示名只影响显示，登录仍用用户名或邮箱。
+          </div>
         </n-card>
       </n-grid-item>
 
@@ -108,18 +171,135 @@
  * 这里重复实现一遍是为了即时反馈，**后端仍是唯一裁决方**——
  * 前端校验只是体验，不是安全边界。
  */
-import { computed, reactive, ref } from 'vue'
-import type { FormInst, FormRules } from 'naive-ui'
+import { computed, onMounted, reactive, ref } from 'vue'
+import type { FormInst, FormRules, UploadFileInfo } from 'naive-ui'
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { authApi } from '@/api/auth'
-import { showSuccess, showWarning } from '@/utils/message'
+import { showError, showSuccess, showWarning } from '@/utils/message'
 import { passwordIssues } from '@/utils/password'
+import BaseUpload from '@/components/common/BaseUpload.vue'
+import type { UserInfo } from '@/api/types/response'
 
 const router = useRouter()
 const userStore = useUserStore()
 
 const roles = computed(() => userStore.userInfo?.roles ?? [])
+
+// ── 头像 ────────────────────────────────────────────────────────
+
+/**
+ * 上传端点的完整 URL
+ *
+ * BaseUpload 走的是 naive-ui 的原生 XHR，**不经过 axios 实例**，
+ * 所以它拿不到 `http.defaults.baseURL`，必须自己拼全路径。
+ */
+const uploadAction = `${import.meta.env.VITE_API_BASE_URL || '/api'}/auth/profile/avatar`
+
+/** 与后端 `UploadConfig::max_file_size` 默认值一致（2MB） */
+const avatarMaxSize = 2 * 1024 * 1024
+
+/**
+ * 头像展示 URL
+ *
+ * 后端存的是站内相对路径（`/uploads/avatars/xxx.png`），
+ * 直接塞进 `src` 会指向前端 dev server 的端口，因此要补上 API 前缀。
+ */
+const avatarSrc = computed(() => {
+  const url = userStore.userInfo?.avatar_url
+  if (!url) return ''
+  return `${import.meta.env.VITE_API_BASE_URL || '/api'}${url}`
+})
+
+/**
+ * naive-ui 的上传组件直接把响应体塞进 `file.response`，
+ * 且**不走 axios 响应拦截器**，所以 `{code, message, data}` 信封要自己拆。
+ */
+function onAvatarUploaded(file: UploadFileInfo) {
+  // naive-ui 的 UploadFileInfo 类型里没有 `response`，但原生 XHR 完成后确实会挂上
+  const body = (file as unknown as { response?: unknown }).response as
+    | { code?: number; message?: string; data?: { url?: string } }
+    | undefined
+  if (body?.code !== 200 || !body?.data?.url) {
+    showError(body?.message || '头像上传失败')
+    return
+  }
+  // 重新拉一次而不是本地乐观更新：服务端可能归一过值，
+  // 界面上显示一个库里没有的名字比晚 200ms 更糟
+  userStore
+    .fetchUserInfo()
+    .then(() => showSuccess('头像已更新'))
+    .catch(() => {
+      // 错误提示已由 store 内部处理
+    })
+}
+
+function onAvatarFailed(file: UploadFileInfo) {
+  const body = (file as unknown as { response?: unknown }).response as
+    | { message?: string }
+    | undefined
+  showError(body?.message || '头像上传失败')
+}
+
+// ── 展示名 ──────────────────────────────────────────────────────
+
+const DISPLAY_NAME_MAX_LEN = 50
+
+const profileFormRef = ref<FormInst | null>(null)
+const profileSaving = ref(false)
+const profileForm = reactive({ displayName: '' })
+
+/** 原值：用于判定"有没有改动"，避免每次都发一个空请求 */
+const savedDisplayName = ref('')
+
+const profileRules: FormRules = {
+  displayName: [
+    {
+      trigger: ['input', 'blur'],
+      validator: (_rule, value: string) =>
+        (value ?? '').length <= DISPLAY_NAME_MAX_LEN
+          ? true
+          : new Error(`展示名不能超过 ${DISPLAY_NAME_MAX_LEN} 个字符`),
+    },
+  ],
+}
+
+const profileDirty = computed(() => profileForm.displayName !== savedDisplayName.value)
+
+function resetProfileForm() {
+  profileForm.displayName = savedDisplayName.value
+}
+
+async function saveProfile() {
+  if (profileSaving.value) return
+  try {
+    await profileFormRef.value?.validate()
+  } catch {
+    return
+  }
+  profileSaving.value = true
+  try {
+    const info = (await authApi.updateProfile({
+      // 空串而非 null：后端反序列化器把两者都归一成"清空"，
+      // 传 null 时 JSON 里保留 null 字段，语义同样正确，
+      // 用空串是为了让"用户清掉了"这件事在日志里也读得出来
+      display_name: profileForm.displayName.trim(),
+    })) as unknown as UserInfo
+    userStore.applyUserInfo(info)
+    savedDisplayName.value = info.display_name ?? ''
+    profileForm.displayName = savedDisplayName.value
+    showSuccess(profileForm.displayName ? '展示名已更新' : '展示名已清空')
+  } catch {
+    // 错误提示已由响应拦截器统一弹出
+  } finally {
+    profileSaving.value = false
+  }
+}
+
+onMounted(() => {
+  savedDisplayName.value = userStore.userInfo?.display_name ?? ''
+  profileForm.displayName = savedDisplayName.value
+})
 
 const createdAt = computed(() => {
   const raw = userStore.userInfo?.created_at
@@ -205,5 +385,11 @@ async function submit() {
 
 .force-alert {
   margin-bottom: 16px;
+}
+
+.hint {
+  font-size: 12px;
+  color: var(--n-text-color-3, #999);
+  margin-top: 4px;
 }
 </style>

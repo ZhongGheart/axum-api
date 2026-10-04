@@ -6,10 +6,12 @@
 
 import http from './index'
 import type {
+  AvatarUploadResult,
   ChangePasswordRequest,
   LoginRequest,
   LoginResponse,
   RegisterRequest,
+  UpdateProfileRequest,
   UserInfo,
 } from './types/response'
 
@@ -46,5 +48,25 @@ export const authApi = {
    */
   changePassword(data: ChangePasswordRequest) {
     return http.put<null>('/auth/password', data)
+  },
+
+  /** PUT /api/auth/profile — 自助修改展示名（v0.20.0） */
+  updateProfile(data: UpdateProfileRequest) {
+    return http.put<UserInfo>('/auth/profile', data)
+  },
+
+  /**
+   * POST /api/auth/profile/avatar — 上传头像（v0.20.0）
+   *
+   * 用 `multipart/form-data` 且字段名必须是 `file`。
+   * **必须让浏览器自己设 Content-Type**：手写 multipart 边界会让
+   * 后端解析不到任何字段，于是报"缺少 file 字段"。
+   */
+  uploadAvatar(file: File) {
+    const form = new FormData()
+    form.append('file', file)
+    return http.post<AvatarUploadResult>('/auth/profile/avatar', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
   },
 }
