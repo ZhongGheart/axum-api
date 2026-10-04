@@ -1,6 +1,6 @@
 [package]
 name = "axum-api"
-version = "0.18.0"
+version = "0.20.0"
 edition = "2021"
 description = "Production-grade Rust backend API with Axum, SQLx, JWT auth"
 authors = ["dev"]
@@ -12,9 +12,9 @@ tower = { version = "0.5", features = ["util"] }
 
 [dependencies]
 # Web框架
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "set-header"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "set-header", "fs"] }
 
 # 数据库
 sqlx = { version = "0.8", features = [
@@ -60,6 +60,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Excel 导出
 rust_xlsxwriter = "0.99"
+
+# CSV 解析（批量导入用户）
+csv = "1.4"
 
 # 文件下载（响应头）
 axum-extra = { version = "0.10", features = ["typed-header"] }

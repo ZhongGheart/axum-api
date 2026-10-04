@@ -59,6 +59,17 @@ pub struct User {
     /// v0.11.0 新增。管理员建号/重置口令时置 `true`，
     /// 用户自助改密后清零。**存量用户一律 `false`**。
     pub must_change_password: bool,
+    /// 展示名（可空，存量用户为 NULL）
+    ///
+    /// v0.20.0 新增。**不是登录键**，与 `username` 不同：
+    /// 两个人同名完全合法，管理员在列表里靠 `username` 与 `id` 辨认。
+    /// 空表示"没设过"，前端回退显示 `username`——两种状态刻意可区分。
+    pub display_name: Option<String>,
+    /// 头像相对路径（可空，形如 `/uploads/xxx.png`）
+    ///
+    /// v0.20.0 新增。DB 层 CHECK 只允许站内 `/uploads/` 前缀，
+    /// 见迁移 014 注释里"为什么不给它开外链"的理由。
+    pub avatar_url: Option<String>,
     /// 创建时间
     pub created_at: DateTime<Utc>,
     /// 更新时间
@@ -125,6 +136,37 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
+/// 自助修改资料请求体
+///
+/// `deny_unknown_fields`：与 [`ChangePasswordRequest`] 同理。
+/// 这个端点**只能**改展示型字段。多传一个 `email`、`is_active` 或 `roles`
+/// 若被静默忽略，调用方会以为"改了"，实际什么都没发生——
+/// 而"以为改了邮箱"这种误解在找回账号时才会暴露，那时已经晚了。
+///
+/// 刻意**不含 `email`**：没有邮件通道就无法证明新邮箱归提交者所有，
+/// 放开它等于把账号找回凭据交给任何登录用户。理由见迁移 014 注释。
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateProfileRequest {
+    /// 展示名（1-50 个字符，可为 null 清空）
+    ///
+    /// 为 null 表示"清空并回退显示用户名"。空串按清空处理，
+    /// 不用 null 与空串表达同一个意思——那正是迁移 014 拒绝的形态二义性。
+    #[serde(
+        default,
+        deserialize_with = "crate::utils::validation::deserialize_display_name"
+    )]
+    pub display_name: Option<Option<String>>,
+    /// 头像相对路径（可为 null 清空）
+    ///
+    /// 只接受 `/uploads/` 开头的站内相对路径；DB 层 CHECK 会再挡一道。
+    #[serde(
+        default,
+        deserialize_with = "crate::utils::validation::deserialize_avatar_url"
+    )]
+    pub avatar_url: Option<Option<String>>,
+}
+
 /// 当前用户信息（对外暴露，不含密码）
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct UserInfo {
@@ -142,6 +184,10 @@ pub struct UserInfo {
     pub is_active: bool,
     /// 是否必须先改密（前端据此强制跳转改密页）
     pub must_change_password: bool,
+    /// 展示名；未设置时为 NULL，由前端回退显示用户名
+    pub display_name: Option<String>,
+    /// 头像相对路径；未设置时为 NULL
+    pub avatar_url: Option<String>,
     /// 创建时间
     pub created_at: DateTime<Utc>,
 }
@@ -159,7 +205,21 @@ impl UserInfo {
             roles,
             is_active: user.is_active,
             must_change_password: user.must_change_password,
+            display_name: user.display_name,
+            avatar_url: user.avatar_url,
             created_at: user.created_at,
         }
+    }
+
+    /// 展示用名称：未设 `display_name` 时回退到用户名
+    ///
+    /// 单独给方法而不是让前端各写一遍 `display_name || username`：
+    /// 这个回退规则一旦在前端出现第二份，两处迟早会不一致，
+    /// 而不一致的表现是"有的地方显示空白"——很难被测出来。
+    pub fn display_label(&self) -> &str {
+        self.display_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.username)
     }
 }

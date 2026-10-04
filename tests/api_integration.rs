@@ -21,7 +21,7 @@ use tower::ServiceExt;
 
 use axum_api::config::{
     AuditLogConfig, Config, DatabaseConfig, MetricsConfig, RateLimitConfig, RedisConfig,
-    SecurityConfig,
+    SecurityConfig, UploadConfig,
 };
 use axum_api::middleware::api_metrics::{EndpointMetric, MetricsCollector};
 use axum_api::repository::audit_log::AuditLogRepository;
@@ -81,6 +81,22 @@ fn test_config(login_max_failures: u64) -> Config {
             flush_interval_seconds: 1,
             key_ttl_seconds: 600,
             max_buffered_endpoints: 1000,
+        },
+        upload: UploadConfig {
+            // 每个用例一个独立目录：头像上传会真的写盘，
+            // 共用目录会让用例之间互相看到对方的文件，
+            // "旧头像被删掉了"这类断言就会因为上一条用例而假绿。
+            dir: format!(
+                "{}/axum-api-it-uploads-{}-{}",
+                std::env::temp_dir().display(),
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            max_file_size: 64 * 1024,
+            allowed_mime_types: ["image/jpeg", "image/png", "image/webp", "image/gif"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         },
         migrate_on_startup: true,
     }
@@ -428,6 +444,29 @@ async fn admin_user_crud_projects_roles_consistently() {
 async fn last_admin_cannot_be_demoted_or_deleted() {
     let app = app().await;
     let token = admin_token(&app).await;
+
+    // 先钉住前提：库里必须**只有**一个 admin。
+    //
+    // 这不是洁癖，是这条用例的成立条件。"最后一个 admin 不能被降级"靠的是
+    // `count_users_with_role("admin") <= 1`，而那是**全库**计数——
+    // 任何前序用例漏下一个持 admin 角色的账号，守卫就会认为还有别人是 admin 而放行，
+    // 随后真 admin 被降掉，再之后**每一条**用例都因 admin 掉权而红。
+    // 症状（随机大面积 403）与病因（一个夹具没清理）能隔一百多条用例。
+    let admins: Vec<String> = sqlx::query_scalar(
+        "SELECT u.username FROM users u \
+         JOIN user_roles ur ON ur.user_id = u.id \
+         JOIN roles r ON r.id = ur.role_id \
+         WHERE r.name = 'admin' ORDER BY u.username",
+    )
+    .fetch_all(&pool().await)
+    .await
+    .expect("查询 admin 账号失败");
+    assert_eq!(
+        admins,
+        vec!["admin".to_string()],
+        "库里有多余的 admin 账号 {admins:?}——是某个夹具没清理， \
+         先修那个夹具，否则这条守卫会被旁路掉并把真 admin 降掉"
+    );
 
     let (_, me) = send(&app, request("GET", "/api/auth/me", Some(&token), None)).await;
     let admin_id = me["data"]["id"].as_str().unwrap().to_string();
@@ -8015,6 +8054,123 @@ async fn every_write_operation_leaves_an_answerable_change_summary() {
     )
     .await;
 
+    // ── 22b. v0.20.0 新增写端点：摘要必须答得出"谁、动了什么" ──
+    //
+    // 这几条是本版新增的写入口。它们的危险不在于"改错了"，
+    // 而在于**事后无法回答**：账号被人锁了却不知道是谁解的锁、
+    // 有人换了头像却不知道换了谁的。摘要空着就等于没审计。
+    {
+        let who = unique("aud20");
+        let (who_username, who_id) = make_plain_user(&app, &token, &who).await;
+        let who_tok = activated_token(&app, &who_username, "Str0ng!Pass").await;
+
+        // 自助改资料：记下改了哪个字段、是谁
+        let (status, body) = send(
+            &app,
+            request(
+                "PUT",
+                "/api/auth/profile",
+                Some(&who_tok),
+                Some(json!({ "display_name": "审计用展示名" })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "改资料失败: {body}");
+        // 标记用字段名而不是展示名内容：下面紧接着断言"内容不进摘要"，
+        // 若这里拿内容当标记，那条断言就永远验不到自己
+        let summary = wait_for_audit_result("PUT", "/api/auth/profile", "展示名").await;
+        assert!(
+            summary.contains(&who_username),
+            "改资料审计必须含账号，否则答不出是谁改的: {summary}"
+        );
+        // 摘要里**不得**有展示名全文：它不是凭据，但把长文本写进长期表
+        // 会让审计表随正常使用迅速膨胀
+        assert!(
+            !summary.contains("审计用展示名"),
+            "展示名内容本身不该进审计（只记字段名）: {summary}"
+        );
+
+        // 上传头像：记下路径与体积
+        let (status, body) = send(
+            &app,
+            multipart_request(&who_tok, "file", "a.png", "image/png", &tiny_png()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "上传头像失败: {body}");
+        let avatar_url = body["data"]["url"].as_str().unwrap().to_string();
+        let summary = wait_for_audit_result("POST", "/api/auth/profile/avatar", &avatar_url).await;
+        assert!(
+            summary.contains("字节"),
+            "上传头像的摘要应报出体积，否则事后无法判断是一次空传还是真图: {summary}"
+        );
+
+        // 解锁：记下解了谁
+        let (status, body) = send(
+            &app,
+            request(
+                "POST",
+                &format!("/api/admin/users/{who_id}/unlock"),
+                Some(&token),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "解锁失败: {body}");
+        let summary = wait_for_audit_result(
+            "POST",
+            &format!("/api/admin/users/{who_id}/unlock"),
+            &who_username,
+        )
+        .await;
+        assert!(
+            summary.contains("失败计数"),
+            "解锁摘要应说明清了什么，否则答不出「清了哪个维度」: {summary}"
+        );
+
+        // 吊销单个会话：记下吊的是哪个 jti
+        let (_, sessions) = send(
+            &app,
+            request(
+                "GET",
+                &format!("/api/admin/users/{who_id}/sessions"),
+                Some(&token),
+                None,
+            ),
+        )
+        .await;
+        let first_jti = sessions["data"][0]["jti"].as_str().unwrap().to_string();
+        let (status, body) = send(
+            &app,
+            request(
+                "POST",
+                &format!("/api/admin/users/{who_id}/sessions/{first_jti}/revoke"),
+                Some(&token),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "吊销会话失败: {body}");
+        wait_for_audit_result(
+            "POST",
+            &format!("/api/admin/users/{who_id}/sessions/{first_jti}/revoke"),
+            &who_username,
+        )
+        .await;
+
+        // CSV 导入：记下建成了谁
+        let csv = format!(
+            "username,email,password,roles\n{who}_imp,{who}_imp@example.com,Str0ng!Pass,user\n"
+        );
+        let (status, body) = import_csv(&app, &token, &csv, false).await;
+        assert_eq!(status, StatusCode::OK, "导入失败: {body}");
+        wait_for_audit_result("POST", "/api/admin/users/import", &format!("{who}_imp")).await;
+        if let Some(id) = user_id_by_name(&format!("{who}_imp")).await {
+            delete_user(&app, &token, id).await;
+        }
+
+        delete_user(&app, &token, who_id).await;
+    }
+
     // ── 23. 最后删角色 → **名字在行消失后仍可追溯** ────────────
     let (status, body) = delete_role(&app, &token, role_id).await;
     assert_eq!(status, StatusCode::OK, "删除角色失败: {body}");
@@ -8150,6 +8306,7 @@ fn every_documented_write_operation_is_covered_by_the_audit_test() {
         "PUT /api/admin/users/{id}",
         "DELETE /api/admin/users/{id}",
         "POST /api/admin/users/batch-delete",
+        "POST /api/admin/users/import",
         "PUT /api/admin/users/{id}/status",
         "POST /api/admin/users/{id}/reset-password",
         "POST /api/admin/dict/types",
@@ -8162,6 +8319,10 @@ fn every_documented_write_operation_is_covered_by_the_audit_test() {
         "POST /api/admin/monitor/metrics/reset",
         "PUT /api/auth/password",
         "POST /api/auth/logout",
+        "PUT /api/auth/profile",
+        "POST /api/auth/profile/avatar",
+        "POST /api/admin/users/{id}/unlock",
+        "POST /api/admin/users/{id}/sessions/{jti}/revoke",
     ];
 
     /// 明确豁免的写端点：**每一条都要写出理由**，否则豁免就变成了漏测的挡箭牌
@@ -10147,4 +10308,1768 @@ fn account_rule_constants_agree_with_the_backend() {
         "前后端常量不一致：\n{}",
         problems.join("\n")
     );
+}
+
+// ──────────────────────────────────────────────
+// v0.20.0：账号自持 + 管理可应急
+// ──────────────────────────────────────────────
+
+/// 建一个普通用户并删掉，返回其 id（用于需要真实用户行的用例）
+async fn make_plain_user(app: &Router, admin_tok: &str, prefix: &str) -> (String, uuid::Uuid) {
+    let username = unique(prefix);
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "建号失败: {body}");
+    let id = body["data"]["id"].as_str().unwrap().parse().unwrap();
+    (username, id)
+}
+
+async fn delete_user(app: &Router, admin_tok: &str, id: uuid::Uuid) {
+    let _ = send(
+        app,
+        request(
+            "DELETE",
+            &format!("/api/admin/users/{id}"),
+            Some(admin_tok),
+            None,
+        ),
+    )
+    .await;
+}
+
+// ── 自助改资料 ──────────────────────────────────
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_user_can_set_and_clear_their_own_display_name() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, id) = make_plain_user(&app, &admin_tok, "profset").await;
+    let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    // 设置
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/profile",
+            Some(&tok),
+            Some(json!({ "display_name": "张三" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["display_name"], "张三");
+
+    // 清空：null 与空串等价，都表示"没设过"
+    for payload in [
+        json!({ "display_name": null }),
+        json!({ "display_name": "" }),
+    ] {
+        let (status, body) = send(
+            &app,
+            request(
+                "PUT",
+                "/api/auth/profile",
+                Some(&tok),
+                Some(payload.clone()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "清空失败 {payload}: {body}");
+        assert_eq!(body["data"]["display_name"], Value::Null, "清空后应为 null");
+    }
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+/// **三态的核心**：不传该字段 = 不改。
+///
+/// 若把"字段缺失"当成"清空"，前端只想改头像时会把展示名一起清掉——
+/// 一次静默的数据丢失，而且没有任何报错可查。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn omitting_a_profile_field_leaves_it_untouched() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, id) = make_plain_user(&app, &admin_tok, "profkeep").await;
+    let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    // 先设好两个字段
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/profile",
+            Some(&tok),
+            Some(json!({ "display_name": "保留我", "avatar_url": "/uploads/keep.png" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 只改其中一个，另一个必须原样保留
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/profile",
+            Some(&tok),
+            Some(json!({ "display_name": "只改这个" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["display_name"], "只改这个");
+    assert_eq!(
+        body["data"]["avatar_url"], "/uploads/keep.png",
+        "未提供的字段不得被清空——这是三态存在的原因"
+    );
+
+    // 反向：只改头像，展示名保留
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/profile",
+            Some(&tok),
+            Some(json!({ "avatar_url": "/uploads/new.png" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["display_name"], "只改这个", "展示名必须保留");
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+/// 这个端点**只能**改展示型字段。
+///
+/// 多传 `email` / `is_active` / `roles` 若被静默忽略，调用方会以为"改了"，
+/// 而"以为改了邮箱"这种误解要到找回账号时才暴露。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_profile_endpoint_refuses_fields_it_does_not_own() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, id) = make_plain_user(&app, &admin_tok, "profdeny").await;
+    let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    for payload in [
+        json!({ "email": "hijack@example.com" }),
+        json!({ "is_active": false }),
+        json!({ "roles": ["admin"] }),
+        json!({ "username": "renamed" }),
+    ] {
+        let (status, _) = send(
+            &app,
+            request(
+                "PUT",
+                "/api/auth/profile",
+                Some(&tok),
+                Some(payload.clone()),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{payload} 必须被拒：自助端点不得具备改登录键或提权的能力"
+        );
+    }
+
+    // 复核：账号没被动过
+    let (status, body) = send(&app, request("GET", "/api/auth/me", Some(&tok), None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["email"], format!("{username}@example.com"));
+    assert_eq!(body["data"]["is_active"], true);
+    assert_eq!(body["data"]["roles"], json!(["user"]));
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+/// DB 层必须挡住逃出 `/uploads/` 的头像路径与 `..` 穿越。
+///
+/// 这一条是**实跑发现过的漏洞**：初版只写了
+/// `avatar_url ~ '^/uploads/[A-Za-z0-9._/-]+$'`，而该字符类里同时有 `.` 与 `/`，
+/// 于是 `/uploads/../etc/passwd` 被直接接受（UPDATE 1，不是报错）。
+/// 应用层有逐段检查所以 HTTP 路径拦得住，但绕过应用直写库的路径会穿透，
+/// 而这一列的 CHECK 存在的意义恰恰就是那条路径。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_database_refuses_avatar_paths_that_escape_the_uploads_prefix() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (_username, id) = make_plain_user(&app, &admin_tok, "avatarck").await;
+
+    // 合法值必须先确认能写进去，否则下面的"被拒"可能只是约束写得太严，
+    // 而一条过严的约束同样会挡住合法上传——那样测出来的是"被拒"，不是"被正确挡住"
+    for ok in ["/uploads/a.png", "/uploads/a..b.png", "/uploads/x/y/z.jpg"] {
+        let res = sqlx::query("UPDATE users SET avatar_url = $2 WHERE id = $1")
+            .bind(id)
+            .bind(ok)
+            .execute(&pool().await)
+            .await;
+        assert!(res.is_ok(), "合法头像路径 {ok} 不该被拒: {:?}", res.err());
+    }
+
+    for bad in [
+        "/uploads/../etc/passwd",
+        "/uploads/a/../../b",
+        "/uploads/a/..",
+        "/uploads/..",
+        "https://evil.example/x.png",
+        "//evil.example/x.png",
+        "/static/x.png",
+    ] {
+        let res: Result<_, sqlx::Error> =
+            sqlx::query("UPDATE users SET avatar_url = $2 WHERE id = $1")
+                .bind(id)
+                .bind(bad)
+                .execute(&pool().await)
+                .await;
+        assert!(
+            res.is_err(),
+            "头像路径 {bad} 必须被数据库拒绝：绕过应用直写库时 CHECK 是唯一的防线"
+        );
+    }
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+/// 展示名长度按**字符**计，且超长在应用层就 400（不是 DB 报的 500 级）
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_display_name_length_is_counted_in_characters() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, id) = make_plain_user(&app, &admin_tok, "prof_len").await;
+    let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    // 50 个汉字 = 150 字节，按字节判定会被误拒（v0.18.0 在用户名上修过同类问题）
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/profile",
+            Some(&tok),
+            Some(json!({ "display_name": "张".repeat(50) })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "50 个汉字必须接受: {body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/profile",
+            Some(&tok),
+            Some(json!({ "display_name": "张".repeat(51) })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "51 个字符必须被拒，且应是 400 而非 DB 约束错误: {body}"
+    );
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+/// 待改密的受限令牌**不得**改资料。
+///
+/// 受限令牌表示"这个会话还没确认过凭据"（v0.11.0 的强制改密）。
+/// 让它去写用户数据，等于把一条未验证的会话变成写通道。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_restricted_token_cannot_change_the_profile() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let username = unique("prof_stale");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let uid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
+        .bind(&username)
+        .fetch_one(&pool().await)
+        .await
+        .unwrap();
+
+    // 管理员建号会置"强制改密"，这里**保留**它以拿到受限令牌。
+    // 刻意不走 activated_token——那个 helper 的职责恰恰是清掉这个标记。
+    let tok = login_token(&app, &username, "Str0ng!Pass").await;
+    let (_, me) = send(&app, request("GET", "/api/auth/me", Some(&tok), None)).await;
+    assert_eq!(
+        me["data"]["must_change_password"], true,
+        "前置条件：应拿到受限令牌"
+    );
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/profile",
+            Some(&tok),
+            Some(json!({ "display_name": "偷改" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "受限令牌改资料必须被拒: {body}"
+    );
+
+    delete_user(&app, &admin_tok, uid).await;
+}
+
+// ── 用户列表按角色 / 状态筛选 ──────────────────
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_user_list_can_be_filtered_by_role_and_by_active_status() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (op_tok, op_role_id, op_uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "listfilt_op",
+        &[permission::USER_LIST, permission::USER_CREATE],
+    )
+    .await;
+
+    // 造 3 个 user、1 个 admin 角色账号。
+    //
+    // 建号**必须**用 admin：操作员夹具不持有 `user` 角色，
+    // 而 `ensure_can_grant_roles` 会拒绝它授出自己没有的角色 → 403。
+    // 操作员只用来读列表，那才是这条用例真正要测的权限码。
+    let mut names = Vec::new();
+    for _ in 0..3 {
+        let (u, _) = make_plain_user(&app, &admin_tok, "filt_user").await;
+        names.push(u);
+    }
+    let admin_named = unique("filt_admin_role");
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": admin_named,
+                "email": format!("{admin_named}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["admin"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 按角色筛：role=admin 只应命中那一个
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            "/api/admin/users?page=1&page_size=200&role=admin",
+            Some(&op_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["data"]["items"].as_array().unwrap();
+    assert!(
+        items.iter().any(|i| i["username"] == admin_named),
+        "按 role=admin 筛选必须命中新建的 admin 账号"
+    );
+    for i in items {
+        assert!(
+            i["roles"].as_array().unwrap().iter().any(|r| r == "admin"),
+            "role=admin 的结果里混进了非 admin: {i}"
+        );
+    }
+
+    // 组合筛选是 AND：role=user 且 is_active=true
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            "/api/admin/users?page=1&page_size=200&role=user&is_active=true",
+            Some(&op_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for i in body["data"]["items"].as_array().unwrap() {
+        let roles = i["roles"].as_array().unwrap();
+        assert!(
+            roles.iter().any(|r| r == "user") && i["is_active"] == true,
+            "AND 组合筛选的结果必须同时满足两个条件: {i}"
+        );
+    }
+
+    // is_active=false 不得返回任何启用账号
+    let (_, body) = send(
+        &app,
+        request(
+            "GET",
+            "/api/admin/users?page=1&page_size=200&is_active=false",
+            Some(&op_tok),
+            None,
+        ),
+    )
+    .await;
+    for i in body["data"]["items"].as_array().unwrap() {
+        assert_eq!(
+            i["is_active"], false,
+            "is_active=false 里混进了启用账号: {i}"
+        );
+    }
+
+    // 这批账号必须清掉，尤其那个持 admin 角色的：
+    //
+    // `last_admin_cannot_be_demoted_or_deleted` 断言"最后一个 admin 不能被降级"，
+    // 它的成立前提是库里**只有**一个 admin。这里漏一个 admin 出去，
+    // 守卫就会认为"还有别人是 admin"而放行降级——那条用例随后把真 admin 降掉，
+    // 之后**每一个**用例都因为 admin 掉权而红。
+    //
+    // 症状与病因隔着一百多条用例，正是它一开始看起来像"随机大面积失败"的原因。
+    for n in names.iter().chain(std::iter::once(&admin_named)) {
+        if let Some(id) = user_id_by_name(n).await {
+            delete_user(&app, &admin_tok, id).await;
+        }
+    }
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
+}
+
+/// 筛选后 `total` 必须与列表同条件——否则就是"列表 3 条但总数 500"的分页错乱。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_filtered_user_list_count_matches_the_filter() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (op_tok, op_role_id, op_uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "listcount_op",
+        &[permission::USER_LIST, permission::USER_CREATE],
+    )
+    .await;
+
+    // 关键字必须是一段**共同前缀**：账号名各自带随机后缀，
+    // 拿其中一个完整用户名去搜只会命中 0 条——那测的是"搜不到"，
+    // 不是"筛选与计数一致"。
+    let keyword = format!("{}k", unique("countme"));
+    let mut created = Vec::new();
+    for i in 0..2 {
+        // 后缀必须逐个不同：两个同名账号里只有第一个建得出来，
+        // 第二个被唯一约束拒掉，筛出 1 条——那不是筛选算错，是夹具本身少了一个。
+        let u = format!("{keyword}u{i}");
+        created.push(u.clone());
+        let _ = send(
+            &app,
+            request(
+                "POST",
+                "/api/admin/users",
+                Some(&admin_tok),
+                Some(json!({
+                    "username": u,
+                    "email": format!("{u}@example.com"),
+                    "password": "Str0ng!Pass",
+                    "roles": ["user"],
+                })),
+            ),
+        )
+        .await;
+    }
+
+    // 用一个能唯一命中该前缀的关键字
+    let (_, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users?page=1&page_size=200&keyword={keyword}"),
+            Some(&op_tok),
+            None,
+        ),
+    )
+    .await;
+    let items = body["data"]["items"].as_array().unwrap();
+    let total = body["data"]["total"].as_i64().unwrap();
+    assert_eq!(
+        items.len() as i64,
+        total,
+        "列表条数({})与 total({}) 必须一致，否则分页错乱: {body}",
+        items.len(),
+        total
+    );
+    assert_eq!(total, 2, "该关键字应恰好命中 2 个账号");
+
+    for u in &created {
+        if let Some(id) = user_id_by_name(u).await {
+            delete_user(&app, &admin_tok, id).await;
+        }
+    }
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
+}
+
+// ── 管理员解锁 ──────────────────────────────────
+
+/// 造一个**低阈值**的 app，用来测锁定与解锁
+///
+/// 不用 `app()`：它的阈值是 `test_config(1_000)`——按 1000 次失败去撞阈值
+/// 意味着几千次 Argon2 验证（那正是它刻意昂贵的地方），一个用例跑到分钟级。
+/// 也**不能**从 `LOGIN_MAX_FAILURES` 环境变量读循环次数：
+/// 测试 app 用的是 `test_config(...)` 里的硬编码值，两边对不上，
+/// 结果就是"试了 3 次没到 1000 的阈值"，测试看起来在跑却什么都没验证。
+///
+/// 阈值 3 让锁定场景只需要三次错密码。
+async fn strict_app() -> Router {
+    // 必须在建 app **之前**清：IP 桶跨用例共享，而阈值只有 3，
+    // 上一个用例留下的计数会让本用例连 admin 登录都过不去。
+    clear_ip_failure_counter().await;
+    create_router(test_config(3))
+        .await
+        .map(|(router, _state)| router)
+        .expect("构建低阈值路由失败")
+}
+
+/// 把某账号的失败计数顶到锁定阈值
+async fn lock_account_by_failed_logins(app: &Router, username: &str, password: &str) {
+    for i in 1..=3 {
+        let (status, _) = login(app, username, password).await;
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "第 {i} 次尝试就 429 了，说明锁定阈值比假设的更小"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_admin_can_unlock_a_locked_account() {
+    let app = strict_app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, id) = make_plain_user(&app, &admin_tok, "unlockme").await;
+
+    lock_account_by_failed_logins(&app, &username, "Wr0ng!Pass").await;
+    let (status, _) = login(&app, &username, "Str0ng!Pass").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "应处于锁定状态");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{id}/unlock"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "解锁失败: {body}");
+    assert!(
+        body["data"]["cleared_failures"].as_u64().unwrap() > 0,
+        "回包必须说明清掉了多少次，否则管理员分不清'解锁了'与'本来就没锁': {body}"
+    );
+
+    // 清掉 IP 桶后再试：账号维度确实解开了
+    clear_ip_failure_counter().await;
+    let (status, body) = login(&app, &username, "Str0ng!Pass").await;
+    assert_eq!(status, StatusCode::OK, "解锁后应能登录: {body}");
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+/// **解锁必须同时清用户名与邮箱两个计数桶。**
+///
+/// 登录框用户名和邮箱都接受，失败计数写在 `account:{归一后的登录输入}` 下，
+/// 于是同一个账号有两个独立桶。只清一个的话，通过另一条路径锁定的用户
+/// 仍然登不进去，而管理员看到"已解锁"却仍被拒。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn unlocking_clears_the_email_counter_too_not_just_the_username_one() {
+    let app = strict_app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, id) = make_plain_user(&app, &admin_tok, "unlkemail").await;
+
+    // **用邮箱**作为登录标识把账号锁上
+    lock_account_by_failed_logins(&app, &format!("{username}@example.com"), "Wr0ng!Pass").await;
+
+    let redis = RedisClient::new(&axum_api::config::RedisConfig {
+        url: test_redis_url(),
+    })
+    .await
+    .unwrap();
+    // 注意：login_failure_count 自带 `login:fail:` 前缀，这里只能传 scope 部分
+    let email_scope = format!("account:{username}@example.com");
+    assert!(
+        redis.login_failure_count(&email_scope).await.unwrap() > 0,
+        "前置条件：邮箱桶应有失败计数"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{id}/unlock"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        redis.login_failure_count(&email_scope).await.unwrap(),
+        0,
+        "邮箱桶必须被清空——否则用邮箱锁定的用户解锁后仍登不进去"
+    );
+
+    clear_ip_failure_counter().await;
+    let (status, _) = login(&app, &username, "Str0ng!Pass").await;
+    assert_eq!(status, StatusCode::OK, "解锁后应能用用户名登录");
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+/// **解锁绝不能清 IP 计数桶。**
+///
+/// IP 计数是跨账号共享的（一个 NAT 出口后所有用户共用）。
+/// 解锁 alice 时把 IP 桶一起清零，等于给正在爆破的地址发了一份新额度——
+/// 不只是 alice 没被救，还顺手帮了攻击者。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn unlocking_never_clears_the_shared_ip_counter() {
+    let app = strict_app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, id) = make_plain_user(&app, &admin_tok, "unlk_ip").await;
+
+    lock_account_by_failed_logins(&app, &username, "Wr0ng!Pass").await;
+
+    let redis = RedisClient::new(&axum_api::config::RedisConfig {
+        url: test_redis_url(),
+    })
+    .await
+    .unwrap();
+    // 走 `Router::oneshot` 时没有对端地址，IP 桶的键是 `unknown` 而非 `127.0.0.1`
+    let ip_scope = "ip:unknown";
+    let ip_before = redis.login_failure_count(ip_scope).await.unwrap();
+    assert!(ip_before > 0, "前置条件：IP 桶应有计数");
+
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{id}/unlock"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        redis.login_failure_count(ip_scope).await.unwrap(),
+        ip_before,
+        "解锁不得触碰 IP 桶：那是跨账号共享的，清了等于给爆破地址发新额度"
+    );
+
+    // 而 IP 桶仍在时，该 IP 依然登不进去——这正是我们要的安全性质
+    let (status, _) = login(&app, &username, "Str0ng!Pass").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "IP 桶未清时仍应锁定");
+
+    clear_ip_failure_counter().await;
+    delete_user(&app, &admin_tok, id).await;
+}
+
+/// 清掉**全部** IP 失败计数桶
+///
+/// 必须按前缀清而不是枚举 `127.0.0.1` / `::1` 两个具体值：
+/// 集成测试走 `Router::oneshot`，没有真实对端地址，实测键是
+/// `login:fail:ip:unknown`。按具体 IP 清理等于什么都没清，
+/// 而残留的计数会把后续用例的登录全部打成 429——症状是"某个用例莫名其妙
+/// 一上来就 429"，根因却在上一个用例，与它完全无关。
+///
+/// 也因此**任何用到 `strict_app` 的用例都必须先调它**：
+/// IP 桶是跨账号共享的，阈值 3 意味着三个失败就会连累同一个来源的所有登录。
+async fn clear_ip_failure_counter() {
+    let redis = RedisClient::new(&test_config(1_000).redis)
+        .await
+        .expect("连接 Redis 失败");
+    redis
+        .delete_by_prefix("login:fail:ip:")
+        .await
+        .expect("清理 IP 失败计数失败");
+}
+
+/// 解锁端点必须有**自己的**权限码，不能顺带被 `system:user:update` 放行
+///
+/// `system:user:update` 是日常高频操作，几乎必然会授给管理员；
+/// 而"解锁"意味着"我确认这个人是本人"，是低频但高判断的动作。
+/// 两者共用一个开关，就等于让前者**必然**带出后者。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn unlocking_needs_its_own_permission_code() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (_username, id) = make_plain_user(&app, &admin_tok, "unlockperm").await;
+
+    // 只持 USER_UPDATE：不得放行
+    let (update_only_tok, r1, u1) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "unlock_deny_op",
+        &[permission::USER_UPDATE],
+    )
+    .await;
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{id}/unlock"),
+            Some(&update_only_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "只持 system:user:update 不该能解锁"
+    );
+    cleanup_operator(&app, &admin_tok, u1, r1).await;
+
+    // 持 USER_UNLOCK：放行
+    let (unlock_tok, r2, u2) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "unlock_allow_op",
+        &[permission::USER_UNLOCK],
+    )
+    .await;
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{id}/unlock"),
+            Some(&unlock_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "持 USER_UNLOCK 后应放行: {body}");
+    cleanup_operator(&app, &admin_tok, u2, r2).await;
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+// ── 在线会话 ────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn each_login_registers_its_own_session_and_logout_removes_it() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let uid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&pool().await)
+        .await
+        .unwrap();
+
+    // admin_tok 本身是一次登录 → 至少 1 条
+    let second = login_token(&app, "admin", "admin123").await;
+    assert_ne!(second, admin_tok, "两次登录必须得到不同令牌");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{uid}/sessions"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sessions = body["data"].as_array().unwrap();
+    assert!(
+        sessions.len() >= 2,
+        "两次登录应登记两条会话，实际 {} 条",
+        sessions.len()
+    );
+
+    // 恰好一条被标为当前
+    let current: Vec<_> = sessions
+        .iter()
+        .filter(|s| s["is_current"] == true)
+        .collect();
+    assert_eq!(current.len(), 1, "必须且只能有一条 is_current=true: {body}");
+
+    // 所有 jti 都是合法 UUID（前端要拿它去吊销）
+    for s in sessions {
+        assert!(
+            s["jti"].as_str().unwrap().parse::<uuid::Uuid>().is_ok(),
+            "jti 必须是 UUID，否则前端无法回传吊销: {s}"
+        );
+    }
+
+    // 记下 second 那条会话的 jti（它不是当前会话）
+    let second_jti = {
+        let (_, body) = send(
+            &app,
+            request(
+                "GET",
+                &format!("/api/admin/users/{uid}/sessions"),
+                Some(&admin_tok),
+                None,
+            ),
+        )
+        .await;
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["is_current"] == false)
+            .map(|s| s["jti"].as_str().unwrap().to_string())
+            .next()
+            .expect("应至少有一个非当前会话")
+    };
+
+    // 登出后对应登记必须消失
+    let (status, _) = send(
+        &app,
+        request("POST", "/api/auth/logout", Some(&second), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{uid}/sessions"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    let after = body["data"].as_array().unwrap();
+    assert!(
+        !after.iter().any(|s| s["jti"] == second_jti),
+        "登出后该会话登记必须消失，否则'谁在线'会把已登出的设备继续显示成在线（最长可达一整天）: {body}"
+    );
+}
+
+/// **单会话吊销只能踢掉那一个**，其余令牌必须继续可用。
+///
+/// 若误用整用户时间戳机制，这里会连 admin_tok 一起失效——那就不是
+/// "单会话吊销"，是换了名字的全量重登。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn revoking_one_session_leaves_the_others_working() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let uid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&pool().await)
+        .await
+        .unwrap();
+
+    let victim = login_token(&app, "admin", "admin123").await;
+
+    // 找到 victim 对应的 jti：它不是当前会话（当前是 admin_tok）
+    let (_, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{uid}/sessions"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    let victim_jti = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["is_current"] == false)
+        .map(|s| s["jti"].as_str().unwrap().to_string())
+        .next()
+        .expect("应至少有一个非当前会话");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{uid}/sessions/{victim_jti}/revoke"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "吊销失败: {body}");
+
+    // 被吊销的令牌失效
+    let (status, _) = send(&app, request("GET", "/api/auth/me", Some(&victim), None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "被吊销的令牌必须失效");
+
+    // **其余令牌不受影响**
+    let (status, body) = send(&app, request("GET", "/api/auth/me", Some(&admin_tok), None)).await;
+    assert_eq!(status, StatusCode::OK, "单会话吊销不得殃及其他会话: {body}");
+}
+
+/// 不存在的用户查会话返回**空数组**，而不是 404
+///
+/// 与 `GET /api/admin/users/{id}/roles` 对齐：同一个 `{id}` 在两个
+/// "查这个人的附属信息"的端点上不该给出两种相反的答案。
+/// 仓库对读端点的统一约定也是"不存在即空"——
+/// `every_documented_endpoint_is_reachable_without_a_server_error`
+/// 拿一个不存在的 UUID 探针，读端点回 4xx 一律算缺陷。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn sessions_of_an_unknown_user_are_an_empty_list_not_a_404() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let ghost = uuid::Uuid::new_v4();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{ghost}/sessions"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "读端点对不存在的用户应回 200: {body}"
+    );
+    assert_eq!(
+        body["data"],
+        json!([]),
+        "不存在即空列表，必须是空数组: {body}"
+    );
+
+    // 对照：真存在但没有在线会话的用户，同样是空数组——两种情况确实分不开，
+    // 这条断言只是把"分不开"这件事固定下来，将来有人想改成 404 时会先看到它。
+    let (_username, id) = make_plain_user(&app, &admin_tok, "sessghost").await;
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{id}/sessions"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"], json!([]), "{body}");
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn revoking_a_malformed_or_unknown_jti_is_refused() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let uid: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(&pool().await)
+        .await
+        .unwrap();
+
+    // 非 UUID：jti 会拼进 Redis 键 `sess:{user_id}:{jti}`，
+    // 而列举用的是 SCAN glob `sess:{user_id}:*`——放行 glob 字符等于
+    // 让一次键名污染改变整个列表
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{uid}/sessions/*/revoke"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "含 glob 字符的 jti 必须被拒"
+    );
+
+    // 格式合法但不存在：必须 404，**不许回成功**
+    // 回成功会让界面显示"已下线"，而令牌其实还在有效期内——
+    // 那是一个看起来完全正常的安全假象
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/users/{uid}/sessions/11111111-2222-3333-4444-555555555555/revoke"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "不存在的会话必须明确拒绝: {body}"
+    );
+}
+
+/// 改密会让全部会话失效，会话登记也必须一起清掉
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn changing_the_password_clears_the_session_records_too() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, id) = make_plain_user(&app, &admin_tok, "sesspwd").await;
+
+    let t1 = activated_token(&app, &username, "Str0ng!Pass").await;
+    let _t2 = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let (_, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{id}/sessions"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        body["data"].as_array().unwrap().len() >= 2,
+        "前置条件：应有 2 条会话"
+    );
+
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/password",
+            Some(&t1),
+            Some(json!({ "old_password": "Str0ng!Pass", "new_password": "N3w!Str0ngPass" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 令牌已全部吊销
+    let (status, _) = send(&app, request("GET", "/api/auth/me", Some(&t1), None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "改密后原令牌必须失效");
+
+    // 登记也清干净了——否则"在线会话"会列出一天内都登不上的设备
+    let (_, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users/{id}/sessions"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["data"].as_array().unwrap().len(),
+        0,
+        "改密后会话登记必须一并清理，否则在线列表会残留一整天: {body}"
+    );
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+// ============================================================
+// v0.20.0 M5：头像上传
+// ============================================================
+
+/// 构造一个 multipart/form-data 请求
+///
+/// 手写 boundary 是必要的：integration test 走 `Router::oneshot`，
+/// 没有浏览器替我们设 Content-Type，而少一个 boundary 后端连字段都读不到。
+fn multipart_request(
+    token: &str,
+    field_name: &str,
+    filename: &str,
+    mime: &str,
+    body: &[u8],
+) -> Request<Body> {
+    let boundary = "----axumapitestboundary";
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    buf.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{field_name}\"; filename=\"{filename}\"\r\n"
+        )
+        .as_bytes(),
+    );
+    buf.extend_from_slice(format!("Content-Type: {mime}\r\n\r\n").as_bytes());
+    buf.extend_from_slice(body);
+    buf.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    Request::builder()
+        .method("POST")
+        .uri("/api/auth/profile/avatar")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(Body::from(buf))
+        .expect("构造 multipart 请求失败")
+}
+
+/// 一张最小的合法 PNG（1x1）
+///
+/// 真的 PNG 字节而不是假的后缀名：白名单只查 MIME，
+/// 但一个存成 `.png` 的文本文件被浏览器当图片渲染时的失败方式
+/// 与"上传被拒"完全不同，测试不该依赖那种失败。
+fn tiny_png() -> Vec<u8> {
+    vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ]
+}
+
+/// 上传成功必须**真的落盘并可回读**——只回一个路径不算数
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_uploaded_avatar_is_written_to_disk_and_recorded_on_the_account() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    // 自己建号并清掉"必须改密"：本用例要的就是一个能正常调接口的令牌
+    let username = unique("avatar_u");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let user_tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let (status, body) = send(
+        &app,
+        multipart_request(
+            &user_tok,
+            "file",
+            "../../../etc/cron.d/pwn.png",
+            "image/png",
+            &tiny_png(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "上传失败: {body}");
+    let url = body["data"]["url"].as_str().unwrap().to_string();
+    assert!(
+        url.starts_with("/uploads/avatars/"),
+        "必须返回站内相对路径: {url}"
+    );
+    assert!(
+        !url.contains("..") && !url.contains("pwn"),
+        "落盘文件名绝不能来自客户端: {url}"
+    );
+
+    // 库里真的写了
+    let (_, me) = send(&app, request("GET", "/api/auth/me", Some(&user_tok), None)).await;
+    assert_eq!(me["data"]["avatar_url"], url, "头像路径必须写入当前用户");
+
+    // 静态路由能取回，且字节一致
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&url)
+                .body(Body::empty())
+                .expect("构造静态请求失败"),
+        )
+        .await
+        .expect("静态请求执行失败");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "上传后静态路由必须能取到"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        tiny_png().as_slice(),
+        "回读字节必须与上传一致"
+    );
+
+    delete_user(&app, &admin_tok, body_id(&me)).await;
+}
+
+/// 白名单外与超限都必须被拒，且**不许留下文件**
+/// 非 multipart 的请求也必须走统一错误信封
+///
+/// `Multipart` 提取器默认在 Content-Type 不对时**在进入处理函数之前**返回
+/// `text/plain` 的 400。于是同一个"入参不对"有两种形态：JSON 信封与纯文本。
+/// 前端若按 `code` 分支处理错误，纯文本那一种拿到的 `data` 是 `null`，
+/// 只能靠 try/catch 兜——错误处理因此分裂成两套。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_non_multipart_avatar_upload_still_returns_the_json_envelope() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, _) = make_plain_user(&app, &admin_tok, "avct").await;
+    let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let req = raw_request(
+        "POST",
+        "/api/auth/profile/avatar",
+        Some(&tok),
+        Some("application/json"),
+        "{}",
+    );
+    let (status, content_type, body) = send_raw(&app, req).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        content_type.starts_with("application/json"),
+        "入参错误的 Content-Type 必须是 JSON，实际 {content_type}"
+    );
+    assert!(
+        body["code"].is_i64() && body["message"].is_string(),
+        "必须返回统一信封（code + message），实际 {body}"
+    );
+
+    delete_user(&app, &admin_tok, user_id_by_name(&username).await.unwrap()).await;
+}
+
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_avatar_outside_the_mime_whitelist_or_the_size_limit_is_refused() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let username = unique("avrej");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let user_tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    // SVG 能内联脚本，是最典型的存储型 XSS 载体，必须被挡在门外
+    let (status, body) = send(
+        &app,
+        multipart_request(
+            &user_tok,
+            "file",
+            "x.svg",
+            "image/svg+xml",
+            b"<svg onload=alert(1)>",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "SVG 必须被拒: {body}");
+
+    // 超限：测试配置上限 64KB
+    let (status, body) = send(
+        &app,
+        multipart_request(
+            &user_tok,
+            "file",
+            "big.png",
+            "image/png",
+            &vec![0u8; 128 * 1024],
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "超限必须 413: {body}"
+    );
+
+    // 两次拒绝之后头像仍未被设置：说明拒绝路径没有留下"半个成功"
+    let (_, me) = send(&app, request("GET", "/api/auth/me", Some(&user_tok), None)).await;
+    assert!(
+        me["data"]["avatar_url"].is_null(),
+        "被拒的上传绝不能写入 avatar_url: {me}"
+    );
+
+    delete_user(&app, &admin_tok, body_id(&me)).await;
+}
+
+/// 换头像必须删掉旧文件，否则磁盘上会累积用户的每一版头像
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn replacing_an_avatar_removes_the_previous_file() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let username = unique("avswap");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let user_tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let (_, first) = send(
+        &app,
+        multipart_request(&user_tok, "file", "a.png", "image/png", &tiny_png()),
+    )
+    .await;
+    let first_url = first["data"]["url"].as_str().unwrap().to_string();
+
+    let (_, second) = send(
+        &app,
+        multipart_request(&user_tok, "file", "b.png", "image/png", &tiny_png()),
+    )
+    .await;
+    let second_url = second["data"]["url"].as_str().unwrap().to_string();
+    assert_ne!(first_url, second_url, "两次上传不得复用同一文件名");
+
+    // 旧文件必须已不可访问
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&first_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "旧头像必须被删除，否则磁盘会累积每一版: {first_url}"
+    );
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&second_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, StatusCode::OK, "新头像必须可访问");
+
+    let (_, me) = send(&app, request("GET", "/api/auth/me", Some(&user_tok), None)).await;
+    delete_user(&app, &admin_tok, body_id(&me)).await;
+}
+
+/// 从 `/api/auth/me` 的回包里取当前用户 id
+fn body_id(me: &Value) -> uuid::Uuid {
+    me["data"]["id"]
+        .as_str()
+        .expect("me 回包缺少 id")
+        .parse()
+        .expect("id 不是 UUID")
+}
+
+/// 受限令牌不得上传头像
+///
+/// 待改密的会话还没确认凭据。放行上传等于让一个被劫持的受限令牌
+/// 先把图换成钓鱼二维码，再等受害者登录。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_restricted_token_cannot_upload_an_avatar() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let username = unique("avrestrict");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    // 未改密的令牌就是受限令牌（管理员建号置位 must_change_password）
+    let restricted = login_token(&app, &username, "Str0ng!Pass").await;
+    let (status, body) = send(
+        &app,
+        multipart_request(&restricted, "file", "x.png", "image/png", &tiny_png()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "受限令牌必须被拒: {body}");
+
+    delete_user(&app, &admin_tok, id).await;
+}
+
+// ============================================================
+// v0.20.0 B3：CSV 批量导入
+// ============================================================
+
+/// 导入一个 CSV 文本
+async fn import_csv(app: &Router, token: &str, csv: &str, dry_run: bool) -> (StatusCode, Value) {
+    send(
+        app,
+        request(
+            "POST",
+            "/api/admin/users/import",
+            Some(token),
+            Some(json!({ "csv": csv, "dry_run": dry_run })),
+        ),
+    )
+    .await
+}
+
+/// 导入必须真的建出账号，且这些账号能登录
+///
+/// "200 了"不等于"建成了"——所以这里走到最后一步：用导入出来的口令登录。
+/// 只断言响应里的 `created` 数字，测的是后端自己的计数，不是用户能不能用。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn imported_accounts_really_exist_and_can_log_in() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let tag = unique("imp");
+    let csv = format!(
+        "username,email,password,roles,display_name\n\
+         {tag}_a,{tag}_a@example.com,Str0ng!Pass,user,张三\n\
+         {tag}_b,{tag}_b@example.com,Str0ng!Pass,user|admin,李四\n"
+    );
+
+    let (status, body) = import_csv(&app, &admin_tok, &csv, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["total"], 2, "{body}");
+    assert_eq!(body["data"]["created"], 2, "{body}");
+    assert_eq!(body["data"]["failed"], 0, "{body}");
+
+    // 真能登录：管理员建号会置 must_change_password，
+    // 登录仍会成功（只是受限令牌），这已足够证明账号与口令都落库了
+    let (status, _) = login(&app, &format!("{tag}_a"), "Str0ng!Pass").await;
+    assert_eq!(status, StatusCode::OK, "导入的账号必须能用导入的口令登录");
+
+    // 展示名与角色都写进去了
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users?page=1&page_size=200&keyword={tag}_a"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["display_name"], "张三", "展示名必须落库: {body}");
+    assert_eq!(
+        items[0]["avatar_url"],
+        Value::Null,
+        "未传头像列时必须为 null"
+    );
+
+    let (_, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/users?page=1&page_size=200&keyword={tag}_b"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    let roles = body["data"]["items"].as_array().unwrap()[0]["roles"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        roles.iter().any(|r| r == "admin"),
+        "多角色必须全部写入: {roles:?}"
+    );
+
+    for name in [format!("{tag}_a"), format!("{tag}_b")] {
+        let id = user_id_by_name(&name).await;
+        if let Some(id) = id {
+            delete_user(&app, &admin_tok, id).await;
+        }
+    }
+}
+
+/// 试运行不得落库
+///
+/// 导入最大的坑是"建了一百个号才发现全部要返工"。试运行是唯一的补救手段，
+/// 若它偷偷落了库，管理员就没有任何安全的预览方式了。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_dry_run_import_creates_nothing() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let tag = unique("impdry");
+    let csv =
+        format!("username,email,password,roles\n{tag}_x,{tag}_x@example.com,Str0ng!Pass,user\n");
+
+    let (status, body) = import_csv(&app, &admin_tok, &csv, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["dry_run"], true, "{body}");
+    assert_eq!(
+        body["data"]["created"], 1,
+        "试运行仍要报告会有几行成功: {body}"
+    );
+    assert!(
+        user_id_by_name(&format!("{tag}_x")).await.is_none(),
+        "试运行绝不能建号"
+    );
+}
+
+/// 一行错不能拖垮整批，且必须指出错在哪一行
+///
+/// 管理员拿到的下一步动作是"改第 47 行再导一次"，
+/// 只回一句"3 行失败"等于让他自己数行号。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_bad_row_does_not_abort_the_batch_and_is_reported_by_line() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let tag = unique("impbad");
+    let csv = format!(
+        "username,email,password,roles\n\
+         {tag}_ok1,{tag}_ok1@example.com,Str0ng!Pass,user\n\
+         !!!,{tag}_bad1@example.com,Str0ng!Pass,user\n\
+         {tag}_weak,{tag}_weak@example.com,weak,user\n\
+         {tag}_norole,{tag}_norole@example.com,Str0ng!Pass,\n\
+         {tag}_norole2,{tag}_norole2@example.com,Str0ng!Pass,\n\
+         {tag}_ok2,{tag}_ok2@example.com,Str0ng!Pass,user\n"
+    );
+
+    let (status, body) = import_csv(&app, &admin_tok, &csv, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let d = &body["data"];
+    assert_eq!(d["total"], 6, "{body}");
+    assert_eq!(d["created"], 2, "两条合法行必须建成: {body}");
+    assert_eq!(d["failed"], 4, "{body}");
+
+    let failures = d["failures"].as_array().unwrap();
+    // 行号必须含表头偏移：第 2 行数据在文件里是第 3 行
+    let lines: Vec<i64> = failures
+        .iter()
+        .map(|f| f["line"].as_i64().unwrap())
+        .collect();
+    assert_eq!(lines, vec![3, 4, 5, 6], "必须逐行指名出错位置: {body}");
+    for f in failures {
+        assert!(
+            !f["reason"].as_str().unwrap_or("").is_empty(),
+            "每一行失败都必须有可行动的原因: {f}"
+        );
+    }
+
+    for name in [format!("{tag}_ok1"), format!("{tag}_ok2")] {
+        if let Some(id) = user_id_by_name(&name).await {
+            delete_user(&app, &admin_tok, id).await;
+        }
+    }
+}
+
+/// 重复导入同一份表不应报"数据库炸了"
+///
+/// 唯一约束兜底的话，管理员拿到的是
+/// `duplicate key violates unique constraint "users_username_key"`，
+/// 不知道该改用户名还是邮箱。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn importing_the_same_rows_twice_reports_a_readable_conflict() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let tag = unique("impdup");
+    let csv =
+        format!("username,email,password,roles\n{tag}_d,{tag}_d@example.com,Str0ng!Pass,user\n");
+
+    let (status, body) = import_csv(&app, &admin_tok, &csv, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["created"], 1, "{body}");
+
+    let (status, body) = import_csv(&app, &admin_tok, &csv, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["created"], 0, "重复行不得再建一次: {body}");
+    assert_eq!(body["data"]["failed"], 1, "{body}");
+    let reason = body["data"]["failures"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("用户名已被占用"),
+        "冲突原因必须是人能读懂的: {reason}"
+    );
+
+    if let Some(id) = user_id_by_name(&format!("{tag}_d")).await {
+        delete_user(&app, &admin_tok, id).await;
+    }
+}
+
+/// 导入必须走与单个建号相同的授权下界
+///
+/// 否则一个只有 `system:user:create` 的账号能通过 CSV 批量造出管理员，
+/// 绕过 v0.5.0 起"能授予的 ⊆ 自己已持有的"这条规则。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_import_cannot_grant_a_role_the_caller_does_not_hold() {
+    use axum_api::model::permission;
+
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (op_tok, op_role_id, op_uid) = operator_with_codes(
+        &app,
+        &admin_tok,
+        "imp_op",
+        &[permission::USER_LIST, permission::USER_CREATE],
+    )
+    .await;
+
+    let tag = unique("impperm");
+    let csv =
+        format!("username,email,password,roles\n{tag}_x,{tag}_x@example.com,Str0ng!Pass,admin\n");
+    let (status, body) = import_csv(&app, &op_tok, &csv, true).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "越权授权必须整批拒绝，而不是逐行跳过: {body}"
+    );
+    assert!(
+        user_id_by_name(&format!("{tag}_x")).await.is_none(),
+        "被拒的导入绝不能留下账号"
+    );
+
+    cleanup_operator(&app, &admin_tok, op_uid, op_role_id).await;
+}
+
+/// 表头缺列必须指名缺哪一列
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_import_whose_header_is_missing_a_column_names_it() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+
+    let (status, body) = import_csv(
+        &app,
+        &admin_tok,
+        "username,email\nalice,a@example.com\n",
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let msg = body["message"].as_str().unwrap_or("");
+    assert!(msg.contains("password"), "必须指名缺 password 列: {msg}");
+    assert!(msg.contains("roles"), "必须指名缺 roles 列: {msg}");
+}
+
+/// 口令一个字都不许进审计表
+///
+/// 批量导入把口令从"管理员在表单里敲一次"变成"几百条明文躺在一个文件里"，
+/// 落进长期表就是一次成规模的泄露。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_import_never_writes_a_password_into_the_audit_log() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let tag = unique("impaudit");
+    let password = "Zx9!UniqueAudit";
+    let csv =
+        format!("username,email,password,roles\n{tag}_s,{tag}_s@example.com,{password},user\n");
+
+    let (status, body) = import_csv(&app, &admin_tok, &csv, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // 审计是异步写的，轮询等它落库
+    wait_for_audit_result("POST", "/api/admin/users/import", &format!("{tag}_s")).await;
+    let leaked = audit_rows_containing(password).await;
+    assert_eq!(
+        leaked, 0,
+        "口令 {password} 出现在了审计表里（params 与 result 都要查）"
+    );
+
+    if let Some(id) = user_id_by_name(&format!("{tag}_s")).await {
+        delete_user(&app, &admin_tok, id).await;
+    }
+}
+
+/// 按用户名查 id，找不到返回 None
+async fn user_id_by_name(username: &str) -> Option<uuid::Uuid> {
+    sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
+        .bind(username)
+        .fetch_optional(&pool().await)
+        .await
+        .expect("查询用户失败")
 }

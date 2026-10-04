@@ -26,6 +26,26 @@ pub struct RateLimitResult {
     pub remaining: u64,
 }
 
+/// 会话元信息
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionRecord {
+    /// 令牌唯一标识（吊销单个会话时用它）
+    ///
+    /// 必须存进记录里：不存的话，"列出该用户全部会话"的接口就只给出一堆
+    /// 无法区分的条目——管理员看得到有几台设备，却没法踢掉其中一台。
+    pub jti: String,
+    /// 用户 ID
+    pub user_id: uuid::Uuid,
+    /// 用户名（展示用，不作鉴权依据——鉴权只看令牌本身）
+    pub username: String,
+    /// 客户端 IP
+    pub client_ip: String,
+    /// 登录时刻（Unix 毫秒）
+    pub login_at_ms: i64,
+    /// 令牌到期时刻（Unix 毫秒）
+    pub expires_at_ms: i64,
+}
+
 /// 通用 Redis 客户端封装
 // ConnectionManager 未实现 Debug，手动实现
 #[derive(Clone)]
@@ -193,6 +213,135 @@ impl RedisClient {
                 })?;
         }
         Ok(count)
+    }
+
+    // ──────────────────────────────────────────────
+    // 会话登记（谁在线 / 单会话吊销）
+    // ──────────────────────────────────────────────
+
+    /// 会话键前缀
+    ///
+    /// 键形如 `sess:{user_id}:{jti}`——**把 user_id 放进键里**，
+    /// 于是"列出某人的全部会话"是一次 `SCAN sess:{user_id}:*`，
+    /// 不需要额外维护一份索引集合，也就没有"索引与实际不一致"这种状态。
+    ///
+    /// 若只用 `sess:{jti}`，列举就得全库 SCAN 再逐条比对 user_id：
+    /// 键空间里每个活跃令牌一条记录，那等于把 O(全部会话) 的扫描
+    /// 放在管理员随手可点的按钮上。
+    const SESSION_PREFIX: &'static str = "sess:";
+
+    /// 登记一个会话
+    ///
+    /// TTL **必须**等于令牌剩余寿命，这样 Redis 会在令牌失效时自动清掉这条记录。
+    /// 少了这个约束，从未登出、永不过期的令牌记录会让键空间单调增长——
+    /// 而"谁在线"这个列表没有任何东西会替我们做清理。
+    pub async fn register_session(&self, record: &SessionRecord, ttl_seconds: u64) -> Result<()> {
+        let key = Self::session_key(record.user_id, &record.jti);
+        let payload = serde_json::to_string(record).map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("会话序列化失败: {e}"))
+        })?;
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .set_ex(key, payload, ttl_seconds.max(1))
+            .await
+            .map_err(|e| {
+                crate::error::AppError::InternalServerError(format!("Redis 写入会话失败: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// 列出某用户的全部会话（按登录时间倒序）
+    pub async fn list_sessions(&self, user_id: uuid::Uuid) -> Result<Vec<SessionRecord>> {
+        let mut conn = self.conn.clone();
+        let pattern = format!("{}{}:*", Self::SESSION_PREFIX, user_id);
+        let mut cursor: u64 = 0;
+        let mut out: Vec<SessionRecord> = Vec::new();
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(200)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| {
+                    crate::error::AppError::InternalServerError(format!("Redis SCAN 失败: {e}"))
+                })?;
+            cursor = next;
+            if !keys.is_empty() {
+                let vals: Vec<String> = redis::cmd("MGET")
+                    .arg(&keys)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| {
+                        crate::error::AppError::InternalServerError(format!("Redis 读取失败: {e}"))
+                    })?;
+                // MGET 在键已过期时返回空串而非 nil 变体，这里统一交给
+                // 下面的解析失败分支跳过——一条脏记录不该让整个列表查不出来。
+                for v in vals {
+                    // 单条解析失败就跳过而不是整体报错：一条脏数据不该
+                    // 让管理员连"这个人在哪些设备登录"都看不到。
+                    match serde_json::from_str::<SessionRecord>(&v) {
+                        Ok(r) => out.push(r),
+                        Err(e) => tracing::warn!("会话记录解析失败，已跳过: {e}"),
+                    }
+                }
+            }
+            if cursor == 0 {
+                break;
+            }
+        }
+        out.sort_by(|a, b| b.login_at_ms.cmp(&a.login_at_ms));
+        Ok(out)
+    }
+
+    /// 查询单个会话；不存在返回 `None`
+    ///
+    /// 查不到有两种原因：令牌已过期（键已自动清理），或已被登出/吊销。
+    /// 调用方据此拒绝吊销一个不存在的会话，而不是回"成功"——
+    /// 那会让界面显示已下线，而令牌其实还在有效期内（键可能因故丢失）。
+    pub async fn get_session(
+        &self,
+        user_id: uuid::Uuid,
+        jti: &str,
+    ) -> Result<Option<SessionRecord>> {
+        let mut conn = self.conn.clone();
+        let key = Self::session_key(user_id, jti);
+        let val: Option<String> = conn.get(&key).await.map_err(|e| {
+            crate::error::AppError::InternalServerError(format!("Redis 读取会话失败: {e}"))
+        })?;
+        match val {
+            None => Ok(None),
+            // 这里与 `list_sessions` 不同：**不能**跳过解析失败。
+            // 列举场景下少一条可以接受（列表本来就只是参考），
+            // 但"查某会话是否存在"是要据此决定放不放行的，
+            // 解析失败必须当"查不到"处理并让调用方拒绝——绝不能悄悄当成有效。
+            Some(s) => match serde_json::from_str::<SessionRecord>(&s) {
+                Ok(r) => Ok(Some(r)),
+                Err(e) => {
+                    tracing::warn!("会话记录解析失败，按不存在处理: {e}");
+                    Ok(None)
+                }
+            },
+        }
+    }
+
+    /// 删除一条会话登记（登出 / 吊销时调用）
+    pub async fn remove_session(&self, user_id: uuid::Uuid, jti: &str) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let _: usize = conn
+            .del(Self::session_key(user_id, jti))
+            .await
+            .map_err(|e| {
+                crate::error::AppError::InternalServerError(format!("Redis 删除会话失败: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// 会话键
+    fn session_key(user_id: uuid::Uuid, jti: &str) -> String {
+        format!("{}{}:{}", Self::SESSION_PREFIX, user_id, jti)
     }
 
     /// 登录成功后清除失败计数

@@ -12,14 +12,15 @@ use std::collections::HashMap;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::audit_log::AuditDetail;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::permission::{
-    ensure_can_grant_roles, PermUserCreate, PermUserDelete, PermUserList, PermUserUpdate,
+    ensure_can_grant_roles, PermSessionManage, PermUserCreate, PermUserDelete, PermUserList,
+    PermUserUnlock, PermUserUpdate,
 };
 use crate::model::{normalize_role_name, ApiResponse, UserInfo, ADMIN_ROLE};
 use crate::router::AppState;
@@ -43,6 +44,14 @@ pub struct UserListParams {
     pub page_size: Option<i64>,
     /// 关键字，同时匹配用户名与邮箱；空串等同不过滤
     pub keyword: Option<String>,
+    /// 激活状态筛选：`true` 只看启用，`false` 只看禁用，不传则不限
+    ///
+    /// 用 `Option<bool>` 而不是裸 `bool`：裸 bool 无法表达"不限"，
+    /// 而默认成"只看启用"会让用户列表凭空少掉所有禁用账号——
+    /// 管理员恰恰最需要看见被自己禁掉的那些。
+    pub is_active: Option<bool>,
+    /// 角色名筛选：只看拥有该角色的用户；空串等同不过滤
+    pub role: Option<String>,
 }
 
 /// 创建/更新用户请求
@@ -189,6 +198,8 @@ fn same_role_set(a: &[String], b: &[String]) -> bool {
         ("page" = Option<i64>, Query, description = "页码（从 1 开始）"),
         ("page_size" = Option<i64>, Query, description = "每页条数（1-200）"),
         ("keyword" = Option<String>, Query, description = "关键字，同时匹配用户名与邮箱"),
+        ("is_active" = Option<bool>, Query, description = "按启用状态筛选，不传则不限"),
+        ("role" = Option<String>, Query, description = "按角色名筛选，只看拥有该角色的用户"),
     ),
     responses((status = 200, description = "用户列表（含角色）", body = ApiResponse<UserListResponse>))
 )]
@@ -203,10 +214,17 @@ pub async fn list_users(
     let page_size = params.page_size.unwrap_or(10);
     validation::validate_page(page, page_size)?;
 
+    // 三个维度一起交给仓储的筛选结构体，由它统一拼 WHERE 并保证
+    // 列表与 COUNT 用同一组条件（漏改一处就是分页错乱，见仓储注释）。
+    let filter = crate::repository::user::UserListFilter {
+        keyword: params.keyword.as_deref(),
+        is_active: params.is_active,
+        role_name: params.role.as_deref(),
+    };
     let (users, total) = state
         .auth_service
         .user_repo
-        .list_filtered(page, page_size, params.keyword.as_deref())
+        .list_filtered(page, page_size, &filter)
         .await?;
 
     let ids: Vec<Uuid> = users.iter().map(|u| u.id).collect();
@@ -566,6 +584,141 @@ pub struct BatchDeleteRequest {
     pub ids: Vec<Uuid>,
 }
 
+/// POST /api/admin/users/{id}/unlock — 解锁被临时锁定的账号
+///
+/// 补上 `clear_login_failures` 一直缺的那个调用入口：v0.19.0 之前它
+/// **唯一**的调用点在登录成功分支，于是用户被锁只能干等
+/// `LOGIN_FAILURE_WINDOW`（默认 300 秒）自然过期，管理员无手动手段。
+///
+/// 用 POST 而非 PUT：这是一个**动作**，不是把某个字段改成某个值。
+/// 重复调用两次与调用一次结果相同，但把它归到 REST 的字段更新里
+/// 会诱导前端做"乐观回填"——显示已解锁，而计数其实还在。
+#[utoipa::path(
+    post,
+    path = "/api/admin/users/{id}/unlock",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "用户 ID")),
+    responses(
+        (status = 200, description = "已解除锁定（cleared_failures 为 0 表示本来就没有锁定）", body = ApiResponse<crate::service::auth::UnlockedAccount>),
+        (status = 404, description = "用户不存在"),
+    )
+)]
+pub async fn unlock_user(
+    State(state): State<AppState>,
+    _perm: PermUserUnlock,
+    ApiPath(id): ApiPath<Uuid>,
+    audit: AuditDetail,
+) -> Result<Json<ApiResponse<crate::service::auth::UnlockedAccount>>, AppError> {
+    let user = state.auth_service.user_repo.find_by_id(id).await?;
+
+    let result = state
+        .auth_service
+        .unlock_user(&state.redis_client, &user)
+        .await?;
+
+    // 记录**清掉了多少次**，而不只是"调用了解锁"。
+    // 解锁是一次"我确认这个人是本人"的判断，低频但高价值，
+    // 事后要能回答"当时到底解了几个桶"。
+    audit.push(format!(
+        "解锁账号 \"{}\"：清除登录失败计数 {} 次（涉及 {} 个计数桶：用户名 / 邮箱）",
+        result.username, result.cleared_failures, result.scopes_cleared
+    ));
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+/// GET /api/admin/users/{id}/sessions — 列出该用户的在线会话
+///
+/// 补上 v0.19.0 之前完全没有的能力：登录成功时**不写任何会话记录**，
+/// jti 只在登出时进黑名单，所以"这个人现在在哪些设备上"根本无从回答。
+/// 而这正是判断账号是否被盗用的第一手依据。
+#[utoipa::path(
+    get,
+    path = "/api/admin/users/{id}/sessions",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    params(("id" = Uuid, Path, description = "用户 ID")),
+    responses(
+        (status = 200, description = "在线会话列表（按登录时间倒序）；用户不存在或当前无在线会话时返回空数组", body = ApiResponse<Vec<crate::service::auth::SessionView>>),
+    )
+)]
+pub async fn list_user_sessions(
+    State(state): State<AppState>,
+    _perm: PermSessionManage,
+    ApiPath(id): ApiPath<Uuid>,
+    auth_user: AuthenticatedUser,
+) -> Result<Json<ApiResponse<Vec<crate::service::auth::SessionView>>>, AppError> {
+    // **刻意不查用户是否存在**，与 `GET /api/admin/users/{id}/roles` 保持一致：
+    // 那里对不存在的用户返回 200 + 空数组，这里若回 404，同一个 `{id}` 在
+    // 两个"查这个人的附属信息"的端点上就给出两种相反的答案。
+    //
+    // 代价要认：一个写错或已删除的 id 与"这个人确实没在线"确实长得一样。
+    // 换来的是这个端点遵守仓库对读端点的统一约定（不存在即空列表），
+    // `every_documented_endpoint_is_reachable_without_a_server_error`
+    // 会拿一个**不存在**的 UUID 探针，读端点回 4xx 一律算缺陷。
+    //
+    // 真的需要区分时，调用方手上已经有用户列表（`GET /api/admin/users` 可按
+    // keyword 精确查到），不必靠这个端点去反推 id 是否有效。
+    let sessions = state
+        .auth_service
+        .list_sessions(&state.redis_client, id, &auth_user.token_jti)
+        .await?;
+
+    Ok(Json(ApiResponse::success(sessions)))
+}
+
+/// POST /api/admin/users/{id}/sessions/{jti}/revoke — 吊销单个会话
+#[utoipa::path(
+    post,
+    path = "/api/admin/users/{id}/sessions/{jti}/revoke",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = Uuid, Path, description = "用户 ID"),
+        ("jti" = String, Path, description = "令牌唯一标识（UUID），取自会话列表"),
+    ),
+    responses(
+        (status = 200, description = "该会话已失效", body = ApiResponse<crate::service::auth::RevokedSession>),
+        (status = 404, description = "用户或会话不存在"),
+        (status = 400, description = "jti 不是合法的 UUID"),
+    )
+)]
+pub async fn revoke_user_session(
+    State(state): State<AppState>,
+    perm: PermSessionManage,
+    ApiPath((id, jti)): ApiPath<(Uuid, String)>,
+    audit: AuditDetail,
+) -> Result<Json<ApiResponse<crate::service::auth::RevokedSession>>, AppError> {
+    // jti 会直接拼进 Redis 键（`sess:{user_id}:{jti}`），所以必须先校验形状。
+    // 不校验的话，路径里的 `*` 或空格能进键名；而列举用的是
+    // `SCAN sess:{user_id}:*` 这个 glob 模式——一次键名污染就能让
+    // 列表凭空多出别人的会话，或者一个都列不出来。
+    //
+    // 顺手也防住了路径穿越式的键构造。
+    let jti = uuid::Uuid::parse_str(&jti)
+        .map_err(|_| AppError::BadRequest("会话标识 jti 必须是合法的 UUID".into()))?;
+    let jti = jti.to_string();
+
+    let user = state.auth_service.user_repo.find_by_id(id).await?;
+
+    let result = state
+        .auth_service
+        .revoke_session(&state.redis_client, id, &jti)
+        .await?;
+
+    audit.push(format!(
+        "吊销账号 \"{}\" 的单个会话（{}，登录 IP {}），剩余会话 {} 个",
+        user.username,
+        jti.chars().take(8).collect::<String>() + "…",
+        "见在线会话列表",
+        result.remaining_sessions
+    ));
+
+    let _ = perm;
+    Ok(Json(ApiResponse::success(result)))
+}
+
 /// PUT /api/admin/users/:id/status — 切换状态
 #[utoipa::path(
     put,
@@ -714,4 +867,297 @@ pub async fn reset_user_password(
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ResetPasswordRequest {
     pub password: String,
+}
+
+// ──────────────────────────────────────────────
+// v0.20.0 B3：CSV 批量导入用户
+// ──────────────────────────────────────────────
+
+/// 导入请求体
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct ImportUsersRequest {
+    /// CSV 文本内容。**刻意用文本而不是 multipart 上传**：
+    /// 这批数据通常来自另一个系统的导出接口，直接把响应体转发过来
+    /// 比"下载到本地再选文件"少一步，也少一个失败点。
+    /// 表头必需列：`username,email,password,roles`；可选列：`display_name`。
+    /// `roles` 单元格内用 `|` 分隔多个角色（如 `user|admin`）。
+    pub csv: String,
+    /// 只校验不落库
+    ///
+    /// 导入的真实风险不是"建错号"，而是"建了一百个号发现全部要返工"。
+    /// 试运行让管理员在写入前看到逐行的成败与原因。
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// 导入中某一行的失败原因
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ImportRowFailure {
+    /// CSV 行号（含表头，从 1 开始），让人能直接定位到那一行
+    pub line: usize,
+    /// 出问题的用户名；解析失败导致连用户名都取不到时为空串
+    pub username: String,
+    pub reason: String,
+}
+
+/// 导入结果
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ImportUsersResponse {
+    /// 解析出的总行数
+    pub total: usize,
+    pub created: usize,
+    pub failed: usize,
+    /// 逐行失败原因；成功时为空数组
+    ///
+    /// **必须回逐行原因而不是只回一个总数**：
+    /// 管理员的下一动作是"改第 47 行再导一次"，
+    /// 只告诉他"3 行失败"等于让他自己数行号。
+    pub failures: Vec<ImportRowFailure>,
+    /// 实际建成的用户名
+    pub created_usernames: Vec<String>,
+    /// 是否为试运行（未落库）
+    pub dry_run: bool,
+}
+
+/// POST /api/admin/users/import — 从 CSV 批量导入用户
+///
+/// 补上 v0.20.0 之前 `GET /api/admin/export/users` 的**反向**能力：
+/// 那时只有导出没有导入，管理员要给一批同事开号只能一个一个填表单。
+///
+/// ── 逐行成败而不是整批成败 ──
+///
+/// 一份 200 行的表里错了一行就整批回滚，管理员既不知道错在哪，
+/// 也没法只补那一个用户。因此失败行被跳过并逐条回报，
+/// 成功行照常入库。**这也意味着响应 200 不代表全部成功**——
+/// 看 `failed` 与 `failures`。
+#[utoipa::path(
+    post,
+    path = "/api/admin/users/import",
+    tag = "用户管理",
+    security(("bearer_auth" = [])),
+    request_body = ImportUsersRequest,
+    responses(
+        (status = 200, description = "已逐行处理；看 failed 与 failures 判断成败", body = ApiResponse<ImportUsersResponse>),
+        (status = 400, description = "CSV 本身无法解析（缺列、只有表头、超过单批上限）"),
+        (status = 403, description = "试图授予自己没有的权限码"),
+    )
+)]
+pub async fn import_users(
+    State(state): State<AppState>,
+    perm: PermUserCreate,
+    audit: AuditDetail,
+    ApiJson(req): ApiJson<ImportUsersRequest>,
+) -> Result<Json<ApiResponse<ImportUsersResponse>>, AppError> {
+    use crate::utils::password::hash_password;
+    use crate::utils::user_import::parse_user_csv;
+
+    let rows = parse_user_csv(&req.csv)?;
+
+    // 授权下界（v0.5.0 PR-3）：整批先校验。放在循环之外是因为
+    // "能建号"不等于"能建管理员"——若逐行校验，第 3 行才撞上越权时，
+    // 前两行已经落库，于是管理员既拿到了部分写入，又没拿到明确的拒绝理由。
+    let mut all_roles: Vec<String> = Vec::new();
+    for row in &rows {
+        for name in &row.roles {
+            let name = normalize_role_name(name)?;
+            if !all_roles.contains(&name) {
+                all_roles.push(name);
+            }
+        }
+    }
+    ensure_can_grant_roles(
+        &state,
+        perm.guard(),
+        &all_roles,
+        &format!("批量导入用户并赋予角色 {}", all_roles.join("、")),
+    )
+    .await?;
+
+    let mut created = 0usize;
+    let mut created_usernames: Vec<String> = Vec::new();
+    let mut failures: Vec<ImportRowFailure> = Vec::new();
+
+    for row in rows {
+        let line = row.line;
+        let username_raw = row.username.clone();
+        let mut fail = |reason: String| {
+            failures.push(ImportRowFailure {
+                line,
+                username: username_raw.clone(),
+                reason,
+            })
+        };
+
+        // 归一与校验的规则**只从 validation 取**，与单个建号完全一致：
+        // 导入若自己写一套，第二年两套规则必然走偏
+        let username = match validation::normalize_username(&row.username) {
+            Ok(v) => v,
+            Err(e) => {
+                fail(e.to_string());
+                continue;
+            }
+        };
+        let email = match validation::normalize_email(&row.email) {
+            Ok(v) => v,
+            Err(e) => {
+                fail(e.to_string());
+                continue;
+            }
+        };
+        if let Err(e) = validation::validate_password(&row.password) {
+            fail(e.to_string());
+            continue;
+        }
+        // 展示名归一后可能变成 None（整格空白），那是"没设过"，不是错误
+        let display_name =
+            match validation::normalize_display_name(row.display_name.as_deref().unwrap_or("")) {
+                Ok(v) => v,
+                Err(e) => {
+                    fail(e.to_string());
+                    continue;
+                }
+            };
+        if row.roles.is_empty() {
+            fail("未指定角色：没有角色的用户登录后没有任何权限".to_string());
+            continue;
+        }
+
+        let roles = match resolve_roles(&state, &row.roles).await {
+            Ok(v) => v,
+            Err(e) => {
+                fail(e.to_string());
+                continue;
+            }
+        };
+
+        // 查重：与单个建号同样在写之前查。若靠数据库唯一约束兜底，
+        // 报错会是"duplicate key violates unique constraint \"users_username_key\""，
+        // 管理员无从知道该改用户名还是邮箱。
+        if state
+            .auth_service
+            .user_repo
+            .find_by_username(&username)
+            .await?
+            .is_some()
+        {
+            fail("用户名已被占用".to_string());
+            continue;
+        }
+        if state
+            .auth_service
+            .user_repo
+            .find_by_email(&email)
+            .await?
+            .is_some()
+        {
+            fail("邮箱已被占用".to_string());
+            continue;
+        }
+
+        if req.dry_run {
+            created += 1;
+            created_usernames.push(username);
+            continue;
+        }
+
+        let password_hash = match hash_password(&row.password) {
+            Ok(h) => h,
+            Err(e) => {
+                fail(format!("口令加密失败: {e}"));
+                continue;
+            }
+        };
+
+        let user = state
+            .auth_service
+            .user_repo
+            .create(
+                Uuid::new_v4(),
+                &username,
+                &email,
+                &password_hash,
+                // 与单个建号一致：口令由管理员代设，用户本人从未参与选择，
+                // 因此强制其首次登录后改掉（v0.11.0）
+                true,
+            )
+            .await;
+        let user = match user {
+            Ok(u) => u,
+            Err(e) => {
+                fail(e.to_string());
+                continue;
+            }
+        };
+
+        // 展示名只能在用户行落库后写：`user_repo::create` 不接受该参数，
+        // 而给它加一个可选参数会让单个建号路径也背上"传不传都得处理"的三态。
+        // 导入是可接受的窄场景，为它改动通用签名不划算。
+        if let Some(name) = display_name {
+            if let Err(e) = state
+                .auth_service
+                .update_profile(user.id, Some(Some(&name)), None)
+                .await
+            {
+                fail(format!(
+                    "用户已创建（{user_id}）但展示名写入失败: {e}",
+                    user_id = user.id
+                ));
+                continue;
+            }
+        }
+
+        if let Err(e) = state
+            .auth_service
+            .role_repo
+            .replace_user_roles(user.id, &roles)
+            .await
+        {
+            // 用户行已经落库却没角色，等于造出一个"登录了但什么都做不了"的账号，
+            // 而管理员在结果里只看到一行失败。必须说出来。
+            fail(format!(
+                "用户已创建（{user_id}）但角色写入失败，需人工处理: {e}",
+                user_id = user.id
+            ));
+            continue;
+        }
+
+        created += 1;
+        created_usernames.push(username);
+    }
+
+    // 审计记**建成了谁**，不记口令。批量场景下这串用户名是事后清理的依据，
+    // 而口令一旦进了这张长期表就是一次全库泄露
+    let summary = if created_usernames.is_empty() {
+        "无".to_string()
+    } else {
+        created_usernames.join("、")
+    };
+    audit.push(format!(
+        "批量导入用户：共 {} 行，成功 {}，失败 {}；{}{}",
+        created + failures.len(),
+        created,
+        failures.len(),
+        if req.dry_run {
+            "（试运行，未落库）"
+        } else {
+            ""
+        },
+        summary
+    ));
+    tracing::info!(
+        "批量导入用户: {} 行，成功 {}，失败 {}{}",
+        created + failures.len(),
+        created,
+        failures.len(),
+        if req.dry_run { "（试运行）" } else { "" }
+    );
+
+    Ok(Json(ApiResponse::success(ImportUsersResponse {
+        total: created + failures.len(),
+        created,
+        failed: failures.len(),
+        failures,
+        created_usernames,
+        dry_run: req.dry_run,
+    })))
 }

@@ -20,6 +20,21 @@ pub const USER_CREATE: &str = "system:user:create";
 pub const USER_UPDATE: &str = "system:user:update";
 /// 删除用户
 pub const USER_DELETE: &str = "system:user:delete";
+/// 解锁被登录爆破防护临时锁定的账号
+///
+/// v0.20.0 新增。**独立于 `USER_UPDATE`**，理由不是"粒度更细更好"，
+/// 而是这个动作本身该被单独收回：`USER_UPDATE` 是日常高频操作，
+/// 几乎一定会授给管理员；而解锁意味着"我确认这个人是本人"，
+/// 是个低频但高判断的动作，不该与"改个显示名"共用一个开关。
+pub const USER_UNLOCK: &str = "system:user:unlock";
+
+// ── 会话管理 ────────────────────────────────────────────────
+/// 查看在线会话与吊销指定会话
+///
+/// v0.20.0 新增。**独立于 `USER_UPDATE`**，理由同 `USER_UNLOCK`：
+/// "看某人在哪些设备登录"会暴露登录时间与 IP，属于侦察面，
+/// 不该与"改个显示名"共用一个开关——后者几乎必然要授给管理员。
+pub const SESSION_MANAGE: &str = "system:session:manage";
 
 // ── 角色管理 ────────────────────────────────────────────────
 /// 查看角色列表
@@ -118,6 +133,16 @@ pub const PERMISSION_DEFS: &[PermissionDef] = &[
     PermissionDef {
         code: USER_DELETE,
         name: "删除用户",
+        parent_path: "/system/user",
+    },
+    PermissionDef {
+        code: USER_UNLOCK,
+        name: "解锁账号",
+        parent_path: "/system/user",
+    },
+    PermissionDef {
+        code: SESSION_MANAGE,
+        name: "查看与吊销会话",
         parent_path: "/system/user",
     },
     // 角色管理

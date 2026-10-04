@@ -55,6 +55,13 @@ pub enum AppError {
     #[error("请求过于频繁: {0}")]
     TooManyRequests(String),
 
+    /// 上传体积超限
+    ///
+    /// 与 `BadRequest` 分开是因为客户端要据此改行为（重新选一个小一点的图），
+    /// 而 400 的文案它通常理解成"参数写错了"。
+    #[error("上传内容过大: {0}")]
+    PayloadTooLarge(String),
+
     /// 内部服务器错误（数据库异常等）
     #[error("服务器内部错误: {0}")]
     InternalServerError(String),
@@ -77,6 +84,7 @@ impl IntoResponse for AppError {
             AppError::InvalidCredentials(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
             AppError::ValidationFailed(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
+            AppError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, self.to_string()),
             AppError::InternalServerError(detail) => {
                 // 具体原因不回传客户端，但必须留在服务端日志里，否则 500 无法定位
                 tracing::error!("内部错误: {detail}");

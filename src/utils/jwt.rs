@@ -91,12 +91,42 @@ impl JwtUtil {
         expiration_seconds: u64,
         pwd_stale: bool,
     ) -> Result<String, jsonwebtoken::errors::Error> {
+        self.sign_with_jti(
+            user_id,
+            username,
+            role,
+            roles,
+            expiration_seconds,
+            pwd_stale,
+        )
+        .map(|(token, _)| token)
+    }
+
+    /// 签发令牌并**同时返回 jti**
+    ///
+    /// v0.20.0 新增。登录后要把这个会话登记进 Redis，而登记的键里必须有 jti。
+    /// 早先只能拿到令牌字符串——jti 被封在 JWT 载荷里，
+    /// 调用方若选择"自己解一次 payload 取 jti"，等于多一份解析路径，
+    /// 且解出来的值未经校验就进了 Redis 的键。
+    ///
+    /// 保留 [`Self::sign`] 作为薄封装，让既有调用点与测试不必改。
+    #[allow(clippy::type_complexity)]
+    pub fn sign_with_jti(
+        &self,
+        user_id: Uuid,
+        username: &str,
+        role: &str,
+        roles: &[String],
+        expiration_seconds: u64,
+        pwd_stale: bool,
+    ) -> Result<(String, String), jsonwebtoken::errors::Error> {
         let now = chrono::Utc::now().timestamp() as u64;
+        let jti = Uuid::new_v4().to_string();
         let claims = Claims {
             sub: user_id,
             role: role.to_string(),
             roles: roles.to_vec(),
-            jti: Uuid::new_v4().to_string(),
+            jti: jti.clone(),
             username: username.to_string(),
             iat: now,
             iat_ms: chrono::Utc::now().timestamp_millis() as u64,
@@ -104,11 +134,12 @@ impl JwtUtil {
             exp: now + expiration_seconds,
         };
 
-        encode(
+        let token = encode(
             &Header::default(),
             &claims,
             &EncodingKey::from_secret(self.secret.as_bytes()),
-        )
+        )?;
+        Ok((token, jti))
     }
 
     /// 验证 JWT 令牌并返回载荷

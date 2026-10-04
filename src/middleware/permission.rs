@@ -234,6 +234,8 @@ permission_guards! {
     PermUserCreate => permission::USER_CREATE,
     PermUserUpdate => permission::USER_UPDATE,
     PermUserDelete => permission::USER_DELETE,
+    PermUserUnlock => permission::USER_UNLOCK,
+    PermSessionManage => permission::SESSION_MANAGE,
     // 角色管理
     PermRoleList => permission::ROLE_LIST,
     PermRoleCreate => permission::ROLE_CREATE,

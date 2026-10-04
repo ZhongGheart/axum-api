@@ -37,6 +37,12 @@ use crate::router::AppState;
 /// 查询串入库前的最大长度
 const MAX_QUERY_LEN: usize = 500;
 
+/// `action` 入库前的最大长度
+///
+/// 与迁移 015 里的列宽一致。两边必须同步：列窄于此则超长路径的审计
+/// 会被 Postgres 拒掉（且不报错），列宽于此则这里的截断是多余的安全网。
+const MAX_ACTION_LEN: usize = 512;
+
 /// 摘要入库前的最大长度
 ///
 /// `result` 是无长度限制的 `TEXT`，而摘要可能包含几十个权限码。
@@ -162,7 +168,11 @@ pub async fn audit_log_middleware(
             Some(u) => (Some(u.user_id), Some(u.username)),
             None => (None, None),
         };
-        let action = format!("{method} {path}");
+        // action 的列宽是 VARCHAR(512)（迁移 015）。这里**仍然截断**，
+        // 因为写库失败只留一行 warn —— 而"某条路径的审计整条消失"
+        // 是个不报错的失败：请求照常 200，事后却答不出"谁干过这件事"。
+        // 截断至少留下一条可检索的记录。
+        let action = truncate(&format!("{method} {path}"), MAX_ACTION_LEN);
 
         let result = sqlx::query(
             r#"

@@ -20,7 +20,94 @@ use sqlx::PgPool;
 /// 守卫见 `tests/api_integration.rs` 的
 /// `every_documented_endpoint_is_called_by_a_test`：新增 SELECT 手写列名会红。
 pub const USER_COLUMNS: &str =
-    "id, username, email, password_hash, is_active, must_change_password, created_at, updated_at";
+    "id, username, email, password_hash, is_active, must_change_password, display_name, avatar_url, created_at, updated_at";
+
+/// 用户列表的筛选条件
+///
+/// 用一个结构体承载，而不是给 `list_filtered` 堆四个位置参数：
+/// 后者每加一个维度就要改所有调用点，且极易把 `keyword` 和 `role_name` 传反位置
+/// （两者都是 `&str` 形状，编译器抓不到）。
+#[derive(Debug, Default, Clone)]
+pub struct UserListFilter<'a> {
+    /// 关键字，同时匹配用户名与邮箱
+    pub keyword: Option<&'a str>,
+    /// 激活状态；`None` 表示不限
+    pub is_active: Option<bool>,
+    /// 角色名（要求用户拥有该角色）；`None` 表示不限
+    pub role_name: Option<&'a str>,
+}
+
+impl<'a> UserListFilter<'a> {
+    /// 构造"不过滤"的空条件
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// 构造关键字筛选
+    pub fn keyword(keyword: &'a str) -> Self {
+        Self {
+            keyword: Some(keyword),
+            ..Default::default()
+        }
+    }
+
+    /// 构造指定角色的筛选
+    pub fn with_role(role_name: &'a str) -> Self {
+        Self {
+            role_name: Some(role_name),
+            ..Default::default()
+        }
+    }
+
+    /// 构造激活状态的筛选
+    pub fn with_active(is_active: bool) -> Self {
+        Self {
+            is_active: Some(is_active),
+            ..Default::default()
+        }
+    }
+
+    /// 拼出 WHERE 片段与对应的绑定值
+    ///
+    /// 返回 `(条件片段, 参数)`，两者顺序严格对应：第 n 个 `$n`
+    /// （WHERE 内的编号从 1 起）绑定 `params[n-1]`。
+    pub fn build_where(&self) -> (Vec<String>, Vec<String>) {
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<String> = Vec::new();
+
+        // 空字符串/纯空白视为"不过滤"：搜索框清空后前端会发空串，
+        // 若当成关键字就会筛出零条，看起来像"搜不到人"
+        if let Some(k) = self.keyword.map(str::trim).filter(|k| !k.is_empty()) {
+            params.push(format!(
+                "%{}%",
+                crate::utils::validation::escape_like_pattern(k)
+            ));
+            let idx = params.len();
+            conditions.push(format!(
+                r#"(username ILIKE ${idx} ESCAPE '\' OR email ILIKE ${idx} ESCAPE '\')"#
+            ));
+        }
+
+        if let Some(active) = self.is_active {
+            params.push(active.to_string());
+            conditions.push(format!("is_active = ${}::boolean", params.len()));
+        }
+
+        if let Some(role) = self.role_name.map(str::trim).filter(|r| !r.is_empty()) {
+            params.push(role.to_string());
+            conditions.push(format!(
+                r#"EXISTS (
+                       SELECT 1 FROM user_roles ur
+                       JOIN roles r ON r.id = ur.role_id
+                       WHERE ur.user_id = users.id AND r.name = ${}
+                   )"#,
+                params.len()
+            ));
+        }
+
+        (conditions, params)
+    }
+}
 
 /// 把 `users` 上的唯一约束冲突翻译成 409，否则一律当内部错误
 ///
@@ -144,82 +231,81 @@ impl UserRepository {
         .map_err(|e| AppError::InternalServerError(format!("查询用户失败: {e}")))
     }
 
-    /// 查询所有用户（分页）
-    /// 用户列表（可按关键字过滤）
+    /// 分页查询用户列表（可组合筛选）
     ///
-    /// `keyword` 为 `None` 时行为与原先的 `list_all` 完全一致——不拼任何
-    /// `WHERE` 片段，而不是拼一个恒真的条件：后者会让"有没有过滤"这件事
-    /// 从 SQL 文本上就看不出来，读代码的人得反推。
+    /// **筛选维度**：关键字（同时匹配用户名与邮箱）、激活状态、指定角色。
     ///
     /// 关键字同时匹配 `username` 与 `email`。**匹配前必须转义**（见
     /// [`crate::utils::validation::escape_like_pattern`]），否则搜 `100%`
     /// 会因 `%` 是通配符而返回全表——一个"筛选"比不筛选还糟。
+    ///
+    /// ── 为什么改成动态拼 WHERE 而不是 `match` 穷举分支 ──
+    /// 原实现按 `keyword` 有无分两条完整 SQL。加两个筛选维度后要 8 个分支，
+    /// 而每条分支里的 WHERE 与 COUNT 必须**逐字一致**，否则就是
+    /// "列表 3 条但 total 500"的分页错乱。分支越多，漏改一处越容易，
+    /// 而且编译器不会提醒。
+    ///
+    /// 现在条件与参数都按**同一个顺序**推进，列表与计数复用同一段拼接逻辑，
+    /// 结构上就不可能对不上。
+    ///
+    /// ── `role_name` 用 EXISTS 子查询而不是 JOIN ──
+    /// 一个用户可能同时命中多条角色行（多对多），JOIN 会让同一用户重复出现
+    /// 并把 total 算大。`EXISTS` 只问"有没有"，天然不放大行数。
+    ///
+    /// `role_name` 与 `is_active` 一起给时是 **AND**：两个条件都要满足。
+    /// 这不是实现偷懒——"既是 HR 又是禁用的"是一个明确的问法，
+    /// 若改成 OR（满足其一即命中）会返回一批用户没预期的账号。
     pub async fn list_filtered(
         &self,
         page: i64,
         page_size: i64,
-        keyword: Option<&str>,
+        filter: &UserListFilter<'_>,
     ) -> Result<(Vec<User>, i64), AppError> {
         let offset = (page - 1) * page_size;
-        // 空字符串/纯空白视为"不过滤"：搜索框清空后前端会发空串，
-        // 若当成关键字就会筛出零条，看起来像"搜不到人"
-        let keyword = keyword.map(str::trim).filter(|k| !k.is_empty());
+        let (where_sql, params) = filter.build_where();
 
-        let users = match keyword {
-            None => {
-                sqlx::query_as::<_, User>(&format!(
-                    r#"
-                    SELECT {USER_COLUMNS}
-                    FROM users
-                    ORDER BY created_at DESC
-                    LIMIT $1 OFFSET $2
-                    "#
-                ))
-                .bind(page_size)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
-            }
-            Some(k) => {
-                let pattern = format!("%{}%", crate::utils::validation::escape_like_pattern(k));
-                sqlx::query_as::<_, User>(&format!(
-                    r#"
-                    SELECT {USER_COLUMNS}
-                    FROM users
-                    WHERE username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\'
-                    ORDER BY created_at DESC
-                    LIMIT $2 OFFSET $3
-                    "#
-                ))
-                .bind(&pattern)
-                .bind(page_size)
-                .bind(offset)
-                .fetch_all(&self.pool)
-                .await
-            }
-        }
-        .map_err(|e| AppError::InternalServerError(format!("查询用户列表失败: {e}")))?;
+        // 没有筛选条件时不拼 WHERE 子句，而不是拼一个恒真的条件：
+        // 后者会让"有没有过滤"这件事从 SQL 文本上就看不出来，读代码的人得反推。
+        let where_clause = if params.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_sql.join(" AND "))
+        };
 
-        // 计数必须用**同一个** WHERE，否则会出现"列表 3 条但 total 500"
-        // 的分页错乱——那比筛选失效更容易让人误判数据规模
-        let total: (i64,) = match keyword {
-            None => {
-                sqlx::query_as("SELECT COUNT(*) FROM users")
-                    .fetch_one(&self.pool)
-                    .await
-            }
-            Some(k) => {
-                let pattern = format!("%{}%", crate::utils::validation::escape_like_pattern(k));
-                sqlx::query_as(
-                    r#"SELECT COUNT(*) FROM users
-                       WHERE username ILIKE $1 ESCAPE '\' OR email ILIKE $1 ESCAPE '\'"#,
-                )
-                .bind(&pattern)
-                .fetch_one(&self.pool)
-                .await
-            }
+        let list_sql = format!(
+            r#"
+            SELECT {USER_COLUMNS}
+            FROM users{where_clause}
+            ORDER BY created_at DESC
+            LIMIT ${} OFFSET ${}
+            "#,
+            params.len() + 1,
+            params.len() + 2
+        );
+
+        let count_sql = format!("SELECT COUNT(*) FROM users{where_clause}");
+
+        // 一次构建两种查询共用的一组绑定值。
+        // QueryBuilder 那类 API 在这里反而更绕：参数类型随条件数量变化，
+        // 动态拼接 + bind 反而能把"SQL 里的 $n 与 binds 的顺序"写成一段线性代码，
+        // 读起来就知道它们不会错位。
+        let mut list_stmt = sqlx::query_as::<_, User>(&list_sql);
+        let mut count_stmt = sqlx::query_as::<_, (i64,)>(&count_sql);
+        for p in &params {
+            list_stmt = list_stmt.bind(p);
+            count_stmt = count_stmt.bind(p);
         }
-        .map_err(|e| AppError::InternalServerError(format!("查询用户总数失败: {e}")))?;
+        let users = list_stmt
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("查询用户列表失败: {e}")))?;
+
+        let total: (i64,) = count_stmt
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("查询用户总数失败: {e}")))?;
 
         Ok((users, total.0))
     }
@@ -250,6 +336,66 @@ impl UserRepository {
             tracing::error!(target: "repository", "更新用户失败 (id={}): {:?}", id, e);
             conflict_from(&e, "更新用户失败", "用户名已被占用", "邮箱已被占用")
         })
+    }
+
+    /// 自助修改资料（仅展示型字段）
+    ///
+    /// 与管理员的 [`Self::update`] **刻意分开**，不能合并成一个方法加个开关：
+    /// 管理员那条会写 `username` / `email` / `is_active`，而这条一个都不碰。
+    /// 合成"可选参数版"的后果是调用方多传一个字段就静默生效——
+    /// 让自助端点具备了改登录键的能力，正是 v0.19.0 刚修掉的那类"意外可达"。
+    ///
+    /// ── 为什么**不能**用 `COALESCE($3, display_name)` ──
+    /// 最初就是这么写的，结果"清空展示名"永远不生效：
+    /// `COALESCE(NULL, display_name)` 的语义是"传了 NULL 就保留旧值"，
+    /// 而请求里"显式清空"正是要传 NULL。两个不同的意思被压进了同一个 COALESCE。
+    /// 集成测试 `a_user_can_set_and_clear_their_own_display_name` 当场抓到了。
+    ///
+    /// 正确写法是让**外层 flag 决定写不写**，内层值原样绑定——
+    /// 内层是 NULL 就写 NULL，那才是"清空"。
+    ///
+    /// 三态语义（外层 / 内层 → 行为）：
+    /// - `None` / —     → 不碰该列
+    /// - `Some(None)`   → 写 NULL（清空）
+    /// - `Some(Some(v))`→ 写 v
+    ///
+    /// 用外层 flag 而不是 COALESCE，还让前端不必先读出旧值再原样写回——
+    /// 回写一个刚刚被别人改过的旧值就是典型的丢失更新。
+    pub async fn update_profile(
+        &self,
+        id: Uuid,
+        display_name: Option<Option<&str>>,
+        avatar_url: Option<Option<&str>>,
+    ) -> Result<User, AppError> {
+        // 两个都没给就是"什么都不改"。仍然走一次 UPDATE 让不存在的 id
+        // 报出可诊断的错误，而不是静默返回成功——调用方需要知道这次是否真的生效。
+        let user = sqlx::query_as::<_, User>(&format!(
+            r#"
+            UPDATE users
+            SET display_name = CASE WHEN $2::boolean THEN $3::text ELSE display_name END,
+                avatar_url   = CASE WHEN $4::boolean THEN $5::text ELSE avatar_url   END
+            WHERE id = $1
+            RETURNING {USER_COLUMNS}
+            "#
+        ))
+        .bind(id)
+        .bind(display_name.is_some())
+        .bind(display_name.flatten().map(str::to_string))
+        .bind(avatar_url.is_some())
+        .bind(avatar_url.flatten().map(str::to_string))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(target: "repository", "更新用户资料失败 (id={}): {:?}", id, e);
+            AppError::InternalServerError(format!("更新用户资料失败: {e}"))
+        })?;
+
+        match user {
+            Some(u) => Ok(u),
+            // 不把"用户不存在"报成 404：这个端点用当前登录者的 id，
+            // 拿不到用户说明账号刚被删或会话已失效，由上层统一处理
+            None => Err(AppError::NotFound("用户不存在".into())),
+        }
     }
 
     /// 批量查询多个用户的角色（避免列表页 N+1）

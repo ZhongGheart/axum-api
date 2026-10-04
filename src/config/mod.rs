@@ -87,6 +87,26 @@ pub struct MetricsConfig {
     pub max_buffered_endpoints: usize,
 }
 
+/// 头像上传配置
+///
+/// 头像落在**本地磁盘**，由 `tower_http::services::ServeDir` 挂在 `/uploads` 下。
+/// 这是 v0.20.0 的有意取舍：admin 后台不是社交产品，头像丢失可接受，
+/// 而对象存储会引入一整套与"账号自持"主线无关的配置面。替换方案见 ROADMAP v0.22.0。
+#[derive(Debug, Clone)]
+pub struct UploadConfig {
+    /// 落盘根目录（相对路径按进程工作目录解析）
+    ///
+    /// 容器里必须挂卷到此处，否则重启即丢图。见 docker-compose.yml 的 volume 配置。
+    pub dir: String,
+    /// 单文件字节上限
+    ///
+    /// 超限直接 413。这里**不用** multipart 流式落盘再判大小：
+    /// 先落盘再删会在磁盘上留下攻击者任意大小的垃圾。
+    pub max_file_size: usize,
+    /// 允许的图片 MIME 白名单
+    pub allowed_mime_types: Vec<String>,
+}
+
 /// 应用全局配置
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -110,6 +130,8 @@ pub struct Config {
     pub audit_log: AuditLogConfig,
     /// 接口耗时指标聚合配置
     pub metrics: MetricsConfig,
+    /// 头像上传配置
+    pub upload: UploadConfig,
     /// 启动时是否自动执行数据库迁移
     pub migrate_on_startup: bool,
 }
@@ -258,6 +280,20 @@ impl Config {
                 .expect("LOGIN_FAILURE_WINDOW 必须是有效的数字"),
         };
 
+        let upload = UploadConfig {
+            dir: env::var("UPLOAD_DIR").unwrap_or_else(|_| "./uploads".to_string()),
+            max_file_size: env::var("UPLOAD_MAX_FILE_SIZE")
+                .unwrap_or_else(|_| "2097152".to_string())
+                .parse()
+                .expect("UPLOAD_MAX_FILE_SIZE 必须是有效的字节数"),
+            // 白名单而非黑名单：新增格式要显式放行，
+            // 否则将来某个奇怪类型被塞进来就是一次存储型攻击面
+            allowed_mime_types: ["image/jpeg", "image/png", "image/webp", "image/gif"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+
         Self {
             server_addr,
             jwt_secret,
@@ -269,6 +305,7 @@ impl Config {
             database,
             audit_log,
             metrics,
+            upload,
             migrate_on_startup,
         }
     }

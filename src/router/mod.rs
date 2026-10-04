@@ -13,7 +13,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 // Swagger UI 通过前端 iframe + CDN 渲染
 
-use crate::config::{AuditLogConfig, Config};
+use crate::config::{AuditLogConfig, Config, UploadConfig};
 use crate::controller::{auth, demo, dict, menu, monitor, rbac, role, user};
 use crate::docs::swagger_ui_handler;
 use crate::error::AppError;
@@ -32,6 +32,7 @@ use crate::service::auth::AuthService;
 use crate::service::rbac::RbacService;
 use crate::utils::jwt::JwtUtil;
 use crate::utils::redis::RedisClient;
+use crate::utils::upload;
 
 /// 应用共享状态
 #[derive(Debug, Clone)]
@@ -50,6 +51,8 @@ pub struct AppState {
     /// 当前部署的真实保留天数，而重新读一次环境变量在测试里可能被改过、
     /// 或在多副本部署下与实际跑的清理任务不一致。
     pub audit_log_config: AuditLogConfig,
+    /// 头像上传配置（v0.20.0）
+    pub upload_config: UploadConfig,
 }
 
 /// 构建应用路由
@@ -111,7 +114,18 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         db_pool,
         metrics_collector: metrics_collector.clone(),
         audit_log_config: config.audit_log.clone(),
+        upload_config: config.upload.clone(),
     };
+
+    // 上传目录必须在挂 ServeDir 之前存在：ServeDir 只在请求到达时才去解析路径，
+    // 目录缺失时的表现是首次访问拿到 404，而不是启动期报错——
+    // 那意味着"部署漏了挂卷"要等到第一个用户传头像时才被发现。
+    if let Err(e) = tokio::fs::create_dir_all(&config.upload.dir).await {
+        return Err(AppError::InternalServerError(format!(
+            "创建上传目录 {} 失败: {e}",
+            config.upload.dir
+        )));
+    }
 
     // ── 配置 CORS ──────────────────────────────────────────────
     let mut cors = CorsLayer::new()
@@ -150,6 +164,15 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         // 之外的位置**：改密要落审计（走中间件），同时它是"受限令牌"
         // 唯一被放行的写接口
         .route("/api/auth/password", put(auth::change_password))
+        // 自助改资料（展示名 / 头像）。
+        // **刻意不在受限令牌白名单里**：待改密的用户先改口令。
+        // 那条白名单（middleware/auth.rs 的 pwd_stale 分支）只放行
+        // password / logout / me，加 profile 就等于允许一个尚未确认凭据的
+        // 会话去写用户数据。
+        .route("/api/auth/profile", put(auth::update_profile))
+        // 头像上传。与 profile 一样刻意不在受限令牌白名单里：
+        // 待改密的用户先改口令。
+        .route("/api/auth/profile/avatar", post(auth::upload_avatar))
         // 当前用户的导航菜单：前端据此动态生成路由与侧栏
         .route("/api/auth/menus", get(crate::controller::menu::my_menus))
         // 当前用户的权限码：前端 v-permission 据此判定按钮级权限
@@ -303,9 +326,33 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
             "/api/admin/users/batch-delete",
             axum::routing::post(user::batch_delete_users),
         )
+        // CSV 批量导入。必须排在 `/api/admin/users/{id}` 之前：
+        // matchit 对同层字面量优先，但留在这里是为了让"哪些是字面量段"
+        // 一眼可辨——`import` 若被当成 id，下一个请求就变成 400 查 UUID 失败。
+        .route(
+            "/api/admin/users/import",
+            axum::routing::post(user::import_users),
+        )
         .route(
             "/api/admin/users/{id}/status",
             axum::routing::put(user::toggle_user_status),
+        )
+        // 解锁被登录爆破防护临时锁定的账号。挂在 /api/admin 分组内，
+        // 因而自动继承该分组的 require_role 闸门与守卫检查
+        // （every_admin_handler_declares_a_permission_guard 会自动纳入它）。
+        .route(
+            "/api/admin/users/{id}/unlock",
+            axum::routing::post(user::unlock_user),
+        )
+        .route(
+            "/api/admin/users/{id}/sessions",
+            axum::routing::get(user::list_user_sessions),
+        )
+        // 单会话吊销。与"吊销全部会话"是两条独立路径：
+        // 后者走 user_revoked_before 的时间戳机制，前者走 jti 黑名单。
+        .route(
+            "/api/admin/users/{id}/sessions/{jti}/revoke",
+            axum::routing::post(user::revoke_user_session),
         )
         .route(
             "/api/admin/users/{id}/reset-password",
@@ -357,6 +404,14 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         .merge(dict_routes)
         .merge(dict_read_routes)
         .merge(monitor_routes)
+        // 上传目录的静态访问。**刻意挂在鉴权之外**：
+        // 头像要能被 `<img src>` 直接取，而 `<img>` 无法附带 Authorization 头。
+        // 换来的是这些图是公开可读的——头像本来就在用户列表页展示，
+        // 这与"用户列表要登录才能看"不是同一个承诺。
+        .nest_service(
+            upload::UPLOAD_URL_PREFIX,
+            tower_http::services::ServeDir::new(&config.upload.dir),
+        )
         // OpenAPI JSON 端点
         .route(
             "/api/openapi.json",

@@ -2,6 +2,8 @@
 //!
 //! 基于 validator crate 提供复杂参数校验规则封装。
 
+use serde::Deserialize;
+
 use crate::error::AppError;
 
 /// 校验结果类型
@@ -211,6 +213,109 @@ pub fn validate_uuid(s: &str) -> ValidationResult<()> {
         return Err(AppError::BadRequest("ID 格式不正确".into()));
     }
     Ok(())
+}
+
+/// 展示名归一 + 校验（供 `Option<String>` 反序列化用）
+///
+/// **空串与纯空白一律归一成 `None`**（表示"没设过"），
+/// 而不是当成一个合法的展示名存进库。理由同迁移 014：
+/// DB 层 CHECK 要求 `display_name` 已被 trim，若这里放行空串，
+/// 就会有一条写入在应用层通过、到 DB 层被拒——错误从"字段值不合法"
+/// 变成"数据库约束冲突"，调用方拿到的是 409 而不是 400。
+///
+/// 长度按**字符数**判定（`chars().count()`），与 `validate_username` 同一把尺子。
+/// 按字节判定会把中文展示名的容量砍掉三分之二，而列本身是 varchar(50)、
+/// Postgres 按字符计——v0.18.0 已在用户名上修过这个同类问题。
+pub fn normalize_display_name(raw: &str) -> ValidationResult<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let count = trimmed.chars().count();
+    if count > 50 {
+        return Err(AppError::BadRequest(format!(
+            "展示名不能超过 50 个字符（当前 {count} 个）"
+        )));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// 头像路径校验：只接受站内 `/uploads/` 开头的相对路径
+///
+/// 拒绝 `//evil.com/x.png`（协议相对 URL，浏览器会当成外域）、
+/// `/uploads/../../etc/passwd`（路径穿越）、以及任何 `http(s)://` 绝对地址。
+/// DB 层 CHECK 会再挡一道，但那时报错是 500 级；这里的 400 带可读原因。
+pub fn normalize_avatar_url(raw: &str) -> ValidationResult<Option<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if !trimmed.starts_with("/uploads/") {
+        return Err(AppError::BadRequest(
+            "头像路径必须以 /uploads/ 开头的站内相对路径".into(),
+        ));
+    }
+    // 归一化后仍含 `..` 即为穿越尝试：/uploads/a/../b 看起来在站内，实际可跳出
+    if trimmed.split('/').any(|s| s == "..") {
+        return Err(AppError::BadRequest("头像路径不能包含 ..".into()));
+    }
+    if trimmed.chars().count() > 512 {
+        return Err(AppError::BadRequest("头像路径过长".into()));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// `display_name` 字段的反序列化器：字段级三态
+///
+/// 返回 `Option<Option<String>>`，**外层区分"字段在不在请求里"，内层区分"要不要清空"**：
+///
+/// | 请求体 | 外层 | 内层 | 语义 |
+/// |---|---|---|---|
+/// | 不带该字段 | `None` | — | 不改 |
+/// | `"display_name": null` | `Some` | `None` | 清空 |
+/// | `"display_name": ""` | `Some` | `None` | 清空（空串与 null 同义，见下） |
+/// | `"display_name": "张三"` | `Some` | `Some("张三")` | 设置 |
+///
+/// **为什么要三态而不是 `Option<String>`**：`Option<String>` 下"不带字段"和
+/// `"display_name": null` 都是 `None`，前端只想改头像时若因此把展示名也清了，
+/// 就是一次静默的数据丢失。而 `COALESCE` 语义的仓储签名（缺省即不改）
+/// 需要的就是这个区分。
+///
+/// 空串归一成 `Some(None)` 而不是 `Some(Some(""))`：DB 层 CHECK 要求
+/// `display_name` 已被 trim，存空串会在库层被拒；而调用方期待的是"清空成功"。
+///
+/// serde 的 `deserialize_with` 只能返回 `D::Error`，所以这里把 `AppError`
+/// 用 `serde::de::Error::custom` 桥接过去（`AppError` 由 thiserror 生成 `Display`）。
+/// 错误最终仍按统一响应格式呈现为 400。
+pub fn deserialize_display_name<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    match Option::<String>::deserialize(deserializer) {
+        Ok(None) => Ok(Some(None)),
+        Ok(Some(s)) => normalize_display_name(&s)
+            .map(Some)
+            .map_err(D::Error::custom),
+        Err(e) => Err(D::Error::custom(format!("展示名字段无法解析: {e}"))),
+    }
+}
+
+/// `avatar_url` 字段的反序列化器：与上面同构的三态
+///
+/// 空串同样归一成"清空"，理由见 [`deserialize_display_name`]。
+pub fn deserialize_avatar_url<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    match Option::<String>::deserialize(deserializer) {
+        Ok(None) => Ok(Some(None)),
+        Ok(Some(s)) => normalize_avatar_url(&s).map(Some).map_err(D::Error::custom),
+        Err(e) => Err(D::Error::custom(format!("头像字段无法解析: {e}"))),
+    }
 }
 
 #[cfg(test)]

@@ -16,6 +16,51 @@ use crate::utils::password::{check_password, hash_password, PasswordCheck};
 use crate::utils::redis::RedisClient;
 use crate::utils::validation;
 
+/// 管理员解锁的结果（对外返回，让"解锁了什么"可核对）
+///
+/// 刻意回**清掉了多少次失败计数**而不只是 "ok"：
+/// 管理员需要区分"确实有锁定并已解除"与"本来就没锁，点了没反应"——
+/// 这两种在只回 ok 的接口里长得一模一样。
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct UnlockedAccount {
+    /// 被解锁的用户名
+    pub username: String,
+    /// 清除的登录失败计数总次数（0 表示本来就没有锁定）
+    pub cleared_failures: u64,
+    /// 实际写入过的计数桶数量（最多 2：用户名与邮箱各一）
+    pub scopes_cleared: usize,
+}
+
+/// 对外返回的单条会话（比 Redis 里的记录多一个"这是不是你当前这条"）
+///
+/// `is_current` 让前端能标出"当前设备"并**禁止吊销它自己**：
+/// 吊销当前令牌会让这次请求的下一次调用立刻 401，用户看到的是
+/// "系统把我踢了"，而不是"你刚才点了下线自己的设备"。差异很真实。
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct SessionView {
+    /// 令牌唯一标识（吊销时回传）
+    pub jti: String,
+    /// 登录时刻（Unix 毫秒）
+    pub login_at_ms: i64,
+    /// 令牌到期时刻（Unix 毫秒）
+    pub expires_at_ms: i64,
+    /// 客户端 IP
+    pub client_ip: String,
+    /// 是否为发起本次请求的会话
+    pub is_current: bool,
+}
+
+/// 会话吊销结果
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct RevokedSession {
+    /// 被吊销的令牌 jti
+    pub jti: String,
+    /// 该令牌在登记时的到期时刻（Unix 毫秒）
+    pub expires_at_ms: i64,
+    /// 剩余会话数
+    pub remaining_sessions: usize,
+}
+
 /// 认证服务
 ///
 /// 组合 Repository 和 JWT 工具，提供完整的认证业务逻辑。
@@ -316,9 +361,9 @@ impl AuthService {
         // 主角色由角色集合推导，不再读取冗余的 users.role 列
         let primary_role = Role::primary_from(&roles);
 
-        let token = self
+        let (token, token_jti) = self
             .jwt_util
-            .sign(
+            .sign_with_jti(
                 user.id,
                 &user.username,
                 &primary_role.to_string(),
@@ -330,6 +375,27 @@ impl AuthService {
 
         self.clear_login_failures(redis_client, &account_scope, &ip_scope)
             .await;
+
+        // 登记会话（"谁在线"的唯一数据来源）。
+        //
+        // **写失败不放行登录**：登记只用于管理视图，缺一条记录不影响认证结论，
+        // 但它会让"这个人在哪些设备登录"漏掉一次登录——而管理员正是靠这个列表
+        // 判断账号是否被盗用。让一次失败变成"那次登录对管理员不可见"，
+        // 比让整个登录失败更危险：后者用户会知道并重试，前者用户毫无察觉。
+        //
+        // TTL 等于令牌寿命，令牌失效时这条记录由 Redis 自动清理。
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let record = crate::utils::redis::SessionRecord {
+            jti: token_jti.clone(),
+            user_id: user.id,
+            username: user.username.clone(),
+            client_ip: client_ip.to_string(),
+            login_at_ms: now_ms,
+            expires_at_ms: now_ms + (self.jwt_expiration_seconds as i64) * 1000,
+        };
+        redis_client
+            .register_session(&record, self.jwt_expiration_seconds)
+            .await?;
 
         self.audit(AuthAudit {
             action: Self::ACTION_LOGIN_SUCCESS,
@@ -359,12 +425,24 @@ impl AuthService {
     pub async fn logout(
         &self,
         redis_client: &RedisClient,
+        user_id: uuid::Uuid,
         token_jti: &str,
         token_exp: u64,
     ) -> Result<(), AppError> {
         redis_client
             .add_token_to_blacklist(token_jti, token_exp)
             .await?;
+
+        // 除黑名单外还要删会话登记——否则"谁在线"会把一个已经登出的会话
+        // 继续显示成在线，且要等到令牌自然过期才消失。
+        //
+        // 删除失败**不**让登出失败：令牌此刻已在黑名单里、事实上已作废，
+        // 此时返回错误会让用户以为"我没登出成功"而去重试，
+        // 而重试时令牌已失效，只会得到一个更难懂的 401。
+        // 所以只记警告，让列表残留至多存在到令牌过期。
+        if let Err(e) = redis_client.remove_session(user_id, token_jti).await {
+            tracing::warn!("会话登记删除失败（令牌已注销，仅在线列表会残留）: {e}");
+        }
 
         tracing::info!("令牌已注销: jti={token_jti}");
         Ok(())
@@ -382,6 +460,169 @@ impl AuthService {
     /// 3. 改密后**吊销全部存量会话**：口令已变，继续有效的旧令牌没有理由留着。
     ///    水位用毫秒（`revoke_user_sessions` 内部即 `timestamp_millis`），
     ///    与 `Claims::iat_ms` 对齐，不会误伤改密后重新登录拿到的令牌
+    ///
+    /// 管理员解锁账号（清除登录爆破防护的失败计数）
+    ///
+    /// ── 为什么必须同时清 username 与 email 两个 scope ──
+    /// 登录失败计数写在 `account:{归一后的登录输入}` 下（见 `login` 里的
+    /// `format!("account:{login_input}")`），而登录框**用户名和邮箱都接受**。
+    /// 于是同一个账号有两个独立的计数桶：`account:alice` 与
+    /// `account:alice@example.com`。攻击者用哪种标识都能把账号锁上。
+    ///
+    /// 只清其中一个的话：**通过另一条路径锁定的用户仍然登不进去**，
+    /// 而管理员看到"已解锁"却仍被拒。这不是边角情况——两种标识
+    /// 分别填在登录框和另一个工具里是常态。
+    ///
+    /// ── 为什么绝不碰 `ip:` scope ──
+    /// IP 计数是**跨账号共享**的。一个 NAT 出口后面的所有用户共用一个桶。
+    /// 管理员解锁 alice 时把 IP 桶一起清零，等于给正在爆破的地址发了一份
+    /// 新额度——不只是 alice 没被救，还顺手帮了攻击者。
+    /// 所以这里只清账号维度，IP 维度交给它自己的 TTL 自然过期。
+    pub async fn unlock_user(
+        &self,
+        redis_client: &RedisClient,
+        user: &crate::model::User,
+    ) -> Result<UnlockedAccount, AppError> {
+        // 与 login 走**同一个**归一函数，否则清掉的 key 与写入的 key 对不上。
+        // 这里直接复用库里已归一的 username / email（v0.19.0 之后写入必为小写无空白）。
+        let scopes = [
+            format!("account:{}", user.username),
+            format!("account:{}", user.email),
+        ];
+
+        let mut cleared = 0u64;
+        let mut remaining = Vec::new();
+        for scope in &scopes {
+            let before = redis_client.login_failure_count(scope).await?;
+            if let Err(e) = redis_client.clear_login_failures(scope).await {
+                // 清失败不改变"是否成功"的结论，但必须可观测且**不能静默成功**：
+                // 若 Redis 挂了而我们回 200，管理员会以为解锁了而用户仍登不进去。
+                tracing::error!("解锁失败：清除 {scope} 出错: {e}");
+                return Err(AppError::InternalServerError(format!(
+                    "解锁失败：Redis 操作出错: {e}"
+                )));
+            }
+            if before > 0 {
+                cleared += before;
+                remaining.push((scope.clone(), before));
+            }
+        }
+
+        tracing::info!(
+            target: "service",
+            "管理员解锁账号: username={}, 清除失败计数 {} 次, 涉及 {} 个桶",
+            user.username,
+            cleared,
+            remaining.len()
+        );
+
+        Ok(UnlockedAccount {
+            username: user.username.clone(),
+            cleared_failures: cleared,
+            scopes_cleared: remaining.len(),
+        })
+    }
+
+    /// 列出某用户的在线会话（管理端）
+    pub async fn list_sessions(
+        &self,
+        redis_client: &RedisClient,
+        user_id: uuid::Uuid,
+        current_jti: &str,
+    ) -> Result<Vec<SessionView>, AppError> {
+        let records = redis_client.list_sessions(user_id).await?;
+        Ok(records
+            .into_iter()
+            .map(|r| SessionView {
+                is_current: r.jti == current_jti,
+                jti: r.jti,
+                login_at_ms: r.login_at_ms,
+                expires_at_ms: r.expires_at_ms,
+                client_ip: r.client_ip,
+            })
+            .collect())
+    }
+
+    /// 吊销**单个**会话
+    ///
+    /// ── 为什么单会话吊销必须走 jti 黑名单，不能走 `revoke_user_sessions` ──
+    /// 后者是**整用户粒度**的时间戳（`user_revoked_before`）：它一次作废该用户
+    /// 所有在那个时刻之前签发的令牌。要踢掉一台设备却把这个人所有设备都踢了，
+    /// 那不是"单会话吊销"，是换个名字的全量重登。
+    ///
+    /// 查不到会话登记时**明确拒绝**（404）而不是回成功：登记可能因故丢失，
+    /// 而"界面显示已下线、令牌其实还在有效期内"是一个**看起来完全正常**的
+    /// 安全假象——管理员会据此认为风险已排除。
+    pub async fn revoke_session(
+        &self,
+        redis_client: &RedisClient,
+        user_id: uuid::Uuid,
+        jti: &str,
+    ) -> Result<RevokedSession, AppError> {
+        let record = redis_client
+            .get_session(user_id, jti)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound("会话不存在或已过期（可能已登出或令牌已失效）".into())
+            })?;
+
+        // 黑名单 TTL 用令牌**剩余**寿命而不是配置值：
+        // 用配置值会让一条本该只再活 5 分钟的令牌在黑名单里躺满一整天，
+        // 而黑名单键是按 jti 存的——无意义地占着内存。
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let remaining = ((record.expires_at_ms - now_ms).max(0) as u64) / 1000 + 1;
+
+        redis_client
+            .add_token_to_blacklist(&record.jti, remaining)
+            .await?;
+        redis_client.remove_session(user_id, jti).await?;
+
+        let remaining_sessions = redis_client.list_sessions(user_id).await?.len();
+
+        tracing::info!(
+            target: "service",
+            "吊销单个会话: user_id={user_id}, 剩余会话={remaining_sessions}"
+        );
+
+        Ok(RevokedSession {
+            jti: record.jti,
+            expires_at_ms: record.expires_at_ms,
+            remaining_sessions,
+        })
+    }
+
+    /// 自助修改资料（仅展示型字段）
+    ///
+    /// **不吊销会话**：改展示名与头像不影响凭据，
+    /// 吊销会把用户正在用的页面直接踢回登录页——而他并没有做任何需要重新
+    /// 确认身份的事。对照 [`Self::change_password`] 改完必须吊销：
+    /// 那一次动的是口令本身。
+    pub async fn update_profile(
+        &self,
+        user_id: uuid::Uuid,
+        display_name: Option<Option<&str>>,
+        avatar_url: Option<Option<&str>>,
+    ) -> Result<crate::model::UserInfo, AppError> {
+        let user = self
+            .user_repo
+            .update_profile(user_id, display_name, avatar_url)
+            .await?;
+
+        // 返回**改完之后**的完整信息，而不是只回一个 "ok"：
+        // 调用方需要立刻拿到归一后的值去更新界面，
+        // 若让它自己乐观地改本地状态，与服务端不一致时（比如并发被别人改了）
+        // 界面就会一直显示一个库里没有的名字。
+        let roles = self.role_repo.find_roles_by_user_id(user_id).await?;
+        tracing::info!(
+            target: "service",
+            "用户自助修改资料: user_id={}, display_name={}, 头像={}",
+            user_id,
+            display_name.flatten().map(|s| if s.is_empty() { "(清空)" } else { s }).unwrap_or("(未提供)"),
+            if avatar_url.flatten().is_some() { "已设置" } else { "未变" }
+        );
+        Ok(crate::model::UserInfo::new(user, roles))
+    }
+
     pub async fn change_password(
         &self,
         redis_client: &RedisClient,
@@ -441,6 +682,21 @@ impl AuthService {
         redis_client
             .revoke_user_sessions(&user_id, self.jwt_expiration_seconds)
             .await?;
+
+        // 同时清掉会话登记。时间戳机制已经让令牌失效了，但登记还留在 Redis 里，
+        // 于是"在线会话"列表会继续把一台台其实已经登不上的设备显示成在线——
+        // 直到各自的 TTL 自然过期（默认整整一天）。
+        //
+        // 清理失败**不回错**：令牌此刻已确实失效，认证结论已经成立。
+        // 若因清理失败而让改密/停用报 500，用户会以为密码没改成功而重试，
+        // 而此时令牌已吊销，重试只会得到更难解释的 401。
+        if let Err(e) = redis_client
+            .delete_by_prefix(&format!("sess:{user_id}:"))
+            .await
+        {
+            tracing::warn!("全量吊销后会话登记清理失败（令牌已失效，仅在线列表残留）: {e}");
+        }
+
         tracing::info!("已吊销用户全部会话: {user_id}");
         Ok(())
     }
