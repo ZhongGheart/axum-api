@@ -20,7 +20,7 @@ use sqlx::PgPool;
 /// 守卫见 `tests/api_integration.rs` 的
 /// `every_documented_endpoint_is_called_by_a_test`：新增 SELECT 手写列名会红。
 pub const USER_COLUMNS: &str =
-    "id, username, email, password_hash, is_active, must_change_password, display_name, avatar_url, password_changed_at, created_at, updated_at";
+    "id, username, email, password_hash, is_active, must_change_password, display_name, avatar_url, password_changed_at, dept_id, created_at, updated_at";
 
 /// 用户列表的筛选条件
 ///
@@ -317,11 +317,12 @@ impl UserRepository {
         username: &str,
         email: &str,
         is_active: bool,
+        dept_id: Option<Uuid>,
     ) -> Result<User, AppError> {
         sqlx::query_as::<_, User>(&format!(
             r#"
             UPDATE users
-            SET username = $2, email = $3, is_active = $4
+            SET username = $2, email = $3, is_active = $4, dept_id = $5
             WHERE id = $1
             RETURNING {USER_COLUMNS}
             "#
@@ -330,6 +331,7 @@ impl UserRepository {
         .bind(username)
         .bind(email)
         .bind(is_active)
+        .bind(dept_id)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {

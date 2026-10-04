@@ -13757,6 +13757,603 @@ async fn admin_can_close_and_reopen_registration() {
     flush_settings_cache().await;
 }
 
+// ──────────────────────────────────────────────
+// v0.24.0 部门 / 组织树
+// ──────────────────────────────────────────────
+
+/// 清理所有非种子部门
+///
+/// 种子部门的 ID 是固定的 `8f000000-0000-4000-8000-000000000001`（总公司）。
+/// 每个测试在开始时调用这个函数，确保在干净的环境上运行。
+///
+/// ── 为什么需要这一步 ──────────────────────────────────────
+/// 测试是串行的（`--test-threads=1`），但多个测试函数会按顺序运行。
+/// 前面的测试如果没清理干净，后面的测试就会看到脏数据，
+/// 表现为"明明只建了一个部门，树形返回却有 4 个"。
+/// 这种失败很难定位，因为脏数据是上一个测试留下的。
+///
+/// ── 为什么用 SQL 而不是 API ────────────────────────────────
+/// API 删除有 `ON DELETE RESTRICT` 约束：有子部门时拒绝删除。
+/// 用 SQL 的 `WITH RECURSIVE` 可以一次性删除整棵子树，
+/// 不需要先删子部门再删父部门。
+async fn cleanup_departments() {
+    sqlx::query(
+        r#"
+        WITH RECURSIVE subtree AS (
+            SELECT id FROM departments WHERE id <> '8f000000-0000-4000-8000-000000000001'
+            UNION ALL
+            SELECT d.id FROM departments d
+            JOIN subtree s ON d.parent_id = s.id
+        )
+        DELETE FROM departments WHERE id IN (SELECT id FROM subtree)
+        "#,
+    )
+    .execute(&pool().await)
+    .await
+    .expect("清理部门失败");
+}
+
+/// 种子部门必须存在
+///
+/// 迁移 018 种了一个"总公司"根部门。这条钉住种子数据确实写进去了，
+/// 否则后续所有部门用例都会因为"没有根部门"而失败。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_seed_department_exists() {
+    let app = app().await;
+    cleanup_departments().await;
+    let admin = admin_token(&app).await;
+
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/admin/departments", Some(&admin), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tree = body["data"].as_array().expect("必须是数组");
+    assert_eq!(tree.len(), 1, "种子只该有一个根部门: {body}");
+    assert_eq!(tree[0]["name"], "总公司", "{body}");
+    assert_eq!(tree[0]["parent_id"], serde_json::Value::Null, "{body}");
+    assert_eq!(tree[0]["children"], serde_json::json!([]), "{body}");
+}
+
+/// 部门树的 CRUD 全链路
+///
+/// 建一个三层树（总公司 → 技术部 → 后端组），验证：
+/// 1. 树形返回的嵌套结构正确
+/// 2. 扁平列表的 level 与 path 正确
+/// 3. 修改名称后树形返回同步更新
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn department_tree_crud_round_trip() {
+    let app = app().await;
+    cleanup_departments().await;
+    let admin = admin_token(&app).await;
+
+    // 找到种子根部门
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/departments", Some(&admin), None),
+    )
+    .await;
+    let root_id = body["data"][0]["id"].as_str().unwrap().to_string();
+
+    // 在根部门下建"技术部"
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": root_id, "name": "技术部" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "新建部门失败: {body}");
+    let tech_id = body["data"]["id"].as_str().unwrap().to_string();
+
+    // 在技术部下面建"后端组"
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": tech_id, "name": "后端组" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "新建子部门失败: {body}");
+    let backend_id = body["data"]["id"].as_str().unwrap().to_string();
+
+    // 树形返回：两层嵌套
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/departments", Some(&admin), None),
+    )
+    .await;
+    let tree = body["data"].as_array().unwrap();
+    assert_eq!(tree.len(), 1, "只有一个根部门: {body}");
+    assert_eq!(tree[0]["name"], "总公司", "{body}");
+    assert_eq!(tree[0]["children"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(tree[0]["children"][0]["name"], "技术部", "{body}");
+    assert_eq!(
+        tree[0]["children"][0]["children"].as_array().unwrap().len(),
+        1,
+        "{body}"
+    );
+    assert_eq!(
+        tree[0]["children"][0]["children"][0]["name"], "后端组",
+        "{body}"
+    );
+
+    // 扁平列表：level 与 path 正确
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/departments/flat", Some(&admin), None),
+    )
+    .await;
+    let flat = body["data"].as_array().unwrap();
+    let backend = flat
+        .iter()
+        .find(|d| d["id"].as_str().unwrap() == backend_id)
+        .expect("扁平列表里该有后端组");
+    assert_eq!(backend["level"], 2, "后端组该是第 2 层: {backend}");
+    assert_eq!(
+        backend["path"].as_str().unwrap(),
+        "总公司/技术部/后端组",
+        "{backend}"
+    );
+
+    // 修改名称
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/departments/{backend_id}"),
+            Some(&admin),
+            Some(json!({ "name": "后端组（已改名）" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "修改部门失败: {body}");
+
+    // 树形返回同步更新
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/departments", Some(&admin), None),
+    )
+    .await;
+    let tree = body["data"].as_array().unwrap();
+    assert_eq!(
+        tree[0]["children"][0]["children"][0]["name"], "后端组（已改名）",
+        "{body}"
+    );
+
+    // 清理：先删后端组，再删技术部
+    let (status, _) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/departments/{backend_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除叶子部门失败");
+
+    let (status, _) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/departments/{tech_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除技术部失败");
+}
+
+/// 有子部门时拒绝删除
+///
+/// `ON DELETE RESTRICT` 会在数据库层面阻止，但服务层先检查一次
+/// 能给出可操作的错误提示（"请先移动或删除子部门"），
+/// 而不是让数据库错误冒到 500。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_department_with_children_cannot_be_deleted() {
+    let app = app().await;
+    cleanup_departments().await;
+    let admin = admin_token(&app).await;
+
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/departments", Some(&admin), None),
+    )
+    .await;
+    let root_id = body["data"][0]["id"].as_str().unwrap().to_string();
+
+    // 建一个子部门
+    let (_, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": root_id, "name": "临时部" })),
+        ),
+    )
+    .await;
+    let child_id = body["data"]["id"].as_str().unwrap().to_string();
+
+    // 删除有子部门的根部门 → 必须 400
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/departments/{root_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "有子部门时必须拒绝删除: {body}"
+    );
+
+    // 先删子部门，再删父部门
+    let (status, _) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/departments/{child_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除叶子部门失败");
+}
+
+/// 不能把部门移动到自己的子孙下面
+///
+/// 循环防护：如果允许这种移动，树形结构会出现环，
+/// `build_tree` 会把环上无一为根的整支剪掉，表现为"部门消失了"。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_department_cannot_be_moved_under_its_own_descendant() {
+    let app = app().await;
+    cleanup_departments().await;
+    let admin = admin_token(&app).await;
+
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/departments", Some(&admin), None),
+    )
+    .await;
+    let root_id = body["data"][0]["id"].as_str().unwrap().to_string();
+
+    // 建两个子部门
+    let (_, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": root_id, "name": "A" })),
+        ),
+    )
+    .await;
+    let a_id = body["data"]["id"].as_str().unwrap().to_string();
+
+    let (_, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": a_id, "name": "A-1" })),
+        ),
+    )
+    .await;
+    let a1_id = body["data"]["id"].as_str().unwrap().to_string();
+
+    // 把 A 移动到 A-1 下面 → 必须 400
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/departments/{a_id}/move"),
+            Some(&admin),
+            Some(json!({ "new_parent_id": a1_id })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "不能移动到自己的子孙下面: {body}"
+    );
+
+    // 把 A 移动到自己下面 → 必须 400
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/departments/{a_id}/move"),
+            Some(&admin),
+            Some(json!({ "new_parent_id": a_id })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "不能移动到自己下面: {body}"
+    );
+
+    // 清理
+    let _ = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/departments/{a1_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    let _ = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/departments/{a_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+}
+
+/// 同一父部门下名称唯一
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn department_name_is_unique_under_the_same_parent() {
+    let app = app().await;
+    cleanup_departments().await;
+    let admin = admin_token(&app).await;
+
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/departments", Some(&admin), None),
+    )
+    .await;
+    let root_id = body["data"][0]["id"].as_str().unwrap().to_string();
+
+    // 用唯一名避免与脏数据冲突
+    let name = format!("dup_{}", unique("dept"));
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": root_id, "name": name })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 再建一个同名 → 必须 409
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": root_id, "name": name })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "同名必须被拒: {body}");
+
+    // 不同父部门下可以同名
+    let other_name = format!("other_{}", unique("dept"));
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": root_id, "name": other_name })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "建另一个部门失败: {body}");
+    let other_id = body["data"]["id"].as_str().unwrap().to_string();
+
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": other_id, "name": name })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "不同父部门下可以同名");
+
+    // 清理：先删子部门（other_id 下的 name），再删父部门（other_id）
+    // other_id 是根部门的子部门，所以要从 tree[0]["children"] 里找
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/departments", Some(&admin), None),
+    )
+    .await;
+    let tree = body["data"].as_array().unwrap();
+    let root_children = tree[0]["children"].as_array().unwrap();
+    for child in root_children {
+        if child["id"].as_str().unwrap() == other_id {
+            // 先删这个部门的子部门
+            for grandchild in child["children"].as_array().unwrap() {
+                let grandchild_id = grandchild["id"].as_str().unwrap();
+                let (status, _) = send(
+                    &app,
+                    request(
+                        "DELETE",
+                        &format!("/api/admin/departments/{grandchild_id}"),
+                        Some(&admin),
+                        None,
+                    ),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "清理子部门失败");
+            }
+        }
+    }
+    let (status, _) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/departments/{other_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "清理失败");
+}
+
+/// 部门管理端点需要对应的权限码
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_department_endpoints_require_their_permission_codes() {
+    let app = app().await;
+    cleanup_departments().await;
+    let _admin = admin_token(&app).await;
+
+    // 四个权限码都必须种出来
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT permission FROM menus WHERE permission IN ('system:dept:list','system:dept:create','system:dept:update','system:dept:delete')",
+    )
+    .fetch_all(&pool().await)
+    .await
+    .expect("查询权限码失败");
+    assert_eq!(rows.len(), 4, "四个部门权限码都必须种出来: {rows:?}");
+
+    // 页面菜单本身也必须在
+    let menu: Option<(String, String)> =
+        sqlx::query_as("SELECT path, component FROM menus WHERE path = '/system/dept' LIMIT 1")
+            .fetch_optional(&pool().await)
+            .await
+            .expect("查询页面菜单失败");
+    let (path, component) = menu.expect("部门管理页面菜单必须存在");
+    assert_eq!(path, "/system/dept");
+    assert_eq!(component, "system/dept/index");
+}
+
+/// 删除部门时用户的 dept_id 变成 NULL
+///
+/// `ON DELETE SET NULL`：删部门时用户变成"无部门"，而不是被级联删除。
+/// 用户是核心数据，部门是组织结构；删一个部门不该删掉一群人。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_a_department_nulls_the_users_dept_id() {
+    let app = app().await;
+    cleanup_departments().await;
+    let admin = admin_token(&app).await;
+
+    let (_, body) = send(
+        &app,
+        request("GET", "/api/admin/departments", Some(&admin), None),
+    )
+    .await;
+    let root_id = body["data"][0]["id"].as_str().unwrap().to_string();
+
+    // 建一个部门
+    let (_, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/departments",
+            Some(&admin),
+            Some(json!({ "parent_id": root_id, "name": "临时部" })),
+        ),
+    )
+    .await;
+    let dept_id = body["data"]["id"].as_str().unwrap().to_string();
+
+    // 建一个用户并分配到这个部门
+    let (username, uid) = make_plain_user(&app, &admin, "deptuser").await;
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/users/{uid}"),
+            Some(&admin),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "roles": ["user"],
+                "dept_id": dept_id,
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "分配部门失败");
+
+    // 确认用户确实在这个部门里
+    let (status, body) = send(
+        &app,
+        request(
+            "GET",
+            &format!("/api/admin/departments/{dept_id}/users"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"].as_array().unwrap().len(),
+        1,
+        "部门下该有 1 个用户"
+    );
+
+    // 删除部门
+    let (status, _) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/departments/{dept_id}"),
+            Some(&admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除部门失败");
+
+    // 用户的 dept_id 必须变成 NULL
+    let row: Option<(Option<uuid::Uuid>,)> =
+        sqlx::query_as("SELECT dept_id FROM users WHERE id = $1")
+            .bind(uid)
+            .fetch_optional(&pool().await)
+            .await
+            .expect("查询用户失败");
+    let (dept_id_after,) = row.expect("用户必须还在");
+    assert!(
+        dept_id_after.is_none(),
+        "删部门后用户的 dept_id 必须变成 NULL，实际: {dept_id_after:?}"
+    );
+
+    delete_user(&app, &admin, uid).await;
+}
+
 /// 关闭注册后，被拒的请求必须落审计
 ///
 /// 关闭注册后仍有人来撞注册口，与登录失败计数一样是"有人在试探"的证据。

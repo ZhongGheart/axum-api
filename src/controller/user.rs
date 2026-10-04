@@ -74,6 +74,12 @@ pub struct UserManageRequest {
     /// 用户原有的其余角色被无声删除。
     pub roles: Option<Vec<String>>,
     pub is_active: Option<bool>,
+    /// 所属部门 ID（v0.24.0）
+    ///
+    /// `None` 表示不修改，`Some(None)` 表示清空，`Some(Some(id))` 表示设置。
+    /// 三态由反序列化器区分，与 `UpdateProfileRequest` 的 `display_name` 同一模式。
+    #[serde(default)]
+    pub dept_id: Option<Option<uuid::Uuid>>,
 }
 
 /// 用户列表响应
@@ -404,7 +410,13 @@ pub async fn update_user(
     let updated = state
         .auth_service
         .user_repo
-        .update(id, &username, &email, req.is_active.unwrap_or(true))
+        .update(
+            id,
+            &username,
+            &email,
+            req.is_active.unwrap_or(true),
+            req.dept_id.unwrap_or(None),
+        )
         .await?;
 
     let mut facts: Vec<String> = Vec::new();
@@ -760,7 +772,7 @@ pub async fn toggle_user_status(
     let updated = state
         .auth_service
         .user_repo
-        .update(id, &user.username, &user.email, req.is_active)
+        .update(id, &user.username, &user.email, req.is_active, None)
         .await?;
 
     // 停用账号必须立即失效其全部会话

@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod demo;
+pub mod department;
 pub mod dict;
 pub mod menu;
 pub mod monitor;

@@ -25,14 +25,15 @@ INSERT INTO menus (id, parent_id, name, path, component, icon, sort_order, type,
   ('7f000000-0000-4000-8000-000000000005', '7f000000-0000-4000-8000-000000000002', '字典组件', '/demo/dict',             'demo/dict',            'grid',     3, 'menu',      NULL, TRUE),
   ('7f000000-0000-4000-8000-000000000006', NULL,                                   '系统管理', '/system',                NULL,                   'settings', 3, 'directory', NULL, TRUE),
   ('7f000000-0000-4000-8000-000000000007', '7f000000-0000-4000-8000-000000000006', '用户管理', '/system/user',           'system/user/index',    'user',     1, 'menu',      NULL, TRUE),
-  ('7f000000-0000-4000-8000-000000000008', '7f000000-0000-4000-8000-000000000006', '角色管理', '/system/role',           'system/role/index',    'role',     2, 'menu',      NULL, TRUE),
-  ('7f000000-0000-4000-8000-000000000009', '7f000000-0000-4000-8000-000000000006', '菜单管理', '/system/menu',           'system/menu/index',    'settings', 3, 'menu',      NULL, TRUE),
-  ('7f000000-0000-4000-8000-000000000010', '7f000000-0000-4000-8000-000000000006', '系统日志', '/system/log',            'system/log/index',     'settings', 4, 'menu',      NULL, TRUE),
-  ('7f000000-0000-4000-8000-000000000011', '7f000000-0000-4000-8000-000000000006', '接口文档', '/system/api-docs',       'system/api-docs/index','settings', 5, 'menu',      NULL, TRUE),
-  ('7f000000-0000-4000-8000-000000000012', '7f000000-0000-4000-8000-000000000006', '系统监控', '/system/monitor/system', 'monitor/system/index', 'settings', 6, 'menu',      NULL, TRUE),
-  ('7f000000-0000-4000-8000-000000000013', '7f000000-0000-4000-8000-000000000006', '接口监控', '/system/monitor/api',    'monitor/api/index',    'settings', 7, 'menu',      NULL, TRUE),
-  ('7f000000-0000-4000-8000-000000000014', '7f000000-0000-4000-8000-000000000006', '字典管理', '/system/dict',           'system/dict/index',    'settings', 8, 'menu',      NULL, TRUE),
-  ('7f000000-0000-4000-8000-000000000015', '7f000000-0000-4000-8000-000000000006', '系统参数', '/system/setting',        'system/setting/index', 'settings', 9, 'menu',      NULL, TRUE)
+  ('7f000000-0000-4000-8000-000000000016', '7f000000-0000-4000-8000-000000000006', '部门管理', '/system/dept',           'system/dept/index',    'apartment', 2, 'menu',      NULL, TRUE),
+  ('7f000000-0000-4000-8000-000000000008', '7f000000-0000-4000-8000-000000000006', '角色管理', '/system/role',           'system/role/index',    'role',     3, 'menu',      NULL, TRUE),
+  ('7f000000-0000-4000-8000-000000000009', '7f000000-0000-4000-8000-000000000006', '菜单管理', '/system/menu',           'system/menu/index',    'settings', 4, 'menu',      NULL, TRUE),
+  ('7f000000-0000-4000-8000-000000000010', '7f000000-0000-4000-8000-000000000006', '系统日志', '/system/log',            'system/log/index',     'settings', 5, 'menu',      NULL, TRUE),
+  ('7f000000-0000-4000-8000-000000000011', '7f000000-0000-4000-8000-000000000006', '接口文档', '/system/api-docs',       'system/api-docs/index','settings', 6, 'menu',      NULL, TRUE),
+  ('7f000000-0000-4000-8000-000000000012', '7f000000-0000-4000-8000-000000000006', '系统监控', '/system/monitor/system', 'monitor/system/index', 'settings', 7, 'menu',      NULL, TRUE),
+  ('7f000000-0000-4000-8000-000000000013', '7f000000-0000-4000-8000-000000000006', '接口监控', '/system/monitor/api',    'monitor/api/index',    'settings', 8, 'menu',      NULL, TRUE),
+  ('7f000000-0000-4000-8000-000000000014', '7f000000-0000-4000-8000-000000000006', '字典管理', '/system/dict',           'system/dict/index',    'settings', 9, 'menu',      NULL, TRUE),
+  ('7f000000-0000-4000-8000-000000000015', '7f000000-0000-4000-8000-000000000006', '系统参数', '/system/setting',        'system/setting/index', 'settings', 10, 'menu',      NULL, TRUE)
 ON CONFLICT (id) DO NOTHING
 "#;
 
@@ -239,14 +240,24 @@ impl RbacService {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<(), AppError> {
         // (id, 父菜单 path, name, path, component, sort_order)
-        const LATE_MENUS: &[(&str, &str, &str, &str, &str, i32)] = &[(
-            "7f000000-0000-4000-8000-000000000015",
-            "/system",
-            "系统参数",
-            "/system/setting",
-            "system/setting/index",
-            9,
-        )];
+        const LATE_MENUS: &[(&str, &str, &str, &str, &str, i32)] = &[
+            (
+                "7f000000-0000-4000-8000-000000000015",
+                "/system",
+                "系统参数",
+                "/system/setting",
+                "system/setting/index",
+                9,
+            ),
+            (
+                "7f000000-0000-4000-8000-000000000016",
+                "/system",
+                "部门管理",
+                "/system/dept",
+                "system/dept/index",
+                2,
+            ),
+        ];
 
         for (id, parent_path, name, path, component, sort) in LATE_MENUS {
             // 父菜单不存在就整体跳过：那是"管理员删了系统管理目录"，

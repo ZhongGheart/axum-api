@@ -36,6 +36,16 @@ pub const USER_UNLOCK: &str = "system:user:unlock";
 /// 不该与"改个显示名"共用一个开关——后者几乎必然要授给管理员。
 pub const SESSION_MANAGE: &str = "system:session:manage";
 
+// ── 部门管理 ────────────────────────────────────────────────
+/// 查看部门树
+pub const DEPT_LIST: &str = "system:dept:list";
+/// 新建部门
+pub const DEPT_CREATE: &str = "system:dept:create";
+/// 修改部门
+pub const DEPT_UPDATE: &str = "system:dept:update";
+/// 删除部门
+pub const DEPT_DELETE: &str = "system:dept:delete";
+
 // ── 角色管理 ────────────────────────────────────────────────
 /// 查看角色列表
 pub const ROLE_LIST: &str = "system:role:list";
@@ -150,6 +160,27 @@ pub const PERMISSION_DEFS: &[PermissionDef] = &[
         code: SESSION_MANAGE,
         name: "查看与吊销会话",
         parent_path: "/system/user",
+    },
+    // 部门管理
+    PermissionDef {
+        code: DEPT_LIST,
+        name: "查询部门",
+        parent_path: "/system/dept",
+    },
+    PermissionDef {
+        code: DEPT_CREATE,
+        name: "新建部门",
+        parent_path: "/system/dept",
+    },
+    PermissionDef {
+        code: DEPT_UPDATE,
+        name: "编辑部门",
+        parent_path: "/system/dept",
+    },
+    PermissionDef {
+        code: DEPT_DELETE,
+        name: "删除部门",
+        parent_path: "/system/dept",
     },
     // 角色管理
     PermissionDef {

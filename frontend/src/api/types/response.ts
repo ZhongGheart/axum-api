@@ -58,6 +58,8 @@ export interface UserInfo {
   display_name: string | null
   /** 头像站内相对路径（v0.20.0）；`null` 表示没设过 */
   avatar_url: string | null
+  /** 所属部门 ID（v0.24.0）；`null` 表示无部门 */
+  dept_id: string | null
   created_at: string
 }
 
@@ -121,6 +123,56 @@ export interface UnlockResult {
   username: string
   cleared_failures: number
   scopes_cleared: number
+}
+
+// ── 部门管理（v0.24.0）────────────────────────────────────────
+
+/** 部门树节点（v0.24.0） */
+export interface DepartmentNode {
+  id: string
+  parent_id: string | null
+  name: string
+  description: string | null
+  sort_order: number
+  children: DepartmentNode[]
+}
+
+/** 扁平部门项（用于下拉选择，v0.24.0） */
+export interface DepartmentFlat {
+  id: string
+  parent_id: string | null
+  name: string
+  level: number
+  path: string
+}
+
+/** 部门下的用户（v0.24.0） */
+export interface DepartmentUser {
+  id: string
+  username: string
+  display_name: string | null
+  email: string
+  is_active: boolean
+}
+
+/** 新建部门请求（v0.24.0） */
+export interface CreateDepartmentRequest {
+  parent_id: string | null
+  name: string
+  description?: string
+  sort_order?: number
+}
+
+/** 修改部门请求（v0.24.0） */
+export interface UpdateDepartmentRequest {
+  name?: string
+  description?: string | null
+  sort_order?: number
+}
+
+/** 移动部门请求（v0.24.0） */
+export interface MoveDepartmentRequest {
+  new_parent_id: string | null
 }
 
 /** CSV 导入中某一行的失败原因（v0.20.0） */

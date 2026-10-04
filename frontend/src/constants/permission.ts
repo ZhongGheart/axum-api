@@ -19,6 +19,12 @@ export const PERM = {
   /** 在线会话列举与单会话吊销（v0.20.0） */
   SESSION_MANAGE: 'system:session:manage',
 
+  // 部门管理（v0.24.0）
+  DEPT_LIST: 'system:dept:list',
+  DEPT_CREATE: 'system:dept:create',
+  DEPT_UPDATE: 'system:dept:update',
+  DEPT_DELETE: 'system:dept:delete',
+
   // 角色管理
   ROLE_LIST: 'system:role:list',
   ROLE_CREATE: 'system:role:create',

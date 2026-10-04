@@ -77,6 +77,11 @@ pub struct User {
     /// 于是"改了个头像"会被算成"刚换过口令"，过期策略被无限推迟——
     /// 一个安全策略被另一个无关功能静默关掉。
     pub password_changed_at: Option<DateTime<Utc>>,
+    /// 所属部门 ID（v0.24.0）
+    ///
+    /// `NULL` 表示"无部门"（存量用户一律 NULL）。
+    /// `ON DELETE SET NULL`：删部门时用户变成"无部门"，而不是被级联删除。
+    pub dept_id: Option<Uuid>,
     /// 创建时间
     pub created_at: DateTime<Utc>,
     /// 更新时间
@@ -195,6 +200,8 @@ pub struct UserInfo {
     pub display_name: Option<String>,
     /// 头像相对路径；未设置时为 NULL
     pub avatar_url: Option<String>,
+    /// 所属部门 ID（v0.24.0）；未设置时为 NULL
+    pub dept_id: Option<Uuid>,
     /// 创建时间
     pub created_at: DateTime<Utc>,
 }
@@ -214,6 +221,7 @@ impl UserInfo {
             must_change_password: user.must_change_password,
             display_name: user.display_name,
             avatar_url: user.avatar_url,
+            dept_id: user.dept_id,
             created_at: user.created_at,
         }
     }

@@ -5935,3 +5935,129 @@ C2 ✅ + A1 ✅ + A2 ✅，**v0.23.0 三项全部完成**。
 
 **改动文件**：仅 `docs/ROADMAP.md`（+ `docs/AI_HANDOFF.md` 本节）。无代码改动，未跑门禁。
 **约定**：本地提交，**不推送**。
+
+---
+
+## 2026-10-04 v0.24.0 / B1 部门树（已实现，待提交）
+
+**目标**：`users` 与 `roles` 之间没有中间层，`dept|department|organization`
+在 src/migrations/frontend 三处 grep 均零命中。
+
+**起始 git 状态**：`663e73dc docs(roadmap): 实测复核剩余缺口，重排 v0.24.0+ 开发计划`。
+
+### 数据模型
+
+- `departments` 表：自引用（`parent_id` 指向自己），`ON DELETE RESTRICT`
+  阻止删除有子部门的节点。
+- `users.dept_id`：`ON DELETE SET NULL`，删部门时用户变成"无部门"，
+  而不是被级联删除。用户是核心数据，部门是组织结构。
+- 种子只种一个"总公司"根部门，其余由管理员在界面上建。
+  不种深层结构：部门是业务数据，种一棵假树只会让管理员删掉它
+  （而删除有子部门的节点会被 RESTRICT 挡住）。
+
+### 树形结构
+
+用应用层 `build_tree` 构建树，与菜单树同一模式。
+**不用递归 CTE**：部门数量级在几十到几百，应用层构建完全够用，
+且两处用同一套树构建逻辑，"什么算根"的定义不会分叉。
+
+`DepartmentNode` 的 `ToSchema` 需要 `#[schema(no_recursion)]`，
+否则递归类型会导致栈溢出（与 `MenuNode` 同一问题）。
+
+### 递归删除策略
+
+`ON DELETE RESTRICT` + 服务层先检查：
+- 有子部门时拒绝删除，提示"请先移动或删除子部门"
+- 没有子部门时可以删除
+- 有用户时不拒绝删除，但给出警告：用户的 dept_id 会变成 NULL
+
+### 循环防护
+
+移动节点时：
+1. 不能移动到自己下面（`new_parent_id == id`）
+2. 不能移动到自己的子孙下面（`is_descendant` 用递归 CTE 判断）
+
+`is_descendant` 用递归 CTE 而不是应用层递归：部门数量级在几十到几百，
+但递归 CTE 在数据库层面做更高效，且能处理任意深度。
+环的处理：加 `depth` 上限（100 层），超过上限就返回 `false`。
+
+### 权限码
+
+新增 4 个权限码：`system:dept:list` / `create` / `update` / `delete`。
+菜单种子加了"部门管理"页面（`/system/dept`），
+并登记到 `backfill_late_added_menus` 的 `LATE_MENUS` 数组里，
+确保存量库也能补写。
+
+### 端点
+
+| 端点 | 作用 |
+|---|---|
+| `GET /api/admin/departments` | 部门树 |
+| `GET /api/admin/departments/flat` | 扁平列表（含 level 与 path，用于下拉选择） |
+| `POST /api/admin/departments` | 新建 |
+| `PUT /api/admin/departments/{id}` | 修改（名称/描述/排序） |
+| `POST /api/admin/departments/{id}/move` | 移动（含循环防护） |
+| `DELETE /api/admin/departments/{id}` | 删除（有子部门时拒绝） |
+| `GET /api/admin/departments/{id}/users` | 该部门下的用户 |
+
+路由顺序：`flat` / `move` / `users` 这三个静态段**必须**排在 `{id}` 之前。
+
+### 用户管理增强
+
+`UserManageRequest` 加了 `dept_id` 字段（`Option<Option<Uuid>>`），
+`user_repo.update` 方法加了 `dept_id` 参数。
+`UserInfo` 加了 `dept_id` 字段。
+
+### 前端
+
+新增 `frontend/src/views/system/dept/index.vue` 页面：
+- 树形展示部门（`n-tree` 组件）
+- 新建/编辑部门（弹窗表单）
+- 移动部门（弹窗选择父部门）
+- 删除部门（带确认）
+- 查看部门详情
+
+### 测试
+
+集成 7 条：
+1. 种子部门存在
+2. 部门树 CRUD 全链路（含 level 与 path）
+3. 有子部门时拒绝删除
+4. 不能移动到自己/子孙下面
+5. 同一父部门下名称唯一
+6. 权限码种出来
+7. 删除部门时用户的 dept_id 变成 NULL
+
+每个测试开头调用 `cleanup_departments()` 清理脏数据。
+
+### 踩到的坑
+
+1. **`DepartmentNode` 的递归 `ToSchema` 导致栈溢出**：
+   `DepartmentNode` 有 `children: Vec<DepartmentNode>`，
+   `ToSchema` 派生会尝试递归地生成 schema，导致栈溢出。
+   解决：加 `#[schema(no_recursion)]`（与 `MenuNode` 同一问题）。
+
+2. **权限码没种出来**：`seed_permission_codes` 按 `parent_path` 解析父菜单，
+   解析不到就跳过。存量库的 `menus` 表非空，`seed_menus_if_empty` 会跳过，
+   所以新增的页面菜单永远不会被写进去。
+   解决：登记到 `backfill_late_added_menus` 的 `LATE_MENUS` 数组里。
+
+3. **测试脏数据残留**：测试是串行的，前面的测试如果没清理干净，
+   后面的测试就会看到脏数据。
+   解决：每个测试开头调用 `cleanup_departments()` 用 SQL 清理。
+
+4. **`list_department_users` 对不存在的部门返回 404**：
+   `every_documented_endpoint_is_reachable_without_a_server_error`
+   期望读端点返回 2xx。
+   解决：改为返回 200 + 空数组（与 `GET /api/admin/users/{id}/sessions` 一致）。
+
+### 门禁结果
+
+fmt ✓ / clippy 0 warning / Rust 单测 114 / 集成 **197 passed 0 failed** /
+前端 lint 0 error（`env.d.ts` 1 个历史 warning）/ typecheck ✓ / **203 passed** / build ✓
+
+### 下一步
+
+v0.24.0 是 B1 部门树，单独占一版。
+下一版按 ROADMAP 是 **v0.25.0 = C1 2FA**（单独占一版）。
+**约定：本地提交，不推送。**

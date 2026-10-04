@@ -14,7 +14,7 @@ use tower_http::trace::TraceLayer;
 // Swagger UI 通过前端 iframe + CDN 渲染
 
 use crate::config::{AuditLogConfig, Config, UploadConfig};
-use crate::controller::{auth, demo, dict, menu, monitor, rbac, role, setting, user};
+use crate::controller::{auth, demo, department, dict, menu, monitor, rbac, role, setting, user};
 use crate::docs::swagger_ui_handler;
 use crate::error::AppError;
 use crate::middleware::api_metrics::{api_metrics_mw, MetricsCollector};
@@ -24,6 +24,7 @@ use crate::middleware::rate_limit::rate_limit_middleware;
 use crate::middleware::request_id::request_id_middleware;
 use crate::repository::audit_log::AuditLogRepository;
 use crate::repository::db::DatabasePool;
+use crate::repository::department::DepartmentRepository;
 use crate::repository::dict::DictRepository;
 use crate::repository::menu::MenuRepository;
 use crate::repository::role::RoleRepository;
@@ -43,6 +44,10 @@ pub struct AppState {
     pub jwt_util: Arc<JwtUtil>,
     pub redis_client: Arc<RedisClient>,
     pub menu_repo: MenuRepository,
+    /// 部门仓储（v0.24.0）
+    pub department_repo: DepartmentRepository,
+    /// 部门服务（v0.24.0）
+    pub department_service: crate::service::department::DepartmentService,
     pub dict_repo: DictRepository,
     pub audit_log_repo: AuditLogRepository,
     pub db_pool: DatabasePool,
@@ -96,6 +101,7 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
     let user_repo = UserRepository::new(pool.clone());
     let role_repo = RoleRepository::new(pool.clone());
     let menu_repo = MenuRepository::new(pool.clone());
+    let department_repo = DepartmentRepository::new(pool.clone());
     let dict_repo = DictRepository::new(pool.clone(), Some(redis_client.as_ref().clone()));
     let audit_log_repo = AuditLogRepository::new(pool.clone());
     // 参数仓储与字典仓储同构：DB 权威 + Redis 缓存
@@ -117,6 +123,8 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         audit_log_repo.clone(),
         setting_service.clone(),
     );
+    let department_service =
+        crate::service::department::DepartmentService::new(department_repo.clone());
     let rbac_service = RbacService::new(pool.clone());
 
     rbac_service.init_defaults().await?;
@@ -126,8 +134,10 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         jwt_util: Arc::clone(&jwt_util),
         redis_client: Arc::clone(&redis_client),
         menu_repo,
+        department_service,
         dict_repo,
         audit_log_repo,
+        department_repo,
         db_pool,
         metrics_collector: metrics_collector.clone(),
         audit_log_config: config.audit_log.clone(),
@@ -263,6 +273,31 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
     // 授权下界（能授予的 ⊆ 自己已持有的）见 `middleware::permission`。
     let admin_routes = Router::new()
         .route("/api/admin/test", get(rbac::admin_test))
+        // 部门管理（v0.24.0）
+        //
+        // `flat` / `move` / `users` 这三个静态段**必须**排在 `{id}` 之前，
+        // 否则它们会被当成一个 id 走进 `{id}` 端点，然后以"部门不存在"404——
+        // 一个看起来像数据错误、实际是路由根本没匹配上的响应。
+        .route(
+            "/api/admin/departments",
+            get(department::list_departments).post(department::create_department),
+        )
+        .route(
+            "/api/admin/departments/flat",
+            get(department::list_departments_flat),
+        )
+        .route(
+            "/api/admin/departments/{id}/move",
+            post(department::move_department),
+        )
+        .route(
+            "/api/admin/departments/{id}/users",
+            get(department::list_department_users),
+        )
+        .route(
+            "/api/admin/departments/{id}",
+            axum::routing::put(department::update_department).delete(department::delete_department),
+        )
         .route(
             "/api/admin/users",
             get(user::list_users).post(user::create_user),
