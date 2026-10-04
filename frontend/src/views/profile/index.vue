@@ -154,6 +154,79 @@
           </n-form>
         </n-card>
       </n-grid-item>
+
+      <n-grid-item span="2 m:1">
+        <n-card title="登录会话" size="small">
+          <template #header-extra>
+            <n-space :size="8">
+              <n-button
+                quaternary
+                size="small"
+                :loading="sessionsLoading"
+                @click="loadSessions"
+              >
+                <template #icon>
+                  <n-icon><RefreshOutline /></n-icon>
+                </template>
+                刷新
+              </n-button>
+              <n-popconfirm @positive-click="revokeOthers">
+                <template #trigger>
+                  <n-button quaternary size="small" type="warning">
+                    <template #icon>
+                      <n-icon><LogOutOutline /></n-icon>
+                    </template>
+                    下线其他所有设备
+                  </n-button>
+                </template>
+                将吊销除本设备外的全部会话，且**本设备不受影响**。确认继续？
+              </n-popconfirm>
+            </n-space>
+          </template>
+
+          <n-spin :show="sessionsLoading">
+            <n-list v-if="sessions.length > 0" bordered>
+              <n-list-item v-for="s in sessions" :key="s.jti">
+                <n-space align="center" :size="12" style="width: 100%">
+                  <n-tag
+                    v-if="s.is_current"
+                    size="small"
+                    type="success"
+                    :bordered="false"
+                  >
+                    本设备
+                  </n-tag>
+                  <n-tag v-else size="small" :bordered="false">其他设备</n-tag>
+
+                  <n-space vertical :size="0" style="flex: 1">
+                    <span class="session-ip">{{ s.client_ip }}</span>
+                    <span class="hint">
+                      登录于 {{ formatMs(s.login_at_ms) }} ·
+                      到期 {{ formatMs(s.expires_at_ms) }}
+                    </span>
+                  </n-space>
+
+                  <n-button
+                    quaternary
+                    size="small"
+                    type="error"
+                    :loading="revokingJti === s.jti"
+                    @click="revokeOne(s)"
+                  >
+                    下线
+                  </n-button>
+                </n-space>
+              </n-list-item>
+            </n-list>
+            <n-empty v-else description="当前没有在线会话" size="small" />
+          </n-spin>
+
+          <div class="hint" style="margin-top: 8px">
+            发现不认识的设备？先「下线」它，再改密码。改密会吊销**全部**会话，
+            包括本设备；「下线其他所有设备」则只踢掉别的设备。
+          </div>
+        </n-card>
+      </n-grid-item>
     </n-grid>
   </div>
 </template>
@@ -174,6 +247,7 @@
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import type { FormInst, FormRules, UploadFileInfo } from 'naive-ui'
+import { LogOutOutline, RefreshOutline } from '@vicons/ionicons5'
 import { useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { authApi } from '@/api/auth'
@@ -183,7 +257,7 @@ import { passwordMaxLength, passwordPlaceholder } from '@/utils/accountRules'
 import { useSettingStore } from '@/stores/setting'
 import BaseUpload from '@/components/common/BaseUpload.vue'
 import { resolveAvatarUrl } from '@/utils/avatar'
-import type { UserInfo } from '@/api/types/response'
+import type { UserInfo, UserSession } from '@/api/types/response'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -240,6 +314,91 @@ function onAvatarFailed(file: UploadFileInfo) {
     | { message?: string }
     | undefined
   showError(body?.message || '头像上传失败')
+}
+
+// ── 登录会话（v0.23.0）─────────────────────────────────────────
+
+const sessions = ref<UserSession[]>([])
+const sessionsLoading = ref(false)
+const revokingJti = ref('')
+
+/**
+ * 把 Unix 毫秒格式化成可读时间
+ *
+ * 解析失败时回退成原值而不是 `Invalid Date`：
+ * 后端给的是数字，一旦格式变化，显示 `Invalid Date` 比显示原始数字更糟。
+ */
+function formatMs(ms: number) {
+  const d = new Date(ms)
+  return Number.isNaN(d.getTime()) ? String(ms) : d.toLocaleString()
+}
+
+async function loadSessions() {
+  if (sessionsLoading.value) return
+  sessionsLoading.value = true
+  try {
+    sessions.value = (await authApi.mySessions()) as unknown as UserSession[]
+  } catch {
+    // 错误提示已由响应拦截器统一弹出
+  } finally {
+    sessionsLoading.value = false
+  }
+}
+
+/**
+ * 下线单个会话
+ *
+ * **允许下线当前会话**（管理端刻意禁止）：用户是主动点"下线这台设备"，
+ * 紧接着的 401 正是他想要的结果。但下线本设备后页面会在下一次请求时
+ * 被踢回登录页，所以先给一句明确提示。
+ */
+async function revokeOne(s: UserSession) {
+  if (revokingJti.value) return
+  revokingJti.value = s.jti
+  try {
+    await authApi.revokeMySession(s.jti)
+    if (s.is_current) {
+      // 本设备被自己下线：后端已把令牌拉黑，这里主动登出，
+      // 好过让用户在下一次请求时莫名其妙被踢回登录页
+      showWarning('本设备已下线，即将返回登录页')
+      await new Promise((r) => setTimeout(r, 800))
+      // **不能调 `userStore.logout()`**：令牌已被自己拉黑，
+      // 再发一次登出请求必然 401——一次注定失败的往返，
+      // 外加控制台里一条 "Failed to load resource"，把真实错误淹掉。
+      // 与改密成功后的处理同一套理由。
+      userStore.clearLocalSession()
+      router.push('/login')
+      return
+    }
+    showSuccess('该设备已下线')
+    await loadSessions()
+  } catch {
+    // 错误提示已由响应拦截器统一弹出
+  } finally {
+    revokingJti.value = ''
+  }
+}
+
+/**
+ * 下线除本设备外的全部会话
+ *
+ * "账号可能被盗用"时最该有的一台开关：改密会吊销全部会话（含本端），
+ * 而"只踢掉其他设备、让我继续用"在语义上更准确——正在用的这台就是可信的证据。
+ */
+async function revokeOthers() {
+  try {
+    const result = (await authApi.revokeMyOtherSessions()) as unknown as {
+      revoked_count: number
+    }
+    showSuccess(
+      result.revoked_count > 0
+        ? `已下线其他 ${result.revoked_count} 台设备`
+        : '没有其他在线设备',
+    )
+    await loadSessions()
+  } catch {
+    // 错误提示已由响应拦截器统一弹出
+  }
 }
 
 // ── 展示名 ──────────────────────────────────────────────────────
@@ -301,6 +460,7 @@ onMounted(() => {
   savedDisplayName.value = userStore.userInfo?.display_name ?? ''
   profileForm.displayName = savedDisplayName.value
   void settingStore.loadPasswordPolicy()
+  void loadSessions()
 })
 
 const createdAt = computed(() => {
@@ -401,5 +561,10 @@ async function submit() {
   font-size: 12px;
   color: var(--n-text-color-3, #999);
   margin-top: 4px;
+}
+
+.session-ip {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
 }
 </style>

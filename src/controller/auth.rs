@@ -15,6 +15,7 @@ use crate::model::{
 };
 use crate::router::AppState;
 use crate::utils::api_extractor::ApiJson;
+use crate::utils::api_extractor::ApiPath;
 
 /// POST /api/auth/register — 用户注册
 #[utoipa::path(
@@ -412,4 +413,124 @@ pub async fn health(State(state): State<AppState>) -> axum::response::Response {
         }),
     )
         .into_response()
+}
+
+/// GET /api/auth/sessions — 列出**当前用户自己**的在线会话
+///
+/// 与管理端 `GET /api/admin/users/{id}/sessions` 的差别只在**数据来源**：
+/// 那里由路径里的 `id` 决定看谁，这里恒为 `auth_user.user_id`。
+/// 服务层复用同一套 `list_sessions`，因此两处对"什么算在线"的定义不会分叉。
+///
+/// ── 为什么用户需要这个入口 ──────────────────────────────────
+/// 改密会吊销该账号**全部**会话，所以"发现异常 → 先改密"这个动作是对的。
+/// 但用户此前**无法只吊销可疑的那一台设备**——他要么全踢（把自己也踢了），
+/// 要么只能等管理员。账号被盗时，能自助踢掉那台陌生设备是第一条处置链路。
+///
+/// **刻意不放进受限令牌白名单**（`middleware/auth.rs` 的 `pwd_stale` 分支）：
+/// 待改密的用户先改口令，与 `profile` / `profile/avatar` 同一原则。
+#[utoipa::path(
+    get,
+    path = "/api/auth/sessions",
+    tag = "认证",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "当前用户的在线会话列表（按登录时间倒序）；无在线会话时返回空数组", body = ApiResponse<Vec<crate::service::auth::SessionView>>),
+    )
+)]
+pub async fn my_sessions(
+    State(state): State<AppState>,
+    auth_user: AuthenticatedUser,
+) -> Result<Json<ApiResponse<Vec<crate::service::auth::SessionView>>>, AppError> {
+    let sessions = state
+        .auth_service
+        .list_sessions(&state.redis_client, auth_user.user_id, &auth_user.token_jti)
+        .await?;
+    Ok(Json(ApiResponse::success(sessions)))
+}
+
+/// POST /api/auth/sessions/{jti}/revoke — 吊销**自己的**单个会话
+///
+/// 与管理端同名端点的差别同样只在数据来源：这里恒为当前用户。
+///
+/// **允许吊销当前会话**（管理端刻意禁止）：管理端那条注释说的是
+/// "吊销当前令牌会让这次请求的下一次调用立刻 401，用户看到的是系统把我踢了"。
+/// 而这里用户是**主动**点"下线这台设备"，紧接着的 401 正是他想要的结果，
+/// 语义上等价于"只登出这一台"。禁止它反而会逼用户去点"吊销其他全部"，
+/// 把一起被踢变成全部被踢。
+#[utoipa::path(
+    post,
+    path = "/api/auth/sessions/{jti}/revoke",
+    tag = "认证",
+    security(("bearer_auth" = [])),
+    params(("jti" = String, Path, description = "令牌唯一标识（UUID），取自会话列表")),
+    responses(
+        (status = 200, description = "该会话已失效", body = ApiResponse<crate::service::auth::RevokedSession>),
+        (status = 404, description = "会话不存在或已过期"),
+        (status = 400, description = "jti 不是合法的 UUID"),
+    )
+)]
+pub async fn revoke_my_session(
+    State(state): State<AppState>,
+    auth_user: AuthenticatedUser,
+    audit: AuditDetail,
+    ApiPath(jti): ApiPath<String>,
+) -> Result<Json<ApiResponse<crate::service::auth::RevokedSession>>, AppError> {
+    // jti 会直接拼进 Redis 键，理由与管理端同名端点一致：
+    // 不校验形状的话，路径里的 `*` 或空格能进键名，
+    // 而列举用的是 `SCAN sess:{user_id}:*` 这个 glob 模式。
+    let jti = uuid::Uuid::parse_str(&jti)
+        .map_err(|_| AppError::BadRequest("会话标识 jti 必须是合法的 UUID".into()))?;
+    let jti = jti.to_string();
+
+    let result = state
+        .auth_service
+        .revoke_session(&state.redis_client, auth_user.user_id, &jti)
+        .await?;
+
+    let is_current = jti == auth_user.token_jti;
+    audit.push(format!(
+        "自助吊销{}会话（{}），剩余会话 {} 个，账号 \"{}\"",
+        if is_current { "当前" } else { "单个" },
+        jti.chars().take(8).collect::<String>() + "…",
+        result.remaining_sessions,
+        auth_user.username
+    ));
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+/// POST /api/auth/sessions/revoke-others — 吊销**除当前会话外**的全部会话
+///
+/// 静态段必须排在 `{jti}` 之前，否则 `revoke-others` 会被当成一个 jti
+/// 走进上一个端点，然后以"不是合法的 UUID"400——一个看起来像参数错误、
+/// 实际是路由没匹配上的响应。
+///
+/// 这是"账号可能被盗用"时最该有的一台开关：改密会吊销全部会话
+/// （含自己当前这条），而"只踢掉其他设备、让我继续用"在语义上更准确
+/// ——他正在用的这台就是可信的证据。
+#[utoipa::path(
+    post,
+    path = "/api/auth/sessions/revoke-others",
+    tag = "认证",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "除当前会话外的全部会话已失效（remaining_sessions 恒为 1）", body = ApiResponse<crate::service::auth::RevokedOthers>),
+    )
+)]
+pub async fn revoke_my_other_sessions(
+    State(state): State<AppState>,
+    auth_user: AuthenticatedUser,
+    audit: AuditDetail,
+) -> Result<Json<ApiResponse<crate::service::auth::RevokedOthers>>, AppError> {
+    let result = state
+        .auth_service
+        .revoke_other_sessions(&state.redis_client, auth_user.user_id, &auth_user.token_jti)
+        .await?;
+
+    audit.push(format!(
+        "自助吊销除当前外的全部会话，本次踢掉 {} 个，剩余 {} 个，账号 \"{}\"",
+        result.revoked_count, result.remaining_sessions, auth_user.username
+    ));
+
+    Ok(Json(ApiResponse::success(result)))
 }

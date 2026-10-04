@@ -101,6 +101,21 @@ export interface UserSession {
   is_current: boolean
 }
 
+/** 单会话吊销结果（v0.20.0 管理端 / v0.23.0 自助端共用） */
+export interface RevokedSession {
+  jti: string
+  expires_at_ms: number
+  remaining_sessions: number
+}
+
+/** 「吊销除当前外的全部会话」的结果（v0.23.0） */
+export interface RevokedOthers {
+  /** 本次实际吊销的会话数（不含当前会话） */
+  revoked_count: number
+  /** 剩余会话数（恒为 1，即当前会话） */
+  remaining_sessions: number
+}
+
 /** 解锁结果（v0.20.0） */
 export interface UnlockResult {
   username: string

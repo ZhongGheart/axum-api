@@ -5769,3 +5769,79 @@ v0.23.0 还剩 **A1 用户自助会话管理** 与 **A2 并发登录上限**，
 两者与 C2 共享「会话 + 参数表」代码路径，同版自洽。
 版号抬到 0.23.0 与 CHANGELOG 按既有规矩**单独一个提交**。
 **约定：本地提交，不推送。**
+
+---
+
+## 2026-10-04 v0.23.0 / A1 用户自助会话管理（已实现，待提交）
+
+**目标**：补齐"账号被盗"的用户侧处置链路。此前会话端点只有管理员侧
+`/api/admin/users/{id}/sessions`，用户**没有** `GET /api/auth/sessions`——
+改密会吊销全部会话，但用户无法只吊销可疑的那一台设备。
+
+**起始 git 状态**：`2398fd64 docs(v0.23.0): 发布元数据、版号抬到 0.23.0、路线图补 v0.23.0 章节`。
+
+### 新增三个端点（都挂在 `protected_routes`，恒以调用者自己为作用域）
+
+| 端点 | 作用 |
+|---|---|
+| `GET /api/auth/sessions` | 列出自己的在线会话（复用 `list_sessions`，与管理端同一套"什么算在线"的定义） |
+| `POST /api/auth/sessions/{jti}/revoke` | 吊销自己的单个会话 |
+| `POST /api/auth/sessions/revoke-others` | 吊销**除当前会话外**的全部会话 |
+
+### 四个刻意的决定
+
+1. **作用域恒为调用者自己**。与管理端端点的差别只在数据来源：
+   那里由路径里的 `id` 决定看谁，这里恒为 `auth_user.user_id`。
+   拿别人的 jti 来吊销会 404（键是 `sess:{自己的user_id}:{jti}`，查不到）。
+   `the_self_service_session_endpoints_are_scoped_to_the_caller` 钉住。
+2. **允许吊销当前会话**（管理端刻意禁止）。管理端那条注释说的是
+   "吊销当前令牌会让这次请求的下一次调用立刻 401，用户看到的是系统把我踢了"；
+   而这里用户是**主动**点"下线这台设备"，紧接着的 401 正是他想要的结果。
+   禁止它反而会逼用户去点"吊销其他全部"，把一起被踢变成全部被踢。
+3. **`revoke-others` 不能用 `revoke_user_sessions`**。后者写的是**整用户粒度**的
+   时间戳（`user_revoked_before`），一次作废该用户**所有**在那个时刻之前签发的
+   令牌，**包括当前这条**——用它实现"保留当前会话"会得到一个自相矛盾的结果：
+   调用成功的当下这次请求的令牌就已经死了。因此走 jti 黑名单逐条跳过 `keep_jti`。
+4. **不在受限令牌白名单里**。待改密的用户先改口令，与 `profile` / `profile/avatar`
+   同一原则。白名单只放行 password / logout / me。
+
+### 路由顺序
+
+`revoke-others` 这个静态段**必须**排在 `{jti}/revoke` 之前：排后面的话
+`revoke-others` 会被当成一个 jti 走进单会话吊销，然后以"不是合法的 UUID"400——
+一个看起来像参数错误、实际是路由根本没匹配上的响应。
+
+### 返回类型
+
+新增 `RevokedOthers { revoked_count, remaining_sessions }`，与 `RevokedSession` 分开。
+两者要回答的问题不同：单会话吊销要回"被吊销的是哪条令牌"，
+而这里要回"**踢掉了几台设备**"。复用 `RevokedSession` 的话 `jti` 字段只能填
+`keep_jti`（并不是被吊销的那条），语义上是错的。
+
+### 前端
+
+个人中心新增「登录会话」卡片：列出在线会话（本设备/其他设备、IP、登录与到期时间）、
+单个「下线」、「下线其他所有设备」（带 popconfirm）、刷新。
+下线本设备时用 `userStore.clearLocalSession()` 而不是 `logout()`——
+令牌已被自己拉黑，再发一次登出请求必然 401，与改密成功后的处理同一套理由。
+
+### 测试
+
+集成 6 条：列出并吊销自己的会话 / 作用域恒为调用者 /
+`revoke-others` 只踢其他设备 / 没有其他会话时是空操作（`revoked_count = 0`）/
+受限令牌不可达 / 自助吊销仍落审计。
+
+**踩到的一个坑**：`the_self_service_session_endpoints_are_not_reachable_with_a_restricted_token`
+最初用 `activated_token` 拿令牌，而后者会清 `must_change_password`，
+拿到的就不是受限令牌了，用例前提整个垮掉（`PUT /api/auth/profile` 返回 200 而非 403）。
+改用 `login_token` 后正常。
+
+### 门禁结果
+
+fmt ✓ / clippy 0 warning / Rust 单测 109 / 集成 **186 passed 0 failed** /
+前端 lint 0 error（`env.d.ts` 1 个历史 warning）/ typecheck ✓ / **203 passed** / build ✓
+
+### 下一步
+
+v0.23.0 还剩 **A2 并发登录上限**，与 A1 共享会话代码路径。
+**约定：本地提交，不推送。**

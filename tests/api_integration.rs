@@ -11330,6 +11330,304 @@ async fn sessions_of_an_unknown_user_are_an_empty_list_not_a_404() {
     delete_user(&app, &admin_tok, id).await;
 }
 
+// ──────────────────────────────────────────────
+// v0.23.0 A1：用户自助会话管理
+// ──────────────────────────────────────────────
+
+/// 用户能列出**自己**的会话，并能只吊销其中一台
+///
+/// 这是 A1 的核心：改密会吊销该账号**全部**会话，所以"发现异常 → 先改密"
+/// 这个动作是对的，但用户此前**无法只吊销可疑的那一台设备**——
+/// 他要么全踢（把自己也踢了），要么只能等管理员。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_user_can_list_and_revoke_their_own_sessions() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, _id) = make_plain_user(&app, &admin_tok, "selfsess").await;
+
+    // 同一账号登录两次，得到两条会话
+    let t1 = activated_token(&app, &username, "Str0ng!Pass").await;
+    let t2 = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    // 用 t1 列出自己的会话：两条都在，且**恰好一条** is_current
+    let (status, body) = send(&app, request("GET", "/api/auth/sessions", Some(&t1), None)).await;
+    assert_eq!(status, StatusCode::OK, "列出自己的会话失败: {body}");
+    let list = body["data"].as_array().expect("必须是数组");
+    assert_eq!(list.len(), 2, "同一账号两次登录应有两条会话: {body}");
+    let current_count = list.iter().filter(|s| s["is_current"] == true).count();
+    assert_eq!(current_count, 1, "必须恰好标出当前会话: {body}");
+
+    // 找到那条**不是**当前的会话并吊销它
+    let other_jti = list
+        .iter()
+        .filter(|s| s["is_current"] == false)
+        .map(|s| s["jti"].as_str().unwrap().to_string())
+        .next()
+        .expect("应至少有一条非当前会话");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/auth/sessions/{other_jti}/revoke"),
+            Some(&t1),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "吊销单个会话失败: {body}");
+    assert_eq!(
+        body["data"]["remaining_sessions"], 1,
+        "吊销一条后应只剩当前这条: {body}"
+    );
+
+    // 被吊销的那条令牌必须失效
+    let (status, _) = send(&app, request("GET", "/api/auth/me", Some(&t2), None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "被自助吊销的令牌必须失效");
+
+    // **当前这条不受影响**
+    let (status, body) = send(&app, request("GET", "/api/auth/me", Some(&t1), None)).await;
+    assert_eq!(status, StatusCode::OK, "单会话吊销不得殃及当前会话: {body}");
+}
+
+/// 自助会话端点**恒以调用者自己为作用域**
+///
+/// 这是安全边界：`/api/auth/sessions` 与 `/api/admin/users/{id}/sessions`
+/// 的差别只在数据来源，前者恒为 `auth_user.user_id`。
+/// 若这里能被路径里的 jti 影响，用户就能吊销别人的会话。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_self_service_session_endpoints_are_scoped_to_the_caller() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (alice, _) = make_plain_user(&app, &admin_tok, "selfalice").await;
+    let (bob, _) = make_plain_user(&app, &admin_tok, "selfbob").await;
+
+    let alice_tok = activated_token(&app, &alice, "Str0ng!Pass").await;
+    let bob_tok = activated_token(&app, &bob, "Str0ng!Pass").await;
+
+    // Alice 列出的是**她自己**的会话，不是 Bob 的
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/auth/sessions", Some(&alice_tok), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let list = body["data"].as_array().expect("必须是数组");
+    assert_eq!(list.len(), 1, "Alice 只该看到自己那一条: {body}");
+    assert_eq!(list[0]["is_current"], true, "{body}");
+
+    // 拿 Bob 的 jti 去吊销：必须 404，**不能成功**
+    let (_, bob_body) = send(
+        &app,
+        request("GET", "/api/auth/sessions", Some(&bob_tok), None),
+    )
+    .await;
+    let bob_jti = bob_body["data"][0]["jti"].as_str().unwrap().to_string();
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/auth/sessions/{bob_jti}/revoke"),
+            Some(&alice_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "不能吊销别人的会话: {body}");
+
+    // Bob 的令牌仍然有效
+    let (status, _) = send(&app, request("GET", "/api/auth/me", Some(&bob_tok), None)).await;
+    assert_eq!(status, StatusCode::OK, "Bob 的会话不该被 Alice 影响");
+}
+
+/// 「吊销除当前外的全部会话」只踢其他设备，当前这条必须活着
+///
+/// 这是"账号可能被盗用"时最该有的一台开关：改密会吊销全部会话
+/// （含自己当前这条），而"只踢掉其他设备、让我继续用"在语义上更准确
+/// ——他正在用的这台就是可信的证据。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn revoke_others_kills_every_session_but_the_current_one() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, _id) = make_plain_user(&app, &admin_tok, "revokeall").await;
+
+    let keep = activated_token(&app, &username, "Str0ng!Pass").await;
+    let dead1 = activated_token(&app, &username, "Str0ng!Pass").await;
+    let dead2 = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/sessions/revoke-others",
+            Some(&keep),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "吊销其他会话失败: {body}");
+    assert_eq!(body["data"]["revoked_count"], 2, "应踢掉两条: {body}");
+    assert_eq!(
+        body["data"]["remaining_sessions"], 1,
+        "当前这条必须留下: {body}"
+    );
+
+    // 其余两条都失效
+    for tok in [&dead1, &dead2] {
+        let (status, _) = send(&app, request("GET", "/api/auth/me", Some(tok), None)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "被踢的令牌必须失效");
+    }
+
+    // 当前这条仍然可用
+    let (status, body) = send(&app, request("GET", "/api/auth/me", Some(&keep), None)).await;
+    assert_eq!(status, StatusCode::OK, "当前会话不得被自己踢掉: {body}");
+}
+
+/// 没有其他会话时，「吊销其他全部」是空操作而不是报错
+///
+/// 返回 `revoked_count = 0` 让调用方能够区分"本来就没有其他会话"
+/// 与"踢掉了 N 台"——两者在剩余条数上都是 1，分不开。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn revoke_others_is_a_no_op_when_there_are_no_other_sessions() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, _id) = make_plain_user(&app, &admin_tok, "revokenone").await;
+
+    let only = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/sessions/revoke-others",
+            Some(&only),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["revoked_count"], 0,
+        "没有其他会话时该是 0: {body}"
+    );
+    assert_eq!(body["data"]["remaining_sessions"], 1, "{body}");
+
+    let (status, _) = send(&app, request("GET", "/api/auth/me", Some(&only), None)).await;
+    assert_eq!(status, StatusCode::OK, "当前会话不该受影响");
+}
+
+/// 自助会话端点**不在受限令牌白名单里**
+///
+/// 待改密的用户先改口令，与 `profile` / `profile/avatar` 同一原则。
+/// 白名单只放行 password / logout / me，加会话端点就等于允许一个
+/// 尚未确认凭据的会话去读会话列表、吊销其他设备。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_self_service_session_endpoints_are_not_reachable_with_a_restricted_token() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    // 管理员建号 → must_change_password = TRUE → 首次登录拿到受限令牌
+    let (username, _id) = make_plain_user(&app, &admin_tok, "sessstale").await;
+    // 用 `login_token` 而不是 `activated_token`：后者会清掉 must_change_password，
+    // 拿到的就不是受限令牌了，这个用例的前提会整个垮掉。
+    let stale = login_token(&app, &username, "Str0ng!Pass").await;
+
+    // 确认这确实是受限令牌：改资料应当被拒
+    let (status, _) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/profile",
+            Some(&stale),
+            Some(json!({ "display_name": "x" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "前提：这必须是受限令牌");
+
+    // 会话端点同样被拒
+    let (status, body) = send(
+        &app,
+        request("GET", "/api/auth/sessions", Some(&stale), None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "受限令牌不该读到会话列表: {body}"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/auth/sessions/revoke-others",
+            Some(&stale),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "受限令牌不该吊销任何会话: {body}"
+    );
+}
+
+/// 自助吊销会话必须落审计
+///
+/// "谁在何时踢掉了自己的哪台设备"与"管理员踢了谁"同样值得留痕：
+/// 账号被盗时，用户自助处置的时间线是判断损失范围的第一手依据。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_self_service_session_revocation_is_audited() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, _id) = make_plain_user(&app, &admin_tok, "sessaudit").await;
+
+    let t1 = activated_token(&app, &username, "Str0ng!Pass").await;
+    let _t2 = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let (_, body) = send(&app, request("GET", "/api/auth/sessions", Some(&t1), None)).await;
+    let other_jti = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["is_current"] == false)
+        .map(|s| s["jti"].as_str().unwrap().to_string())
+        .next()
+        .expect("应有一条非当前会话");
+
+    let (status, _) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/auth/sessions/{other_jti}/revoke"),
+            Some(&t1),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT path FROM audit_logs
+        WHERE path = '/api/auth/sessions' OR path LIKE '/api/auth/sessions/%'
+        ORDER BY created_at DESC LIMIT 1
+        "#,
+    )
+    .fetch_optional(&pool().await)
+    .await
+    .expect("查询审计失败");
+    assert!(row.is_some(), "自助吊销会话必须落审计");
+}
+
 #[tokio::test]
 #[ignore = "需要真实 Postgres + Redis"]
 async fn revoking_a_malformed_or_unknown_jti_is_refused() {

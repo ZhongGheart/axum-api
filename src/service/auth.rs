@@ -62,6 +62,20 @@ pub struct RevokedSession {
     pub remaining_sessions: usize,
 }
 
+/// 「吊销除当前外的全部会话」的结果
+///
+/// 与 [`RevokedSession`] 分开是因为两者要回答的问题不同：
+/// 单会话吊销要回"被吊销的是哪条令牌"，而这里要回"**踢掉了几台设备**"。
+/// 复用 `RevokedSession` 的话，`jti` 字段只能填 `keep_jti`（并不是被吊销的那条），
+/// 语义上是错的。
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct RevokedOthers {
+    /// 本次实际吊销的会话数（不含当前会话）
+    pub revoked_count: usize,
+    /// 剩余会话数（恒为 1，即当前会话）
+    pub remaining_sessions: usize,
+}
+
 /// 认证服务
 ///
 /// 组合 Repository 和 JWT 工具，提供完整的认证业务逻辑。
@@ -623,6 +637,60 @@ impl AuthService {
         Ok(RevokedSession {
             jti: record.jti,
             expires_at_ms: record.expires_at_ms,
+            remaining_sessions,
+        })
+    }
+
+    /// 吊销**除当前会话外**的全部会话
+    ///
+    /// 这是"账号可能被盗用"时最该有的一台开关：用户发现一台陌生设备，
+    /// 改密会吊销全部会话（含自己当前这条），而"只踢掉其他设备、
+    /// 让我继续用"在语义上更准确——他正在用的这台就是可信的证据。
+    ///
+    /// ── 为什么不能用 `revoke_user_sessions` ────────────────────
+    /// 后者写的是**整用户粒度**的时间戳（`user_revoked_before`），
+    /// 一次作废该用户**所有**在那个时刻之前签发的令牌，**包括当前这条**。
+    /// 用它来实现"保留当前会话"会得到一个自相矛盾的结果：
+    /// 调用成功的当下，这次请求的令牌就已经死了。
+    ///
+    /// 因此这里走 jti 黑名单，逐条跳过 `keep_jti`。
+    ///
+    /// ── 为什么返回被吊销的条数而不是剩余条数 ──────────────────
+    /// 调用方要回答的是"我踢掉了几台设备"。剩余条数在只剩当前会话时为 1，
+    /// 与"本来就没有其他会话"无法区分；被吊销条数则两种情况分别是 0 和 N。
+    pub async fn revoke_other_sessions(
+        &self,
+        redis_client: &RedisClient,
+        user_id: uuid::Uuid,
+        keep_jti: &str,
+    ) -> Result<RevokedOthers, AppError> {
+        let records = redis_client.list_sessions(user_id).await?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
+        let mut revoked = 0usize;
+        for record in &records {
+            if record.jti == keep_jti {
+                continue;
+            }
+            // 黑名单 TTL 用令牌**剩余**寿命，理由同 [`Self::revoke_session`]：
+            // 用配置值会让一条本该只再活 5 分钟的令牌在黑名单里躺满一整天。
+            let remaining = ((record.expires_at_ms - now_ms).max(0) as u64) / 1000 + 1;
+            redis_client
+                .add_token_to_blacklist(&record.jti, remaining)
+                .await?;
+            redis_client.remove_session(user_id, &record.jti).await?;
+            revoked += 1;
+        }
+
+        let remaining_sessions = redis_client.list_sessions(user_id).await?.len();
+
+        tracing::info!(
+            target: "service",
+            "吊销除当前外的全部会话: user_id={user_id}, 吊销={revoked}, 剩余={remaining_sessions}"
+        );
+
+        Ok(RevokedOthers {
+            revoked_count: revoked,
             remaining_sessions,
         })
     }

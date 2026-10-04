@@ -224,6 +224,21 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         // 头像上传。与 profile 一样刻意不在受限令牌白名单里：
         // 待改密的用户先改口令。
         .route("/api/auth/profile/avatar", post(auth::upload_avatar))
+        // 自助会话管理（v0.23.0）。
+        //
+        // `revoke-others` 这个静态段**必须**排在 `{jti}/revoke` 之前：
+        // 排后面的话 `revoke-others` 会被当成一个 jti 走进单会话吊销，
+        // 然后以"不是合法的 UUID"400——一个看起来像参数错误、
+        // 实际是路由根本没匹配上的响应。
+        .route("/api/auth/sessions", get(auth::my_sessions))
+        .route(
+            "/api/auth/sessions/revoke-others",
+            post(auth::revoke_my_other_sessions),
+        )
+        .route(
+            "/api/auth/sessions/{jti}/revoke",
+            post(auth::revoke_my_session),
+        )
         // 当前用户的导航菜单：前端据此动态生成路由与侧栏
         .route("/api/auth/menus", get(crate::controller::menu::my_menus))
         // 当前用户的权限码：前端 v-permission 据此判定按钮级权限
