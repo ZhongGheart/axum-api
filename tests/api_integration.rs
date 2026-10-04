@@ -14354,6 +14354,35 @@ async fn deleting_a_department_nulls_the_users_dept_id() {
     delete_user(&app, &admin, uid).await;
 }
 
+/// 补写的页面菜单必须同时补写 role_menus 授权
+///
+/// 这是 v0.24.0 实际踩到的坑：`backfill_late_added_menus` 只补写菜单，
+/// 不补写 `role_menus` 授权，导致菜单存在但 admin 看不到。
+///
+/// `find_tree_for_roles` 按 `role_menus` 查菜单树，没有授权，
+/// 菜单树里根本不会出现这个页面。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn backfilled_menus_are_also_authorized_to_admin() {
+    let app = app().await;
+    let admin = admin_token(&app).await;
+
+    // admin 的菜单树里必须有部门管理页面
+    let (status, body) = send(&app, request("GET", "/api/auth/menus", Some(&admin), None)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let menus = body["data"].as_array().expect("必须是数组");
+    // 递归查找：system/dept 是 /system 的子菜单
+    fn has_path(menus: &[serde_json::Value], path: &str) -> bool {
+        menus.iter().any(|m| {
+            m["path"].as_str() == Some(path)
+                || has_path(m["children"].as_array().unwrap_or(&vec![]), path)
+        })
+    }
+    let has_dept = has_path(menus, "/system/dept");
+    assert!(has_dept, "admin 的菜单树里必须有部门管理页面: {body}");
+}
+
 /// 关闭注册后，被拒的请求必须落审计
 ///
 /// 关闭注册后仍有人来撞注册口，与登录失败计数一样是"有人在试探"的证据。

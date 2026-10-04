@@ -6061,3 +6061,26 @@ fmt ✓ / clippy 0 warning / Rust 单测 114 / 集成 **197 passed 0 failed** /
 v0.24.0 是 B1 部门树，单独占一版。
 下一版按 ROADMAP 是 **v0.25.0 = C1 2FA**（单独占一版）。
 **约定：本地提交，不推送。**
+
+---
+
+## 2026-10-04 v0.24.0 修复：补写菜单时漏了 role_menus 授权
+
+**问题**：admin 用户登录后看不到部门管理菜单。
+
+**根因**：`backfill_late_added_menus` 只补写 `menus` 表，不补写 `role_menus` 授权。
+`find_tree_for_roles` 按 `role_menus` 查菜单树，没有授权，菜单树里根本不会出现这个页面。
+表现为"菜单存在但 admin 看不到"。
+
+**修复**：在 `backfill_late_added_menus` 里，补写菜单后同时补写 `role_menus` 授权给 admin 角色。
+与 `seed_menus_if_empty` 里的 `SEED_ADMIN_MENUS_SQL` 一致：admin 拥有全部菜单。
+`ON CONFLICT DO NOTHING` 保证幂等。
+
+**测试**：新增 `backfilled_menus_are_also_authorized_to_admin`，
+验证 admin 的菜单树里必须有部门管理页面（递归查找）。
+
+**教训**：补写菜单和补写授权是两件事，缺一不可。
+`seed_menus_if_empty` 里的 `SEED_MENUS_SQL` + `SEED_ADMIN_MENUS_SQL` + `SEED_USER_MENUS_SQL`
+三条 SQL 是一起执行的，而 `backfill_late_added_menus` 只补写了菜单，漏了授权。
+
+**门禁**：fmt / clippy 0 warning / 单测 114 / 集成 **198 passed 0 failed**。

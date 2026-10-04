@@ -301,6 +301,30 @@ impl RbacService {
             if inserted.is_some() {
                 tracing::info!("补写页面菜单: {path}");
             }
+
+            // 补写 role_menus 授权（admin 全量）
+            //
+            // ── 为什么需要这一步 ────────────────────────────
+            // 只补写菜单不够：`find_tree_for_roles` 按 role_menus 查菜单树，
+            // 没有 role_menus 授权，菜单树里根本不会出现这个页面，
+            // 表现为"菜单存在但 admin 看不到"。
+            //
+            // 与 `seed_menus_if_empty` 里的 `SEED_ADMIN_MENUS_SQL` 一致：
+            // admin 拥有全部菜单。`ON CONFLICT DO NOTHING` 保证幂等，
+            // 已存在的授权不会重复插入。
+            sqlx::query(
+                r#"
+                INSERT INTO role_menus (role_id, menu_id)
+                SELECT r.id, $1 FROM roles r WHERE r.name = 'admin'
+                ON CONFLICT (role_id, menu_id) DO NOTHING
+                "#,
+            )
+            .bind(Uuid::parse_str(id).expect("种子 UUID 必须合法"))
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| {
+                AppError::InternalServerError(format!("补写 role_menus 授权 {path} 失败: {e}"))
+            })?;
         }
         Ok(())
     }
