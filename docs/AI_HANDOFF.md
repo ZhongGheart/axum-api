@@ -5902,3 +5902,36 @@ fmt ✓ / clippy 0 warning / Rust 单测 **110** / 集成 **190 passed 0 failed*
 C2 ✅ + A1 ✅ + A2 ✅，**v0.23.0 三项全部完成**。
 下一版按 ROADMAP 是 **v0.24.0 = B1 部门树（单独占一版）**。
 **约定：本地提交，不推送。**
+
+---
+
+## 2026-10-04 功能缺口复核与 v0.24.0+ 开发计划（文档，无代码改动）
+
+**目标**：v0.23.0 完成后，基于实测重排后续开发计划。
+**起始 git 状态**：`a45a15f5 feat(v0.23.0): 并发会话上限`（工作区干净）。
+
+### 实测确认的剩余缺口
+
+| 缺口 | 证据 | 量级 |
+|---|---|---|
+| **B1 部门/组织树** | `dept|department|organization` 在 src/migrations/frontend 零命中 | **大** |
+| **C1 2FA/TOTP** | `totp|two_factor|2fa|qrcode` 零命中 | 中 |
+| **D1 审计明细结构化查询** | `audit_logs` 表有 `action`/`method`/`path`/`result`，但**无** `target_type`/`target_id`/`change_type`；`utils/audit.rs` 的 `diff_summary`/`permission_change` 能力已有且已接进 4 处 handler，但只产出人类可读字符串 | 中 |
+| **D2 对象存储抽象** | `upload.rs` 用 `tokio::fs` 写本地磁盘；`s3|oss|minio|aws_sdk` 零命中 | 中 |
+| **A3 自助改邮箱** | `smtp|lettre|sendgrid` 零命中（`email` 命中都是用户邮箱字段，不是发送通道） | 中（阻塞） |
+
+### 排期结论（已写入 ROADMAP 第 5 节）
+
+- **v0.24.0 = B1 部门树**（单独占一版）。当前最大缺口，
+  递归删除的父子循环、跨部门授权各需独立边界测试。
+- **v0.25.0 = C1 2FA**（单独占一版）。改变登录交互，与 B1 同时动会让回归定位变难。
+- **v0.26.0 = D1 审计结构化查询**。加结构化列 + 列表端点支持按 target 筛 + 存量回填。
+- **v0.27.0 = D2 对象存储抽象**。`Storage` trait + 本地/S3 双实现 + 配置切换。
+- **A3 自助改邮箱**：阻塞于邮件通道（需 SMTP = 增加部署前置条件），需单独决策。
+
+### 确认**不是**缺口（有意不做，别再排期）
+
+软删除/回收站、审计日志被篡改、i18n/WebSocket/数据备份。
+
+**改动文件**：仅 `docs/ROADMAP.md`（+ `docs/AI_HANDOFF.md` 本节）。无代码改动，未跑门禁。
+**约定**：本地提交，**不推送**。
