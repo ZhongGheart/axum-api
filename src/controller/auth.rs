@@ -10,8 +10,8 @@ use crate::middleware::audit_log::AuditDetail;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::client_ip::ClientIp;
 use crate::model::{
-    ApiResponse, ChangePasswordRequest, LoginRequest, LoginResponse, RegisterRequest,
-    UpdateProfileRequest, UserInfo,
+    ApiResponse, ChangePasswordRequest, ChangeType, LoginRequest, LoginResponse, RegisterRequest,
+    TargetType, UpdateProfileRequest, UserInfo,
 };
 use crate::router::AppState;
 use crate::utils::api_extractor::ApiJson;
@@ -110,10 +110,16 @@ pub async fn logout(
             auth_user.token_exp,
         )
         .await?;
-    audit.push(format!(
-        "登出：注销当前令牌（仅本次会话，其余并发会话不受影响），账号 \"{}\"",
-        auth_user.username
-    ));
+    audit.push_targeted(
+        format!(
+            "登出：注销当前令牌（仅本次会话，其余并发会话不受影响），账号 \"{}\"",
+            auth_user.username
+        ),
+        TargetType::User,
+        auth_user.user_id,
+        ChangeType::RevokeSession,
+        Some(auth_user.username.clone()),
+    );
     Ok(Json(ApiResponse::success("登出成功")))
 }
 
@@ -146,10 +152,16 @@ pub async fn change_password(
         .await?;
     // 记"改了什么"而不记新旧口令：旧口令本身是当前的凭据，
     // 新口令是改完后的凭据，两者写进长期表都是把当前有效的秘密再复制一份
-    audit.push(format!(
-        "自助修改口令并吊销该账号全部会话，账号 \"{}\"",
-        auth_user.username
-    ));
+    audit.push_targeted(
+        format!(
+            "自助修改口令并吊销该账号全部会话，账号 \"{}\"",
+            auth_user.username
+        ),
+        TargetType::User,
+        auth_user.user_id,
+        ChangeType::Update,
+        Some(auth_user.username.clone()),
+    );
     Ok(Json(ApiResponse::success("密码修改成功，请重新登录")))
 }
 
@@ -215,10 +227,13 @@ pub async fn update_profile(
     } else {
         changes.join("、")
     };
-    audit.push(format!(
-        "自助修改资料（{changed}），账号 \"{}\"",
-        auth_user.username
-    ));
+    audit.push_targeted(
+        format!("自助修改资料（{changed}），账号 \"{}\"", auth_user.username),
+        TargetType::User,
+        auth_user.user_id,
+        ChangeType::Update,
+        Some(auth_user.username.clone()),
+    );
 
     Ok(Json(ApiResponse::success(info)))
 }
@@ -348,12 +363,18 @@ pub async fn upload_avatar(
         }
     }
 
-    audit.push(format!(
-        "自助上传头像（{}，{} 字节），账号 \"{}\"",
-        saved.url,
-        bytes.len(),
-        auth_user.username
-    ));
+    audit.push_targeted(
+        format!(
+            "自助上传头像（{}，{} 字节），账号 \"{}\"",
+            saved.url,
+            bytes.len(),
+            auth_user.username
+        ),
+        TargetType::User,
+        auth_user.user_id,
+        ChangeType::Update,
+        Some(auth_user.username.clone()),
+    );
 
     Ok(Json(ApiResponse::success(AvatarUploadResponse {
         url: saved.url,
@@ -488,13 +509,19 @@ pub async fn revoke_my_session(
         .await?;
 
     let is_current = jti == auth_user.token_jti;
-    audit.push(format!(
-        "自助吊销{}会话（{}），剩余会话 {} 个，账号 \"{}\"",
-        if is_current { "当前" } else { "单个" },
-        jti.chars().take(8).collect::<String>() + "…",
-        result.remaining_sessions,
-        auth_user.username
-    ));
+    audit.push_targeted(
+        format!(
+            "自助吊销{}会话（{}），剩余会话 {} 个，账号 \"{}\"",
+            if is_current { "当前" } else { "单个" },
+            jti.chars().take(8).collect::<String>() + "…",
+            result.remaining_sessions,
+            auth_user.username
+        ),
+        TargetType::User,
+        auth_user.user_id,
+        ChangeType::RevokeSession,
+        Some(auth_user.username.clone()),
+    );
 
     Ok(Json(ApiResponse::success(result)))
 }
@@ -527,10 +554,16 @@ pub async fn revoke_my_other_sessions(
         .revoke_other_sessions(&state.redis_client, auth_user.user_id, &auth_user.token_jti)
         .await?;
 
-    audit.push(format!(
-        "自助吊销除当前外的全部会话，本次踢掉 {} 个，剩余 {} 个，账号 \"{}\"",
-        result.revoked_count, result.remaining_sessions, auth_user.username
-    ));
+    audit.push_targeted(
+        format!(
+            "自助吊销除当前外的全部会话，本次踢掉 {} 个，剩余 {} 个，账号 \"{}\"",
+            result.revoked_count, result.remaining_sessions, auth_user.username
+        ),
+        TargetType::User,
+        auth_user.user_id,
+        ChangeType::RevokeSession,
+        Some(auth_user.username.clone()),
+    );
 
     Ok(Json(ApiResponse::success(result)))
 }

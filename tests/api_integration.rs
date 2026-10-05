@@ -15520,3 +15520,700 @@ async fn revoking_own_sessions_is_audited_with_the_counts() {
         "一键吊销的审计必须记下踢掉几个、剩余几个: {result}"
     );
 }
+
+// ============================================================
+// v0.26.0 D1：审计明细结构化查询
+//
+// 此前审计只能按 `action` 模糊筛，答不出"谁改过 role:3 的权限"。
+// `audit_log_targets` 一行一个 target，`AuditDetail` 让 handler 显式声明。
+//
+// 这一节的测试盯三件**容易被做错**的事：
+// 1. 筛选真的按对象生效（旗舰问题："谁改过这个角色的权限"）
+// 2. **一次请求碰多个对象时一条都不丢**——这正是路线图里
+//    "给 audit_logs 加三列"方案会静默丢数据的地方
+// 3. 有多个 target 的审计行**只算一行**（EXISTS 而非 JOIN）
+// ============================================================
+
+/// 从一行审计里取出它的结构化对象，返回 `(target_type, target_id, target_key, change_type)`
+fn targets_of(row: &Value) -> Vec<(String, Option<String>, Option<String>, String)> {
+    row["targets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| {
+            (
+                t["target_type"].as_str().unwrap_or_default().to_string(),
+                t["target_id"].as_str().map(str::to_string),
+                t["target_key"].as_str().map(str::to_string),
+                t["change_type"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// 建一个目录 + 其下 N 个带权限码的按钮，返回 `(目录 id, [(按钮 id, 权限码)])`
+async fn mkbuttons(app: &Router, token: &str, n: usize) -> (uuid::Uuid, Vec<(uuid::Uuid, String)>) {
+    let (status, body) = send(
+        app,
+        request(
+            "POST",
+            "/api/admin/menus",
+            Some(token),
+            Some(json!({
+                "name": unique("v026_dir"),
+                "type": "directory",
+                "path": format!("/{}", unique("v026")),
+                "sort_order": 98
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "创建测试目录失败: {body}");
+    let dir = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    let mut buttons = Vec::new();
+    for _ in 0..n {
+        let code = format!("v026:perm:{}", &unique("c")[5..]);
+        let (status, body) = send(
+            app,
+            request(
+                "POST",
+                "/api/admin/menus",
+                Some(token),
+                Some(json!({
+                    "parent_id": dir,
+                    "name": unique("v026_btn"),
+                    "type": "button",
+                    "permission": code,
+                    "sort_order": 1
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "创建测试按钮失败: {body}");
+        let id = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+        buttons.push((id, code));
+    }
+    (dir, buttons)
+}
+
+/// 旗舰问题：**"谁改过这个角色的权限"现在能回答了**
+///
+/// 这是 v0.26.0 立项的原始动机。给角色授权是一次请求、动 N 个菜单，
+/// 结构化审计必须能按角色筛出来，也能按其中任一个菜单筛出来。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn audit_targets_answer_who_changed_a_roles_permissions() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let role_name = unique("v026_role");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+    let (_dir, buttons) = mkbuttons(&app, &token, 2).await;
+    let menu_ids: Vec<uuid::Uuid> = buttons.iter().map(|(id, _)| *id).collect();
+
+    let (status, body) = assign_menus(&app, &token, role_id, &menu_ids).await;
+    assert_eq!(status, StatusCode::OK, "给角色授权失败: {body}");
+
+    let grant_path = format!("PUT /api/admin/roles/{role_id}/menus");
+    let by_role = wait_for_logs(
+        &app,
+        &token,
+        &format!("target_type=role&target_id={role_id}&page_size=50"),
+        |b| {
+            b["data"]["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|r| r["action"] == grant_path.as_str()))
+        },
+    )
+    .await;
+
+    let grant_row = by_role["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["action"] == grant_path.as_str())
+        .expect("按角色筛必须能筛出这次授权");
+
+    let ts = targets_of(grant_row);
+    assert!(
+        ts.iter().any(|(t, id, _, c)| t == "role"
+            && id.as_deref() == Some(role_id.to_string().as_str())
+            && c == "grant"),
+        "这次授权必须声明 role/grant target: {ts:?}"
+    );
+    // 两个按钮都要在，一次请求碰了 N 个对象就不能只记第一个
+    for (menu_id, _) in &buttons {
+        assert!(
+            ts.iter().any(|(t, id, _, c)| t == "menu"
+                && id.as_deref() == Some(menu_id.to_string().as_str())
+                && c == "grant"),
+            "菜单 {menu_id} 的授权必须留 target，不能只记第一个: {ts:?}"
+        );
+    }
+
+    // 反向：按**其中一个菜单**也要能筛出同一次授权
+    let first_menu = buttons[0].0;
+    let by_menu = wait_for_logs(
+        &app,
+        &token,
+        &format!("target_type=menu&target_id={first_menu}&page_size=50"),
+        |b| {
+            b["data"]["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|r| r["action"] == grant_path.as_str()))
+        },
+    )
+    .await;
+    assert!(
+        by_menu["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["action"] == grant_path.as_str()),
+        "按菜单 {first_menu} 筛必须能筛出授权它的那次操作: {by_menu}"
+    );
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// **一次请求碰 N 个对象时，target 一条都不能丢**
+///
+/// 回归的是路线图原方案（给 `audit_logs` 加单列 `target_id`）的失败模式：
+/// 批量删除 3 个用户，单列只能存下其中一个，
+/// 于是"另外两个被谁删了"永远查不到，而且**没有任何报错**。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn every_user_of_a_bulk_delete_is_individually_findable() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let ids: Vec<uuid::Uuid> = {
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            let name = unique("v026_bulk");
+            v.push(mkuser(&app, &token, &name).await);
+        }
+        v
+    };
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users/batch-delete",
+            Some(&token),
+            Some(json!({ "ids": ids })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "批量删除失败: {body}");
+
+    for id in &ids {
+        let rows = wait_for_logs(
+            &app,
+            &token,
+            &format!("target_type=user&target_id={id}&page_size=50"),
+            |b| {
+                b["data"]["items"].as_array().is_some_and(|items| {
+                    items.iter().any(|r| {
+                        r["action"] == "POST /api/admin/users/batch-delete"
+                            && targets_of(r).iter().any(|(t, tid, _, c)| {
+                                t == "user"
+                                    && tid.as_deref() == Some(id.to_string().as_str())
+                                    && c == "delete"
+                            })
+                    })
+                })
+            },
+        )
+        .await;
+        assert!(
+            rows["data"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| targets_of(r)
+                    .iter()
+                    .any(|(t, tid, _, _)| t == "user"
+                        && tid.as_deref() == Some(id.to_string().as_str()))),
+            "批量删除里的每个用户都要能单独查到，漏了 {id}: {rows}"
+        );
+    }
+}
+
+/// 有多个 target 的审计行**只算一行**
+///
+/// 用 JOIN 过滤会让一行审计出现 N 次，于是 `total` 与去重后的实际行数对不上，
+/// 分页也会漏行——`total=8` 但翻到底只有 4 条。这里钉住 `EXISTS` 语义。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_audit_row_with_several_targets_is_counted_only_once() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let role_id = create_role_via_api(&app, &token, &unique("v026_multi")).await;
+    let (_dir, buttons) = mkbuttons(&app, &token, 3).await;
+    let menu_ids: Vec<uuid::Uuid> = buttons.iter().map(|(id, _)| *id).collect();
+
+    let (status, body) = assign_menus(&app, &token, role_id, &menu_ids).await;
+    assert_eq!(status, StatusCode::OK, "授权失败: {body}");
+
+    let grant_path = format!("PUT /api/admin/roles/{role_id}/menus");
+    let page = wait_for_logs(
+        &app,
+        &token,
+        &format!("target_type=role&target_id={role_id}&page_size=100"),
+        |b| {
+            b["data"]["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|r| r["action"] == grant_path.as_str()))
+        },
+    )
+    .await;
+
+    let items = page["data"]["items"].as_array().unwrap();
+    let total = page["data"]["total"].as_i64().unwrap();
+
+    // 这一行自己就带 4 个 target（1 角色 + 3 菜单），但它**只能出现一次**
+    let grant_rows: Vec<&Value> = items
+        .iter()
+        .filter(|r| r["action"] == grant_path.as_str())
+        .collect();
+    assert_eq!(
+        grant_rows.len(),
+        1,
+        "一次授权只能产出一行审计，重复说明用了 JOIN 而不是 EXISTS: {page}"
+    );
+    assert_eq!(
+        items.len() as i64,
+        total,
+        "total 必须等于实际行数（去重后），JOIN 会把 total 放大: {page}"
+    );
+
+    let ts = targets_of(grant_rows[0]);
+    assert_eq!(
+        ts.iter().filter(|(t, ..)| t == "menu").count(),
+        3,
+        "一行审计要挂住全部 3 个菜单 target: {ts:?}"
+    );
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 筛选值看不懂时必须 400，**不能静默查不到**
+///
+/// 静默忽略的表现是"这个对象没有审计记录"，用户会据此认定没人动过它。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_unreadable_target_type_filter_is_rejected() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    // 值必须先百分号编码：真实前端 query 里出现中文或空格是常事，
+    // 而裸的空格/非 ASCII 会在到达我们代码之前就被 http crate 判成非法 URI
+    // （InvalidUriChar），那样测的就不是我们的 400 而是 URI 解析器的。
+    for bad in ["rol", "drop%20table", "%E7%94%A8%E6%88%B7"] {
+        let (status, body) = query_logs(&app, &token, &format!("target_type={bad}")).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "看不懂的 target_type={bad:?} 必须 400 而不是查不到: {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("target_type"),
+            "错误信息要点名是哪个筛选值不合法: {body}"
+        );
+    }
+
+    // 大小写与下划线宽容：`Role` / `role` / `ROLE` 指同一类
+    for good in ["role", "Role", "ROLE", "dict-type"] {
+        let (status, body) = query_logs(&app, &token, &format!("target_type={good}")).await;
+        assert_eq!(status, StatusCode::OK, "{good:?} 应当被接受: {body}");
+    }
+}
+
+/// target 指向的行被删掉后，审计仍要查得到
+///
+/// `target_id` **故意不加外键**。这里把这点钉住：真加了外键，
+/// 删除类审计会因为"引用的行没了"而插不进去，或在删除时被级联清掉，
+/// 于是"删掉的是什么"这个唯一的信息来源自己消失了。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn an_audit_target_outlives_the_row_it_points_at() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let role_name = unique("v026_gone");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+
+    let (status, body) = delete_role(&app, &token, role_id).await;
+    assert_eq!(status, StatusCode::OK, "删除角色失败: {body}");
+
+    // 行已经不在了，这条审计必须还在，而且要能答出"删的是哪个角色"
+    let rows = wait_for_logs(
+        &app,
+        &token,
+        &format!("target_type=role&target_id={role_id}&page_size=50"),
+        |b| {
+            b["data"]["items"].as_array().is_some_and(|items| {
+                items.iter().any(|r| {
+                    r["action"] == format!("DELETE /api/admin/roles/{role_id}")
+                        && targets_of(r).iter().any(|(t, tid, _, c)| {
+                            t == "role"
+                                && tid.as_deref() == Some(role_id.to_string().as_str())
+                                && c == "delete"
+                        })
+                })
+            })
+        },
+    )
+    .await;
+    let row = rows["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["action"] == format!("DELETE /api/admin/roles/{role_id}"))
+        .unwrap();
+    let label = row["targets"][0]["target_label"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        label.contains(&role_name),
+        "目标行已删除，target_label 必须留得住名字（{role_name}），否则答不出删的是什么: {row}"
+    );
+}
+
+/// 导出也要能按「涉及对象」筛选（v0.26.0）
+///
+/// 导出与列表是两条独立的读路径，`push_filters` 写漏一处，
+/// 界面上筛对了、导出的却是全量——这和 v0.13.0 记的
+/// "界面上筛了半天、导出的却还是全量"是同一个坑，只是这次踩在结构化筛选上。
+///
+/// **断言写成"导出行数 == 同条件下列表返回的 total"，而不是"比全量少"。**
+///
+/// 第一版这里写的是 `matched < total`，缺陷注入时它**假通过**了：
+/// 导出端点自己也会写一条审计，于是"带筛选的那次请求"比"全量那次"恰好少一条
+/// 自己刚写下的记录，`6750 < 6751` 恒成立——筛没生效它照样绿。
+/// 一个恒真的断言比没有断言更糟，它让人以为这条路径已经被钉住了。
+///
+/// 现在的写法钉的是**两条读路径给出同一个数**：列表端点与导出端点各自独立
+/// 拼 SQL，只要有一个漏了 target 条件，两者就对不上。
+/// （不会有自记偏差：中间件在 handler 返回后才落审计，
+/// 两次查询看到的都是"对方那次请求尚未写入"的库状态。）
+///
+/// 不解 xlsx（dev-dependencies 里没有 zip 解包器），列内容由
+/// `utils::audit::targets_summary` 的单测守住。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn audit_export_honors_the_target_filter() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let role_name = unique("v026_exp");
+    let role_id = create_role_via_api(&app, &token, &role_name).await;
+    let (status, body) = delete_role(&app, &token, role_id).await;
+    assert_eq!(status, StatusCode::OK, "删除角色失败: {body}");
+
+    let filter = format!("target_type=role&target_id={role_id}");
+    // 先用列表端点确认这条筛选确实只命中极少量的行
+    let listed = wait_for_logs(&app, &token, &format!("{filter}&page_size=10"), |b| {
+        b["data"]["items"].as_array().is_some_and(|i| !i.is_empty())
+    })
+    .await;
+    let listed_total = listed["data"]["total"].as_u64().expect("列表应返回 total");
+    assert!(
+        listed_total >= 1,
+        "按刚删掉的角色筛，至少该有那一条: {listed_total}"
+    );
+    assert!(
+        listed_total < 100,
+        "这条筛选本该只命中那一两条，却命中了 {listed_total} 行——筛选本身就没生效， \
+         后面拿它做基准没有意义"
+    );
+
+    let exported = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/api/admin/logs/audit/export?{filter}"),
+            Some(&token),
+            None,
+        ))
+        .await
+        .expect("导出请求失败");
+    assert_eq!(exported.status(), StatusCode::OK, "导出应成功");
+    let exported_count: u64 = exported
+        .headers()
+        .get("x-export-row-count")
+        .and_then(|v| v.to_str().ok())
+        .expect("应回传 x-export-row-count")
+        .parse()
+        .expect("行数应为整数");
+
+    assert_eq!(
+        exported_count, listed_total,
+        "同一条筛选下，列表与导出必须给出同一个行数：导出少了 target 条件就会把全量导出来"
+    );
+}
+
+/// 系统参数**没有 UUID**，target 走字符串键
+///
+/// 参数主键就是参数名。硬塞一个假 UUID 会让"口令策略被谁改小了"
+/// 这条排查路径直接断掉——而它恰好是参数类审计最常被问的问题。
+///
+/// 刻意挑 `require_mixed_case` 这个布尔参数而不是 `session.max_concurrent`：
+/// 测试库是长期存在的共享库，改一个会话上限参数会让**之后所有用例**的
+/// admin 登录都被拦在门外（v0.26.0 开发时真的踩过一次，一批用例集体变红）。
+/// 布尔开关没有运行时副作用，且用完照样复原。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_setting_can_be_found_by_its_own_key() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let key = KEY_MIXED_CASE;
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/settings/{key}"),
+            Some(&token),
+            Some(json!({ "value": "true" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "改系统参数失败: {body}");
+
+    let rows = wait_for_logs(
+        &app,
+        &token,
+        &format!("target_type=setting&target_key={key}&page_size=50"),
+        |b| {
+            b["data"]["items"].as_array().is_some_and(|items| {
+                items.iter().any(|r| {
+                    r["action"] == format!("PUT /api/admin/settings/{key}")
+                        && targets_of(r).iter().any(|(t, _, tk, c)| {
+                            t == "setting" && tk.as_deref() == Some(key) && c == "update"
+                        })
+                })
+            })
+        },
+    )
+    .await;
+    assert!(
+        rows["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| targets_of(r)
+                .iter()
+                .any(|(_, _, tk, _)| tk.as_deref() == Some(key))),
+        "按参数名必须能查到改它的审计: {rows}"
+    );
+
+    // 复原共享测试库里的参数值，别让这条用例给后面的用例留残留
+    put_setting_raw(KEY_MIXED_CASE, "false", None).await;
+    flush_settings_cache().await;
+}
+
+/// 被拒绝的写操作**不留 target**
+///
+/// 与"不留变更摘要"是同一条门禁。若只门禁文本不门禁 target，
+/// 就会出现"没有摘要、却查得到这个对象被改过"的自相矛盾记录，
+/// 而矛盾记录比缺记录更难排查。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_rejected_write_records_no_targets() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let role_id = create_role_via_api(&app, &token, &unique("v026_rej")).await;
+
+    // 改名成内置角色名 → 400
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            &format!("/api/admin/roles/{role_id}"),
+            Some(&token),
+            Some(json!({ "name": "admin", "description": null })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "改名内置角色应被拒: {body}"
+    );
+
+    let rows = wait_for_logs(
+        &app,
+        &token,
+        &format!("target_type=role&target_id={role_id}&page_size=50"),
+        |b| !b["data"]["items"].as_array().unwrap_or(&vec![]).is_empty(),
+    )
+    .await;
+
+    // 只应有"新建角色"那一条，多出来的就是失败请求也记了 target
+    assert_eq!(
+        rows["data"]["items"].as_array().unwrap().len(),
+        1,
+        "被拒的改名不该留下 target（只该有先前新建那一条）: {rows}"
+    );
+
+    let _ = delete_role(&app, &token, role_id).await;
+}
+
+/// 字典类型删除会**级联**删掉字典项，每一项都要单独留 target
+///
+/// 级联删除的东西此前只以"其下字典项一并删除"七个字存在，
+/// 事后答不出"我用的那个字典值是不是被这次删掉了"。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn deleting_a_dict_type_records_every_cascaded_item() {
+    let app = app().await;
+    let token = admin_token(&app).await;
+
+    let code = unique("v026_dict");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/dict/types",
+            Some(&token),
+            Some(json!({ "name": "v0.26 结构化审计", "code": code })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "建字典类型失败: {body}");
+    let type_id = uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap();
+
+    let mut item_ids = Vec::new();
+    for i in 0..2 {
+        let (status, body) = send(
+            &app,
+            request(
+                "POST",
+                "/api/admin/dict/items",
+                Some(&token),
+                Some(json!({
+                    "dict_type_id": type_id,
+                    "label": format!("v026 项{i}"),
+                    "value": format!("v{i}"),
+                    "sort_order": i
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "建字典项失败: {body}");
+        item_ids.push(uuid::Uuid::parse_str(body["data"]["id"].as_str().unwrap()).unwrap());
+    }
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/dict/types/{type_id}"),
+            Some(&token),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "删除字典类型失败: {body}");
+
+    let del_path = format!("DELETE /api/admin/dict/types/{type_id}");
+    let rows = wait_for_logs(
+        &app,
+        &token,
+        &format!("target_type=dict_type&target_id={type_id}&page_size=50"),
+        |b| {
+            b["data"]["items"].as_array().is_some_and(|items| {
+                items.iter().any(|r| {
+                    r["action"] == del_path.as_str()
+                        && targets_of(r)
+                            .iter()
+                            .filter(|(t, ..)| t == "dict_item")
+                            .count()
+                            == 2
+                })
+            })
+        },
+    )
+    .await;
+
+    let row = rows["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["action"] == del_path.as_str())
+        .unwrap();
+    let ts = targets_of(row);
+    for id in &item_ids {
+        assert!(
+            ts.iter().any(|(t, tid, _, c)| t == "dict_item"
+                && tid.as_deref() == Some(id.to_string().as_str())
+                && c == "delete"),
+            "级联删掉的字典项 {id} 必须各自留 target: {ts:?}"
+        );
+    }
+}
+
+/// 静态自检：任何**裸** `audit.push(` 都必须写明"为什么不声明 target"
+///
+/// 其余写 handler 都用 `push_targeted` / `add_target`，
+/// 剩下的裸 `push` 属于"确实没改任何持久对象"的情形
+/// （清缓存、重置指标）。这里要求它们把理由写在附近，
+/// 否则将来新增一个裸 `push` 会静默绕过结构化覆盖，而没人会发现。
+#[test]
+fn every_bare_audit_push_explains_why_it_declares_no_target() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/controller");
+    let mut offenders = Vec::new();
+
+    for entry in std::fs::read_dir(&dir).expect("读不到 src/controller") {
+        let path = entry.expect("目录项读取失败").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("读不到 controller 源文件");
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            // 只认调用点，跳过定义与文档里的提及
+            if !trimmed.starts_with("audit.push(") {
+                continue;
+            }
+            // 往上找本次 push 的说明（最多 6 行），往下找紧随的注释
+            let window: String = lines[i.saturating_sub(6)..(i + 4).min(lines.len())].join("\n");
+            let justified = window.contains("不声明")
+                || window.contains("没有改动任何")
+                || window.contains("不是摆设");
+            // 「文本只写汇总、逐个对象交给紧随其后的 add_target」也是一种交代：
+            // 一次导入几百个用户时，把名字全堆进 result，这张长期表就没法看了。
+            //
+            // 但只认**代码里真的调用了** add_target，不认注释里的口头声称：
+            // 缺陷注入时删掉那个循环、留下一句"逐个声明"的注释，静态检查照样放行，
+            // 那这条检查就只是在数注释而不是在查事实。
+            let justified =
+                justified || (window.contains("逐个声明") && window.contains("add_target"));
+            if !justified {
+                offenders.push(format!(
+                    "{}:{}: {trimmed}",
+                    path.file_name().unwrap().to_string_lossy(),
+                    i + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "以下裸 audit.push 没有写明为何不声明结构化 target：\n  {}\n\
+         确实没改任何持久对象的话，请在附近注释里写明「不声明 target」及理由。",
+        offenders.join("\n  ")
+    );
+}

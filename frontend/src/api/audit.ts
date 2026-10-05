@@ -3,6 +3,50 @@
 import http from './index'
 import type { PageResult } from './types/response'
 
+/** 被操作对象的一类（v0.26.0） */
+export type AuditTargetType =
+  | 'user'
+  | 'role'
+  | 'menu'
+  | 'dict_type'
+  | 'dict_item'
+  | 'department'
+  | 'setting'
+  | 'user_two_factor'
+
+/** 变更类型（v0.26.0） */
+export type AuditChangeType =
+  | 'create'
+  | 'update'
+  | 'delete'
+  | 'grant'
+  | 'revoke'
+  | 'enable'
+  | 'disable'
+  | 'status'
+  | 'revoke_session'
+  | 'login'
+
+/**
+ * 一次操作涉及的**每一个**对象（v0.26.0）
+ *
+ * 是数组而不是单个字段：批量删除一次碰 N 个用户、删除角色连带撤销 N 个权限码。
+ * 存成单值就只能记下第一个，其余静默丢失——那会让"另外两个被谁删了"永远查不到，
+ * 而且没有任何报错。
+ *
+ * `target_id` 与 `target_key` 至少有一个非空：UUID 资源用 `target_id`，
+ * 字符串主键的资源（如系统参数 `security.password.min_length`）用 `target_key`。
+ * 后端**故意不加外键**，所以对象被删掉后 target 仍在，`target_label` 留得住名字。
+ */
+export interface AuditLogTarget {
+  target_type: AuditTargetType
+  target_id: string | null
+  target_key: string | null
+  change_type: AuditChangeType
+  /** 对象的可读名字。对象已删除时仍保留，因此能答出"删掉的是什么" */
+  target_label: string | null
+}
+
 export interface AuditLogItem {
   id: string
   user_id: string | null
@@ -16,6 +60,13 @@ export interface AuditLogItem {
   client_ip: string | null
   duration_ms: number | null
   created_at: string
+  /**
+   * 涉及的对象列表
+   *
+   * **空数组不代表"这次没改任何东西"**：v0.26.0 上线前的历史行一律是空的，
+   * 界面上要把这两种情况分开说，否则管理员会以为那段时间的操作没被记录。
+   */
+  targets: AuditLogTarget[]
 }
 
 /**
@@ -39,6 +90,12 @@ export interface AuditLogListParams {
   start_time?: string
   /** 结束时间（含），RFC3339 */
   end_time?: string
+  /** 对象类型，精确匹配。后端对看不懂的值返回 400 而不是"查不到" */
+  target_type?: string
+  /** 对象 UUID，精确匹配。批量操作涉及的每个对象都能单独查出来 */
+  target_id?: string
+  /** 对象字符串键（如系统参数名），精确匹配。与 `target_id` 二选一 */
+  target_key?: string
 }
 
 /**

@@ -7,7 +7,9 @@
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::model::{LoginRequest, LoginResponse, RegisterRequest, Role, UserInfo};
+use crate::model::{
+    ChangeType, LoginRequest, LoginResponse, RegisterRequest, Role, TargetType, UserInfo,
+};
 use crate::repository::audit_log::{AuditEntry, AuditLogRepository};
 use crate::repository::role::RoleRepository;
 use crate::repository::user::UserRepository;
@@ -153,9 +155,29 @@ impl AuthService {
     /// 那正是爆破的证据。写入失败会**覆盖**业务错误返回 500，
     /// 这是有意的取舍：审计不可用时不能假装"这次登录已被记录"。
     async fn audit(&self, a: AuthAudit<'_>) -> Result<(), AppError> {
-        let entry = AuditEntry::auth(a.action, "POST", a.path, a.status_code as i32, a.client_ip)
-            .with_identity(a.user_id, Some(a.username.to_string()))
-            .with_result(a.result);
+        let mut entry =
+            AuditEntry::auth(a.action, "POST", a.path, a.status_code as i32, a.client_ip)
+                .with_identity(a.user_id, Some(a.username.to_string()))
+                .with_result(a.result);
+        // 结构化对象（v0.26.0）：登录/注册不走审计中间件，只能在这里声明。
+        //
+        // **只有 `user_id` 已知时才声明**：登录失败时账号可能根本不存在
+        // （那正是爆破的证据），此时没有可指向的对象。
+        // 硬凑一个 target 只会让"这个账号的登录记录"里混进
+        // 指向不存在账号的假记录——而账号名已经记在 `username` 列里了。
+        if let Some(user_id) = a.user_id {
+            let change = if a.action == Self::ACTION_REGISTER {
+                ChangeType::Create
+            } else {
+                ChangeType::Login
+            };
+            entry = entry.with_target(
+                TargetType::User,
+                user_id,
+                change,
+                Some(a.username.to_string()),
+            );
+        }
         self.audit_repo.record(&entry).await
     }
 

@@ -389,6 +389,40 @@ impl MenuRepository {
         .map_err(|e| AppError::InternalServerError(format!("查询角色权限码失败: {e}")))
     }
 
+    /// 把一组权限码映射回持有它们的菜单 ID（v0.26.0 审计用）
+    ///
+    /// `assign_role_menus` 求差得到的是**权限码**（`system:user:list`），
+    /// 而结构化审计要记的是**菜单**（`target_type = 'menu'` + 菜单 UUID）。
+    /// 两者之间缺这一步就接不上。
+    ///
+    /// **一个码可能对应多个菜单**，因此返回的是 `Vec<(Uuid, String)>`：
+    /// 去重成"一个码一个菜单"会漏掉另一个同样声明了该码的按钮，
+    /// 而"谁动过这个按钮"恰恰是要回答的问题。
+    /// 找不到的码（菜单已被删除）**静默不出现在结果里**——
+    /// 此时那条 target 无法归属到任何现存菜单，但摘要文本里仍留着码名。
+    pub async fn find_menu_ids_by_permission_codes(
+        &self,
+        codes: &[String],
+    ) -> Result<Vec<(Uuid, String)>, AppError> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, (Uuid, String)>(
+            r#"
+            SELECT id, permission
+            FROM menus
+            WHERE permission = ANY($1)
+              AND type = 'button'
+            ORDER BY permission ASC, id ASC
+            "#,
+        )
+        .bind(codes)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("按权限码反查菜单失败: {e}")))?;
+        Ok(rows)
+    }
+
     /// 更新菜单
     ///
     /// `actor_id` 只用于权限码留痕：把某个码从按钮上清空时，

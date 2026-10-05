@@ -9,8 +9,8 @@ use crate::middleware::permission::{
     PermDictCreate, PermDictDelete, PermDictList, PermDictRefresh, PermDictUpdate,
 };
 use crate::model::{
-    ApiResponse, CreateDictItemRequest, CreateDictTypeRequest, DictCacheRefresh, DictItem,
-    DictItemResponse, DictType, DictTypeWithItems,
+    ApiResponse, ChangeType, CreateDictItemRequest, CreateDictTypeRequest, DictCacheRefresh,
+    DictItem, DictItemResponse, DictType, DictTypeWithItems, TargetType,
 };
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
@@ -58,7 +58,13 @@ pub async fn create_type(
         updated_at: chrono::Utc::now(),
     };
     let saved = state.dict_repo.create_type(&t).await?;
-    audit.push(format!("新建字典类型 \"{}\"（{}）", saved.code, saved.id));
+    audit.push_targeted(
+        format!("新建字典类型 \"{}\"（{}）", saved.code, saved.id),
+        TargetType::DictType,
+        saved.id,
+        ChangeType::Create,
+        Some(saved.code.clone()),
+    );
     Ok(Json(ApiResponse::success(saved)))
 }
 
@@ -84,12 +90,24 @@ pub async fn update_type(
     // `code` 是字典的业务主键：改掉之后前端按 code 取缓存就取到另一份数据，
     // 因此前后两个 code 都要留在审计里
     if before.code != saved.code {
-        audit.push(format!(
-            "字典类型 \"{}\"（{id}）的 code 改为 \"{}\"",
-            before.code, saved.code
-        ));
+        audit.push_targeted(
+            format!(
+                "字典类型 \"{}\"（{id}）的 code 改为 \"{}\"",
+                before.code, saved.code
+            ),
+            TargetType::DictType,
+            id,
+            ChangeType::Update,
+            Some(saved.code.clone()),
+        );
     } else {
-        audit.push(format!("更新字典类型 \"{}\"（{id}）", saved.code));
+        audit.push_targeted(
+            format!("更新字典类型 \"{}\"（{id}）", saved.code),
+            TargetType::DictType,
+            id,
+            ChangeType::Update,
+            Some(saved.code.clone()),
+        );
     }
     Ok(Json(ApiResponse::success(saved)))
 }
@@ -109,10 +127,38 @@ pub async fn delete_type(
     audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
-    // 删除会级联清掉该类型下的全部字典项，名字要在删之前取
+    // 删除会级联清掉该类型下的全部字典项，**每一条都要单独留 target**：
+    // 级联删掉的字典项在审计里此前只以"一并删除"四个字存在，
+    // 事后无法回答"我用的那个字典值（label=value）是不是被这次删掉了"。
+    // 名字也要在删之前取——删掉之后查不到了。
     let label = audit::dict_type_label(&state, id).await;
+    // 裸 code 也要在删之前取：删完再查就只剩 None 了。
+    // 查失败（不存在）就留空——那一列是锦上添花，摘要文本里仍有名字。
+    let type_code = state
+        .dict_repo
+        .find_type_by_id(id)
+        .await
+        .ok()
+        .map(|t| t.code);
+    let cascaded_items = state.dict_repo.list_items(id).await.unwrap_or_default();
     state.dict_repo.delete_type(id).await?;
-    audit.push(format!("删除{label}（{id}），其下字典项一并删除"));
+    audit.push_targeted(
+        format!("删除{label}（{id}），其下字典项一并删除"),
+        TargetType::DictType,
+        id,
+        ChangeType::Delete,
+        // 存裸 code 而不是 `label`（后者形如 `字典类型 "xxx"`）：
+        // 这一列在所有行里都是裸名字，带前缀会与其它列不一致
+        type_code,
+    );
+    for item in cascaded_items {
+        audit.add_target(
+            TargetType::DictItem,
+            item.id,
+            ChangeType::Delete,
+            Some(format!("{}={}", item.label, item.value)),
+        );
+    }
     Ok(Json(ApiResponse::success("删除成功")))
 }
 
@@ -192,10 +238,16 @@ pub async fn create_item(
         updated_at: chrono::Utc::now(),
     };
     let saved = state.dict_repo.create_item(&item).await?;
-    audit.push(format!(
-        "新建字典项 \"{}={}\"（{}），属于字典类型 {}",
-        saved.label, saved.value, saved.id, saved.dict_type_id
-    ));
+    audit.push_targeted(
+        format!(
+            "新建字典项 \"{}={}\"（{}），属于字典类型 {}",
+            saved.label, saved.value, saved.id, saved.dict_type_id
+        ),
+        TargetType::DictItem,
+        saved.id,
+        ChangeType::Create,
+        Some(format!("{}={}", saved.label, saved.value)),
+    );
     Ok(Json(ApiResponse::success(saved)))
 }
 
@@ -218,10 +270,16 @@ pub async fn update_item(
 ) -> Result<Json<ApiResponse<DictItem>>, AppError> {
     let before = state.dict_repo.find_item_by_id(id).await?;
     let saved = state.dict_repo.update_item(id, &req).await?;
-    audit.push(format!(
-        "字典项（{id}）由 \"{}={}\" 改为 \"{}={}\"",
-        before.label, before.value, saved.label, saved.value
-    ));
+    audit.push_targeted(
+        format!(
+            "字典项（{id}）由 \"{}={}\" 改为 \"{}={}\"",
+            before.label, before.value, saved.label, saved.value
+        ),
+        TargetType::DictItem,
+        id,
+        ChangeType::Update,
+        Some(format!("{}={}", saved.label, saved.value)),
+    );
     Ok(Json(ApiResponse::success(saved)))
 }
 
@@ -244,8 +302,22 @@ pub async fn delete_item(
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, AppError> {
     let label = audit::dict_item_label(&state, id).await;
+    // 裸 `label=value` 在删之前取，理由同 `delete_type`
+    let item_label = state
+        .dict_repo
+        .find_item_by_id(id)
+        .await
+        .ok()
+        .map(|i| format!("{}={}", i.label, i.value));
     state.dict_repo.delete_item(id).await?;
-    audit.push(format!("删除{label}（{id}）"));
+    audit.push_targeted(
+        format!("删除{label}（{id}）"),
+        TargetType::DictItem,
+        id,
+        ChangeType::Delete,
+        // 字典项行已消失，这一列是"删掉的是哪个值"的最后存档
+        item_label,
+    );
     Ok(Json(ApiResponse::success("删除成功")))
 }
 
@@ -303,6 +375,10 @@ pub async fn refresh_cache(
         reloaded_types += 1;
     }
 
+    // **不声明任何结构化 target**：这个端点只清 Redis 缓存并回填，
+    // 没有改动任何一条持久化的字典类型 / 字典项。硬给它挂一个 target
+    // 会让"这个字典项被改过"出现一条不成立的记录——
+    // 而缓存刷新与字典内容变更在事后追溯里是两回事。
     audit.push(format!(
         "清空字典缓存 {cleared_keys} 个键，回填 {reloaded_types} 个类型（跳过 {skipped_disabled_types} 个已禁用类型）"
     ));

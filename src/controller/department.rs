@@ -22,7 +22,7 @@ use crate::model::department::{
     CreateDepartmentRequest, DepartmentFlat, DepartmentNode, DepartmentUser, MoveDepartmentRequest,
     UpdateDepartmentRequest,
 };
-use crate::model::ApiResponse;
+use crate::model::{ApiResponse, ChangeType, TargetType};
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
 
@@ -81,13 +81,19 @@ pub async fn create_department(
     ApiJson(req): ApiJson<CreateDepartmentRequest>,
 ) -> Result<Json<ApiResponse<crate::model::department::Department>>, AppError> {
     let dept = state.department_service.create(&req).await?;
-    audit.push(format!(
-        "新建部门 \"{}\"（父部门 {}）",
-        dept.name,
-        dept.parent_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "无（根部门）".to_string())
-    ));
+    audit.push_targeted(
+        format!(
+            "新建部门 \"{}\"（父部门 {}）",
+            dept.name,
+            dept.parent_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "无（根部门）".to_string())
+        ),
+        TargetType::Department,
+        dept.id,
+        ChangeType::Create,
+        Some(dept.name.clone()),
+    );
     Ok(Json(ApiResponse::success(dept)))
 }
 
@@ -113,7 +119,13 @@ pub async fn update_department(
     ApiJson(req): ApiJson<UpdateDepartmentRequest>,
 ) -> Result<Json<ApiResponse<crate::model::department::Department>>, AppError> {
     let dept = state.department_service.update(id, &req).await?;
-    audit.push(format!("修改部门 \"{}\"", dept.name));
+    audit.push_targeted(
+        format!("修改部门 \"{}\"", dept.name),
+        TargetType::Department,
+        dept.id,
+        ChangeType::Update,
+        Some(dept.name.clone()),
+    );
     Ok(Json(ApiResponse::success(dept)))
 }
 
@@ -139,13 +151,19 @@ pub async fn move_department(
     ApiJson(req): ApiJson<MoveDepartmentRequest>,
 ) -> Result<Json<ApiResponse<crate::model::department::Department>>, AppError> {
     let dept = state.department_service.move_to(id, &req).await?;
-    audit.push(format!(
-        "移动部门 \"{}\" 到 {}",
-        dept.name,
-        dept.parent_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "根".to_string())
-    ));
+    audit.push_targeted(
+        format!(
+            "移动部门 \"{}\" 到 {}",
+            dept.name,
+            dept.parent_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "根".to_string())
+        ),
+        TargetType::Department,
+        dept.id,
+        ChangeType::Update,
+        Some(dept.name.clone()),
+    );
     Ok(Json(ApiResponse::success(dept)))
 }
 
@@ -168,8 +186,29 @@ pub async fn delete_department(
     audit: AuditDetail,
     ApiPath(id): ApiPath<Uuid>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
+    // 名字必须在删之前取。删完之后 `departments` 行没了，
+    // 审计里就只剩一个 UUID——"删掉的是哪个部门"再也答不出来。
+    // 这与 `utils/audit.rs` 文件头那条规矩是同一件事，
+    // 此前的实现漏了它，这里补上。
+    let name = state
+        .department_repo
+        .find_by_id(id)
+        .await
+        .ok()
+        .and_then(|d| d.map(|d| d.name));
     state.department_service.delete(id).await?;
-    audit.push(format!("删除部门 {id}"));
+    audit.push_targeted(
+        format!(
+            "删除部门 {id}{}",
+            name.as_deref()
+                .map(|n| format!("（\"{n}\")"))
+                .unwrap_or_default()
+        ),
+        TargetType::Department,
+        id,
+        ChangeType::Delete,
+        name,
+    );
     Ok(Json(ApiResponse::success("部门已删除".to_string())))
 }
 

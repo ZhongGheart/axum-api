@@ -7,7 +7,7 @@ use crate::error::AppError;
 use crate::middleware::audit_log::AuditDetail;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::permission::{PermSettingList, PermSettingUpdate};
-use crate::model::ApiResponse;
+use crate::model::{ApiResponse, ChangeType, TargetType};
 use crate::repository::setting::SettingView;
 use crate::router::AppState;
 use crate::utils::api_extractor::ApiJson;
@@ -93,10 +93,15 @@ pub async fn update_setting(
         .update(&key, &req.value, user.user_id)
         .await?;
 
-    audit.push(format!(
-        "修改系统参数 {key}：{old_value} → {}",
-        req.value.trim()
-    ));
+    audit.push_key_targeted(
+        format!("修改系统参数 {key}：{old_value} → {}", req.value.trim()),
+        TargetType::Setting,
+        &key,
+        ChangeType::Update,
+        // label 存参数名本身：参数行还在，但"改之前叫什么"没有意义，
+        // 参数名是它的身份
+        Some(key.to_string()),
+    );
 
     let saved = state
         .setting_service
@@ -131,7 +136,13 @@ pub async fn reset_setting(
         .ok_or_else(|| AppError::BadRequest(format!("没有名为 {key} 的系统参数")))?;
 
     state.setting_service.reset(&key, user.user_id).await?;
-    audit.push(format!("复位系统参数 {key} 为默认值 {}", def.default));
+    audit.push_key_targeted(
+        format!("复位系统参数 {key} 为默认值 {}", def.default),
+        TargetType::Setting,
+        &key,
+        ChangeType::Update,
+        Some(key.to_string()),
+    );
 
     let saved = state
         .setting_service
@@ -160,6 +171,8 @@ pub async fn refresh_cache(
     //（返回成功、Redis 里的键没动、读到的还是陈旧数据）。
     // 这里真的删掉缓存键，下一次读会回源查库。
     state.setting_service.repo().invalidate_cache().await?;
+    // **不声明 target**：只清 Redis 缓存，没有改动任何一条参数。
+    // 挂一个 `setting/update` 会让"这个参数被人改过"出现不成立的记录。
     audit.push("清理系统参数缓存".to_string());
     Ok(Json(ApiResponse::success("参数缓存已清理".to_string())))
 }

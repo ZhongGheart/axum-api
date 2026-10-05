@@ -192,6 +192,12 @@ pub struct AuditLogQuery {
     pub start_time: Option<chrono::DateTime<chrono::Utc>>,
     /// 结束时间（含），RFC3339
     pub end_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// 对象种类，如 `role` / `user` / `department`（v0.26.0）
+    pub target_type: Option<String>,
+    /// 被操作对象 ID；与 `target_type` 配对，也可单独使用（v0.26.0）
+    pub target_id: Option<uuid::Uuid>,
+    /// 被操作对象的字符串键（系统参数名，如 `security.password.min_length`）
+    pub target_key: Option<String>,
 }
 
 impl AuditLogQuery {
@@ -204,14 +210,35 @@ impl AuditLogQuery {
         }
     }
 
-    fn filter(&self) -> crate::repository::AuditLogFilter {
-        crate::repository::AuditLogFilter {
+    fn filter(&self) -> Result<crate::repository::AuditLogFilter, AppError> {
+        // `target_type` **必须校验而不是原样透传**：
+        // 透传的话一个拼错的值（如 `roles` 之外的 `Rol`）会进 SQL 查不到任何行，
+        // 表现是"这个对象没有审计记录"——而真相是筛选值本身就不合法。
+        // 那比报错危险：用户会据此认定没人动过它。
+        let target_type = match self.target_type.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(raw) => Some(
+                crate::model::TargetType::parse(raw)
+                    .ok_or_else(|| {
+                        AppError::BadRequest(format!(
+                            "target_type 不合法: {raw:?}（可用值：user / role / menu / dict_type \
+                     / dict_item / department / setting / user_two_factor）"
+                        ))
+                    })?
+                    .as_str()
+                    .to_string(),
+            ),
+        };
+        Ok(crate::repository::AuditLogFilter {
             username: self.username.clone(),
             action: self.action.clone(),
             status_code: self.status_code,
             start_time: self.start_time,
             end_time: self.end_time,
-        }
+            target_type,
+            target_id: self.target_id,
+            target_key: self.target_key.clone(),
+        })
     }
 }
 
@@ -236,8 +263,11 @@ pub async fn export_audit_logs(
     // 现在上限连同"是否真的被截断"一起回传（见响应头）。
     let (logs, truncated) = state
         .audit_log_repo
-        .fetch_for_export(&params.filter(), EXPORT_MAX_ROWS)
+        .fetch_for_export(&params.filter()?, EXPORT_MAX_ROWS)
         .await?;
+    // 导出也要带「涉及对象」，否则结构化数据只在一半读路径上可见。
+    // 复用仓储里同一个批量取法，不在导出路径上再写一份 N+1 的查询
+    let targets = state.audit_log_repo.targets_for(&logs).await?;
 
     let columns = vec![
         ExcelColumn {
@@ -261,6 +291,13 @@ pub async fn export_audit_logs(
             // 于是"改了什么"这一整层信息存进了库却没人读得到——
             // 审计日志是出事之后才有人看的东西，看不到就等于没记
             header: "变更摘要".into(),
+            width: 60.0,
+        },
+        ExcelColumn {
+            // v0.26.0：导出里必须有这一列，理由同 v0.13.0 加「变更摘要」。
+            // 只在界面表格里给、导出不给，等于"能看不能用"——
+            // 而出事之后拿审计做取证的人，要的往往正是导出的那份文件
+            header: "涉及对象".into(),
             width: 60.0,
         },
         ExcelColumn {
@@ -294,6 +331,9 @@ pub async fn export_audit_logs(
                     l.method.clone(),
                     l.path.clone(),
                     l.result.clone().unwrap_or_default(),
+                    crate::utils::audit::targets_summary(
+                        &targets.get(&l.id).cloned().unwrap_or_default(),
+                    ),
                     l.status_code.map(|s| s.to_string()).unwrap_or_default(),
                     l.client_ip.clone().unwrap_or_default(),
                     l.duration_ms.map(|d| d.to_string()).unwrap_or_default(),
@@ -424,18 +464,22 @@ pub async fn audit_log_retention(
         ("sort_by" = Option<String>, Query, description = "排序字段"),
         ("sort_order" = Option<String>, Query, description = "排序方向 asc/desc"),
     ),
-    responses((status = 200, description = "操作日志分页", body = ApiResponse<PaginatedResponse<crate::model::AuditLog>>))
+    params(
+        ("target_type" = Option<String>, Query, description = "对象种类，如 role/user/department"),
+        ("target_id" = Option<uuid::Uuid>, Query, description = "被操作对象 ID"),
+    ),
+    responses((status = 200, description = "操作日志分页", body = ApiResponse<PaginatedResponse<crate::model::AuditLogWithTargets>>))
 )]
 pub async fn list_audit_logs(
     State(state): State<AppState>,
     _perm: PermLogList,
     params: Result<Query<AuditLogQuery>, QueryRejection>,
-) -> Result<Json<ApiResponse<PaginatedResponse<crate::model::AuditLog>>>, AppError> {
+) -> Result<Json<ApiResponse<PaginatedResponse<crate::model::AuditLogWithTargets>>>, AppError> {
     // 显式接住拒绝，错误才走统一响应格式（见 `From<QueryRejection>`）
     let Query(params) = params?;
     let result = state
         .audit_log_repo
-        .paginate(&params.page_params(), &params.filter())
+        .paginate(&params.page_params(), &params.filter()?)
         .await?;
 
     Ok(Json(ApiResponse::success(result)))

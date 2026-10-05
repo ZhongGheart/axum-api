@@ -37,6 +37,24 @@ impl ExcelExport {
         columns: &[ExcelColumn],
         rows: &[Vec<String>],
     ) -> Result<(), AppError> {
+        // 单元格与表头都是**按索引**写入的，两者长度不一致时不会报错，
+        // 只会安静地产出一张参差的表：多出的单元格没有表头（取值读不出来），
+        // 少掉的则是一列数据直接消失。
+        //
+        // 对审计导出这类**取证用途**的文件，静默少一列是最坏的结果：
+        // 导出成功、行数正确、筛选也对，唯独缺了那唯一能回答问题的信息。
+        // 因此在动手写之前先拒绝这种调用。
+        for (idx, row) in rows.iter().enumerate() {
+            if row.len() != columns.len() {
+                return Err(AppError::InternalServerError(format!(
+                    "导出工作表 {sheet_name:?} 第 {} 行的单元格数({})与表头数({})不一致",
+                    idx + 1,
+                    row.len(),
+                    columns.len()
+                )));
+            }
+        }
+
         let sheet = self.workbook.add_worksheet();
         sheet.set_name(sheet_name)?;
 
@@ -101,4 +119,67 @@ fn urlencoding(s: &str) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cols(n: usize) -> Vec<ExcelColumn> {
+        (0..n)
+            .map(|i| ExcelColumn {
+                header: format!("列{i}"),
+                width: 10.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_row_with_a_missing_cell_is_rejected_instead_of_silently_dropping_a_column() {
+        // 这正是 v0.26.0 加「涉及对象」列时最容易踩的：
+        // 表头加了、行忘了加，导出照样"成功"，只是那一列永远没有值
+        let mut export = ExcelExport::new("t.xlsx");
+        let err = export
+            .add_sheet_from_rows("表", &cols(3), &[vec!["a".into(), "b".into()]])
+            .expect_err("少一个单元格必须报错");
+        assert!(
+            err.to_string().contains("不一致"),
+            "错误信息要点明是列数不一致: {err}"
+        );
+    }
+
+    #[test]
+    fn a_row_with_an_extra_cell_is_rejected_too() {
+        let mut export = ExcelExport::new("t.xlsx");
+        let err = export
+            .add_sheet_from_rows(
+                "表",
+                &cols(2),
+                &[vec!["a".into(), "b".into(), "多出来的".into()]],
+            )
+            .expect_err("多一个单元格必须报错");
+        assert!(err.to_string().contains("不一致"), "{err}");
+    }
+
+    #[test]
+    fn matching_lengths_still_write_the_sheet() {
+        // 加上这道校验后，得确认真正常见的调用没被误伤
+        let mut export = ExcelExport::new("t.xlsx");
+        export
+            .add_sheet_from_rows(
+                "表",
+                &cols(2),
+                &[vec!["a".into(), "b".into()], vec!["c".into(), "d".into()]],
+            )
+            .expect("长度一致应当成功");
+    }
+
+    #[test]
+    fn no_rows_at_all_is_fine() {
+        // 筛不到数据是导出最常见的正常情形，不能因此报错
+        let mut export = ExcelExport::new("t.xlsx");
+        export
+            .add_sheet_from_rows("表", &cols(2), &[])
+            .expect("零行应当成功");
+    }
 }

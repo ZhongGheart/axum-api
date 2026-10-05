@@ -3,6 +3,176 @@
 本文件是跨会话的交接日志。任何非平凡改动在**动手前**先写这里，达成里程碑后更新。
 接手者必须先把它与 `git status` / `git diff` / 实际文件系统对账。
 
+## v0.26.0 审计明细结构化查询 D1（2026-10-05 会话 · ✅ 已完成，已本地提交未推送）
+
+### 当前目标
+
+用户指令：**按计划继续后续的开发**。ROADMAP 定的下一版是
+**v0.26.0 = D1 审计明细结构化查询**，目标是让审计能回答
+"谁改过 role:3 的权限"——此前只能按 `action` 模糊筛，答不出来。
+
+### 起始 git 状态
+
+- 分支 `master`，工作区干净，`HEAD == ac2b2323`，与 origin/master 同步
+- `ac2b2323` 是修 CI clippy 1.99 的提交，run `37209004038` 全绿
+- 本地 Rust 已是全局默认 1.99.0（`rustup default 1.99.0`）
+- **本地 `v0.25.0` tag 尚未推送**，且指向 `41ded0a9`（比 master 落后一个提交）——本轮未处理
+
+### 三处对 ROADMAP 的偏离（都有实测依据，不是随手改）
+
+1. **用子表 `audit_log_targets`，不用 `audit_logs` 加三列**
+   ROADMAP 的单列方案假设"一次请求只碰一个对象"，实际不成立：批量删/导入用户
+   一次碰 N 个、删角色连带撤销 N 个权限码、改菜单一个请求 3 条摘要。
+   单列只能存第一个（静默截断）或存逗号拼接串（UUID 无法建索引）——
+   两者都是本仓反复批驳的失败模式（见 `repository/audit_log.rs`
+   `fetch_for_export` 的"静默截断比报错更糟"注释）。
+   改为一行一个 target，索引 `(target_type, target_id)`，筛选走 `EXISTS`。
+
+2. **不做存量回填**
+   ROADMAP 写"从 `result` 解析回填存量行"，实测后放弃：
+   - `为用户 "X" 追加角色 "Y"（<uuid>）` 里那个 UUID 是**用户**的，按"取最后一个 UUID"回填会张冠李戴
+   - 大量摘要不含 UUID：`批量导入用户：共 6 行…` 只列用户名；`自助吊销单个会话（d6d2c2a2…）` 只有 8 位前缀
+   - `change_type` 无法从中文文本可靠反解（`更新用户`/`停用用户`/`重置用户口令` 语义难分）
+
+   理由已写进迁移文件注释。核心判断：**错误的结构化数据比没有结构化数据更危险**——
+   它看起来可信、会被直接引用，而答案是错的。
+
+3. **`target_id` 可空 + 新增 `target_key`**
+   系统参数（`security.password.min_length`）主键是字符串没有 UUID。
+   硬塞假 UUID 会让"按参数名查审计"直接断掉，而那恰好是排查
+   "口令策略被谁改小了"的唯一入口。
+   故 `target_id UUID NULL` + `target_key VARCHAR(200)`，CHECK 至少一个非空，
+   去重改用表达式唯一索引 `COALESCE(target_id::text, target_key)`
+   （主键列不允许 NULL，且 NULL != NULL 会让唯一约束失效）。
+
+### 已完成的后端改动
+
+**新增**
+
+- `migrations/020_audit_log_targets.sql` — 子表 + 4 索引 + CHECK + 注释。已在测试库手工验证：建表通过、CHECK 拦下双空行、UUID 与字符串键两种去重都生效
+- `TargetType` / `ChangeType` 枚举（`src/model/audit_log.rs`）— 收敛成枚举而非任意字符串，理由是会进索引列，`"User"` 与 `"user"` 指同一类却互相查不到。`parse()` 大小写与下划线宽容，解析不了返回 `None` 让 controller 回 400
+
+**改动**
+
+- `src/middleware/audit_log.rs` — `AuditDetail` 增加并行 target 累加器；新增 `push_targeted()` / `add_target()` / `add_key_target()` / `push_key_targeted()`；去重按 `(type, id, key, change)`；中间件 INSERT 改 `RETURNING id` 后逐条写 target；**非 2xx 门禁同时作用于文本与 target**
+- `src/repository/audit_log.rs` — `AuditEntry.targets` + `with_target()`；`AuditLogFilter` 加三个字段；`push_filters` 三个 `EXISTS` 子查询；`paginate` 返回 `AuditLogWithTargets` 并**批量**取 target（一次查询而非每行一次）
+- `src/repository/menu.rs` — `find_menu_ids_by_permission_codes()`，权限码映射回菜单 ID（一个码可对应多个按钮，**故意不去重**）
+- `src/utils/audit.rs` — 抽出 `diff_sets()`，`diff_summary` 改为复用它，保证文本与结构化不会漂移
+- `src/controller/demo.rs` — `AuditLogQuery` 加三个参数；`filter()` 改返回 `Result`，`target_type` 校验失败回 400（透传会让拼错的值"查不到"，用户误以为没人动过）
+- 41 个 push 点补结构化 target，跨 8 个 controller：`menu.rs`(7) / `role.rs`(5) / `user.rs`(10) / `dict.rs`(8) / `department.rs`(4) / `two_factor.rs`(4) / `setting.rs`(3) / `auth.rs`(6)
+- `src/service/auth.rs` — 登录/注册走 `AuditEntry` 同步写路径，在 `audit()` 里补 target；**只有 `user_id` 已知时才声明**（登录失败时账号可能不存在，那正是爆破证据，硬凑会指向不存在的假记录）
+
+**三处刻意的「不声明 target」**（都有注释，不是遗漏）
+
+- `dict.rs` 清缓存、`setting.rs` 清缓存、`monitor.rs` 重置指标 — 只动 Redis / 进程内计数器，没改任何持久对象
+- `delete_role` 不给被撤销权限码对应的菜单记 `menu/revoke` — 菜单还在、别的角色也还持有同一个码，"这个角色不再授予它"与"这个按钮的权限被撤了"是两回事，记了会产生不成立的正面命中。对照：`assign_role_menus` 里记 `menu/revoke` 是对的，因为那里的操作本身就是撤授权
+- `assign_role_menus` 无变化时不声明任何 target（防假阳性）；`dry_run` 导入不声明（没建号）
+
+**顺带修的真缺陷**
+
+- `delete_department` 原本只记 UUID，部门名随行删除永久丢失。现在删前取名，补进摘要与 `target_label`
+- `update_user` 的角色变更现在逐个解析角色名→ID 记 `Role` target（多几次查询，注释里说明了这笔开销换来了什么）
+
+### 测试（9 个，全部绿）
+
+- `audit_targets_answer_who_changed_a_roles_permissions` — 旗舰问题，按角色筛与按菜单筛双向验证
+- `every_user_of_a_bulk_delete_is_individually_findable` — **回归单列方案失败模式**：批量删 3 个用户，每个都要能单独查到
+- `an_audit_row_with_several_targets_is_counted_only_once` — 钉住 `EXISTS` 语义：一次授权出 1 行、挂 4 个 target，`items.len() == total`
+- `an_unreadable_target_type_filter_is_rejected` — 400 且信息点名；`Role`/`ROLE`/`dict-type` 宽容
+- `an_audit_target_outlives_the_row_it_points_at` — 删掉角色后审计仍在且 `target_label` 留得住名字（钉住"不加外键"）
+- `a_setting_can_be_found_by_its_own_key` — 按参数名查
+- `a_rejected_write_records_no_targets` — 被拒的改名不留 target
+- `deleting_a_dict_type_records_every_cascaded_item` — 级联删的每个字典项各自留 target
+- `every_bare_audit_push_explains_why_it_declares_no_target` — 静态自检，扫 `src/controller/*.rs` 的裸 `audit.push(`
+
+### 过程中踩到并已修的两个坑（都值得记住）
+
+**1. 新测试污染共享测试库，把后续用例全带崩。**
+`a_setting_can_be_found_by_its_own_key` 原本改 `security.session.max_concurrent = 7` 却没还原，
+于是**之后所有用例的 admin 登录都被 403 拦在门外**，8 个用例集体变红，
+而报错信息（"该账号已在 7 个设备上登录"）完全指不到真凶。
+改用无运行时副作用的布尔参数 `security.password.require_mixed_case`，并用完 `put_setting_raw` + `flush_settings_cache` 复原。
+**教训：共享长寿命测试库里，任何写系统参数/全局配置的用例都必须复原。**
+
+**2. 静态自检只数注释、不查事实。**
+第一次缺陷注入删掉批量删除的 `add_target` 循环，`every_user_of_a_bulk_delete...` 如期变红，
+但 `every_bare_audit_push...` 仍**绿**——因为"逐个声明"那句注释还在。
+注释声称有、代码里没有，正是静态检查最该拦的情况。
+已收紧为：`window.contains("逐个声明") && window.contains("add_target")`——
+只认代码里真的调用了 `add_target`，不认口头声称。重新注入后如期变红。
+
+### 缺陷注入验证（已做，双向）
+
+| 注入 | 期望变红的测试 | 结果 |
+|---|---|---|
+| 删掉批量删除的 `add_target` 循环（留注释） | `every_user_of_a_bulk_delete_is_individually_findable` | ✅ FAILED |
+| 同上 | `every_bare_audit_push_explains_why...`（收紧后） | ✅ FAILED |
+| 还原 | 两个都 | ✅ ok |
+
+### 后续补充完成的部分（同一会话内接续做掉）
+
+**前端**
+
+- `src/api/audit.ts` — `AuditLogTarget` / `AuditTargetType` / `AuditChangeType` 类型 + 三个筛选参数
+- `src/utils/auditTargets.ts`（新）+ `__tests__/auditTargets.spec.ts`（12 个）— 中文名映射、
+  变更类型配色、整列文案。**文案放在 util 而非 SFC**，理由同 `auditRetention.ts`：
+  这类判定会骗人，放 SFC 里只能靠截图验，而截图看不出"空列表该显示什么"
+- `src/views/system/log/index.vue` — 对象类型下拉 + 对象ID + 参数名三个筛选控件、
+  「涉及对象」列（逐个渲染成标签，批量操作动辄十几个对象，拼成一行会挤成一坨）。
+  **历史行 `targets` 为空数组时显示"该记录早于结构化上线"**，不是空白也不是破折号
+
+**导出补列**（原本只在界面表格里有，等于"能看不能用"）
+
+- `utils/export.rs` 的 `targets_summary()` + 导出 Excel 新增「涉及对象」列
+- `repository/audit_log.rs` 的 `targets_for` 改为 `pub`（导出路径复用同一批量查询，不写第二份 N+1）
+- `demo.rs` 导出路径 `params.filter()?` 之后补一次 `targets_for(&logs)`
+
+**顺带修掉一个会静默丢列的缺陷**
+
+`add_sheet_from_rows` 按索引写表头与单元格，长度不一致**不报错**，
+只会安静地产出一张参差的表。对取证用途的文件，静默少一列是最坏结果
+（导出成功、行数正确、筛选也对，唯独缺了那唯一能回答问题的信息）。
+现在写入前先拒绝，4 个单测覆盖（少一格 / 多一格 / 一致 / 零行）。
+
+**又一条测试自己暴露的假通过**
+
+新写的 `audit_export_honors_the_target_filter` 第一版断言是
+「筛选后行数 < 全量行数」，缺陷注入时**假通过**了——导出端点自己也会写一条审计，
+于是带筛选的那次请求恰好比全量那次少一条自己刚写下的记录，
+`6750 < 6751` 恒成立，筛没生效它照样绿。
+改成钉「同一条筛选下，列表与导出必须给出同一个行数」（两条读路径各自拼 SQL，
+漏一个就对不上），注入后如期变红（6755 vs 1）。
+**一个恒真的断言比没有断言更糟，它让人以为这条路径已经被钉住了。**
+
+### 门禁（v0.26.0 定稿）
+
+| 门禁 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | ✅ |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings`（rustc 1.99.0） | ✅ 0 告警 |
+| `cargo test --locked --lib` | ✅ 139 |
+| `cargo test --locked --test api_integration -- --ignored --test-threads=1` | ✅ 223（290s） |
+| 前端 `vue-tsc --noEmit` | ✅ |
+| 前端 `eslint` | ✅ |
+| 前端 `vitest run` | ✅ 25 文件 / 237 用例 |
+| 前端 `npm run build` | ✅ |
+
+### 提交状态
+
+- 版号 `0.26.0`（`Cargo.toml` / `frontend/package.json`）+ `Cargo.lock` 已同步
+- CHANGELOG / README / ROADMAP / AI_HANDOFF 都已更新
+- **本地已提交，未推送、未打 tag**，等明确指令
+- **遗留**：本地 `v0.25.0` tag 仍未推送，且指向 `41ded0a9`（比 master 落后）
+- **下一版**：v0.27.0 = D2 对象存储抽象（见 ROADMAP 第 7 节）
+
+### 硬约束
+
+- 本地提交**不推送**，不擅自打 tag
+- 编辑用 `apply_patch`，长补丁易失败 → 拆小段或用 python 精确替换
+- 集成测试 `eval "$(./scripts/test_env.sh env)"`（不是 `/tmp/axum_dev.env`）
+- 不要重复起多个 cargo：曾因 build lock 互相阻塞，先 `pgrep -fl 'cargo test'`
+- 工具参数陷阱：本会话 `yield_time_ms` / `max_output_tokens` / `session_id` 等数字参数反复被强制转成浮点然后被拒 → 省略这些参数，或把长命令输出重定向到 `/tmp/*.log` 再单独读
+
 ## CI 失败排查：Rust 1.99 的 clippy 告警（2026-10-04 会话 · ✅ 已修，未推送）
 
 ### 结论先说

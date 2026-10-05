@@ -22,7 +22,9 @@ use crate::middleware::permission::{
     ensure_can_grant_roles, PermSessionManage, PermUserCreate, PermUserDelete, PermUserList,
     PermUserUnlock, PermUserUpdate,
 };
-use crate::model::{normalize_role_name, ApiResponse, UserInfo, ADMIN_ROLE};
+use crate::model::{
+    normalize_role_name, ApiResponse, ChangeType, TargetType, UserInfo, ADMIN_ROLE,
+};
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
 use crate::utils::audit;
@@ -344,12 +346,18 @@ pub async fn create_user(
         .await?;
 
     // 只记用户名与角色，**绝不记口令**——哪怕是管理员代设的那一份
-    audit.push(format!(
-        "新建用户 \"{}\"（{}），角色：{}",
-        user.username,
+    audit.push_targeted(
+        format!(
+            "新建用户 \"{}\"（{}），角色：{}",
+            user.username,
+            user.id,
+            audit::roles_list(&roles)
+        ),
+        TargetType::User,
         user.id,
-        audit::roles_list(&roles)
-    ));
+        ChangeType::Create,
+        Some(user.username.clone()),
+    );
     tracing::info!(
         "管理员创建用户: {} (角色: {})",
         user.username,
@@ -433,6 +441,19 @@ pub async fn update_user(
             .await?;
         let diff = audit::diff_summary(&current_roles, &new_roles, "追加角色", "移除角色");
         facts.push(format!("角色变更（{diff}）"));
+        // 结构化侧逐个声明角色（v0.26.0）：入参只有角色名，
+        // 要按 ID 筛就得每个名字查一次。一次改动的角色数通常是个位数，
+        // 这个查询量可以接受；换来的是"这个角色被从谁身上拿走过"能直接筛出来。
+        let (added_roles, removed_roles) = audit::diff_sets(&current_roles, &new_roles);
+        for (name, change) in added_roles
+            .iter()
+            .map(|r| (r, ChangeType::Grant))
+            .chain(removed_roles.iter().map(|r| (r, ChangeType::Revoke)))
+        {
+            if let Ok(Some(role)) = state.auth_service.role_repo.find_by_name(name).await {
+                audit.add_target(TargetType::Role, role.id, change, Some(role.name));
+            }
+        }
     }
     if updated.is_active != before_active {
         let to = if updated.is_active {
@@ -443,13 +464,25 @@ pub async fn update_user(
         facts.push(format!("状态改为{to}"));
     }
     if !facts.is_empty() {
-        audit.push(format!(
-            "更新用户 \"{}\"（{id}）：{}",
-            updated.username,
-            facts.join("；")
-        ));
+        audit.push_targeted(
+            format!(
+                "更新用户 \"{}\"（{id}）：{}",
+                updated.username,
+                facts.join("；")
+            ),
+            TargetType::User,
+            id,
+            ChangeType::Update,
+            Some(updated.username.clone()),
+        );
     } else {
-        audit.push(format!("更新用户 \"{}\"（{id}）", updated.username));
+        audit.push_targeted(
+            format!("更新用户 \"{}\"（{id}）", updated.username),
+            TargetType::User,
+            id,
+            ChangeType::Update,
+            Some(updated.username.clone()),
+        );
     }
 
     tracing::info!(
@@ -506,11 +539,17 @@ pub async fn delete_user(
 
     // 用户名与角色一起记：行删掉后 `user_roles` 也被级联清空，
     // 只留 UUID 的话，"删掉的是哪个账号、它原本是什么权限"都答不出来
-    audit.push(format!(
-        "删除用户 \"{}\"（{id}），原角色：{}",
-        user.username,
-        audit::roles_list(&roles)
-    ));
+    audit.push_targeted(
+        format!(
+            "删除用户 \"{}\"（{id}），原角色：{}",
+            user.username,
+            audit::roles_list(&roles)
+        ),
+        TargetType::User,
+        id,
+        ChangeType::Delete,
+        Some(user.username.clone()),
+    );
     tracing::info!("管理员删除用户: {} ({})", user.username, id);
     Ok(Json(ApiResponse::success("删除成功")))
 }
@@ -589,6 +628,15 @@ pub async fn batch_delete_users(
         .collect::<Vec<_>>()
         .join("、");
     audit.push(format!("批量删除 {} 个用户：{names}", targets.len()));
+    // 逐个声明，`targets` 里就是这次真删掉的那些 `(id, name)`
+    for (id, name) in &targets {
+        audit.add_target(
+            TargetType::User,
+            *id,
+            ChangeType::Delete,
+            Some(name.clone()),
+        );
+    }
     Ok(Json(ApiResponse::success("批量删除成功")))
 }
 
@@ -633,10 +681,18 @@ pub async fn unlock_user(
     // 记录**清掉了多少次**，而不只是"调用了解锁"。
     // 解锁是一次"我确认这个人是本人"的判断，低频但高价值，
     // 事后要能回答"当时到底解了几个桶"。
-    audit.push(format!(
-        "解锁账号 \"{}\"：清除登录失败计数 {} 次（涉及 {} 个计数桶：用户名 / 邮箱）",
-        result.username, result.cleared_failures, result.scopes_cleared
-    ));
+    audit.push_targeted(
+        format!(
+            "解锁账号 \"{}\"：清除登录失败计数 {} 次（涉及 {} 个计数桶：用户名 / 邮箱）",
+            result.username, result.cleared_failures, result.scopes_cleared
+        ),
+        TargetType::User,
+        // 解锁的是**这个账号的锁定状态**，记 `status` 而不是 `update`：
+        // "这个账号什么时候被解锁过"要用状态类变更来查
+        id,
+        ChangeType::Status,
+        Some(result.username.clone()),
+    );
 
     Ok(Json(ApiResponse::success(result)))
 }
@@ -720,13 +776,19 @@ pub async fn revoke_user_session(
         .revoke_session(&state.redis_client, id, &jti)
         .await?;
 
-    audit.push(format!(
-        "吊销账号 \"{}\" 的单个会话（{}，登录 IP {}），剩余会话 {} 个",
-        user.username,
-        jti.chars().take(8).collect::<String>() + "…",
-        "见在线会话列表",
-        result.remaining_sessions
-    ));
+    audit.push_targeted(
+        format!(
+            "吊销账号 \"{}\" 的单个会话（{}，登录 IP {}），剩余会话 {} 个",
+            user.username,
+            jti.chars().take(8).collect::<String>() + "…",
+            "见在线会话列表",
+            result.remaining_sessions
+        ),
+        TargetType::User,
+        user.id,
+        ChangeType::RevokeSession,
+        Some(user.username.clone()),
+    );
 
     let _ = perm;
     Ok(Json(ApiResponse::success(result)))
@@ -796,11 +858,17 @@ pub async fn toggle_user_status(
     } else {
         "停用"
     };
-    audit.push(format!(
-        "用户 \"{}\"（{id}）状态由{was}改为{now}，角色：{}",
-        user.username,
-        audit::roles_list(&roles)
-    ));
+    audit.push_targeted(
+        format!(
+            "用户 \"{}\"（{id}）状态由{was}改为{now}，角色：{}",
+            user.username,
+            audit::roles_list(&roles)
+        ),
+        TargetType::User,
+        id,
+        ChangeType::Status,
+        Some(user.username.clone()),
+    );
     Ok(Json(ApiResponse::success(UserInfo::new(updated, roles))))
 }
 
@@ -872,10 +940,16 @@ pub async fn reset_user_password(
     // 只记"重置了谁的口令"，**新口令一个字都不记**。
     // 这是全库风险最高的写操作（拿到新口令即等于登录成该账号），
     // 也正因如此审计里绝不能出现口令本身
-    audit.push(format!(
-        "重置用户 \"{}\"（{id}）的口令，已强制其下次登录改密并吊销全部会话",
-        user.username
-    ));
+    audit.push_targeted(
+        format!(
+            "重置用户 \"{}\"（{id}）的口令，已强制其下次登录改密并吊销全部会话",
+            user.username
+        ),
+        TargetType::User,
+        id,
+        ChangeType::Update,
+        Some(user.username.clone()),
+    );
     tracing::info!("管理员重置用户密码并吊销会话: {}", user.username);
     Ok(Json(ApiResponse::success("密码重置成功")))
 }
@@ -997,6 +1071,10 @@ pub async fn import_users(
 
     let mut created = 0usize;
     let mut created_usernames: Vec<String> = Vec::new();
+    // 落库的 `(id, username)`，供结构化审计逐个声明 target（v0.26.0）。
+    // `dry_run` 分支只动 `created_usernames`、不碰它——试运行没建号，
+    // 也就没有"新建了这些用户"这回事。
+    let mut created_users: Vec<(uuid::Uuid, String)> = Vec::new();
     let mut failures: Vec<ImportRowFailure> = Vec::new();
 
     for row in rows {
@@ -1144,7 +1222,11 @@ pub async fn import_users(
         }
 
         created += 1;
-        created_usernames.push(username);
+        // 结构化审计要 ID，光有用户名筛不了（v0.26.0），因此连 ID 一起留。
+        // 两个数组都只在**真正落库后**追加，所以 `dry_run` 时同为空，
+        // 不会出现"有 target 却没建号"这种自相矛盾的记录。
+        created_usernames.push(username.clone());
+        created_users.push((user.id, username));
     }
 
     // 审计记**建成了谁**，不记口令。批量场景下这串用户名是事后清理的依据，
@@ -1154,6 +1236,7 @@ pub async fn import_users(
     } else {
         created_usernames.join("、")
     };
+    // 文本只写汇总行，逐个建成的账号交给下面的 add_target 逐个声明
     audit.push(format!(
         "批量导入用户：共 {} 行，成功 {}，失败 {}；{}{}",
         created + failures.len(),
@@ -1166,6 +1249,17 @@ pub async fn import_users(
         },
         summary
     ));
+    // 逐个声明建成的账号。一次导入几百个就写几百行 target——
+    // 这正是**必须有子表**而不能塞进单列的理由：单列在这里只能记第一个，
+    // 而"这次导入建出来的账号有哪些"恰恰是批量操作最常被追问的事。
+    for (id, username) in &created_users {
+        audit.add_target(
+            TargetType::User,
+            *id,
+            ChangeType::Create,
+            Some(username.clone()),
+        );
+    }
     tracing::info!(
         "批量导入用户: {} 行，成功 {}，失败 {}{}",
         created + failures.len(),

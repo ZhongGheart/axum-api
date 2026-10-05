@@ -32,6 +32,7 @@ use axum::{
 
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::client_ip;
+use crate::model::{AuditTargetEntry, ChangeType, TargetType};
 use crate::router::AppState;
 
 /// 查询串入库前的最大长度
@@ -56,6 +57,17 @@ const MAX_RESULT_LEN: usize = 2000;
 /// "操作日志"表里直接展示），不是给程序解析的。
 const DETAIL_SEPARATOR: &str = "；";
 
+/// `target_label` 入库前的最大长度
+///
+/// 与迁移 020 里的列宽（VARCHAR(200)）一致。名字来自库里的真实值，
+/// 但列窄于此而这里不截断，超长名字会让 INSERT 失败——
+/// 在 `tokio::spawn` 路径上那就是**整条审计连同它的 target 一起消失**，
+/// 而请求照常 200。所以两边必须同步。
+const MAX_TARGET_LABEL_LEN: usize = 200;
+
+/// `target_key` 入库前的最大长度（与迁移 020 的列宽一致，理由同上）
+const MAX_TARGET_KEY_LEN: usize = 200;
+
 /// 写操作摘要累加器
 ///
 /// 由中间件在请求进入时挂到 extensions 上，handler 通过
@@ -66,6 +78,10 @@ const DETAIL_SEPARATOR: &str = "；";
 #[derive(Debug, Clone, Default)]
 pub struct AuditDetail {
     lines: Arc<Mutex<Vec<String>>>,
+    /// 结构化对象引用（v0.26.0）
+    ///
+    /// 与 `lines` **并行**：文本给人读，这里给机器筛。
+    targets: Arc<Mutex<Vec<AuditTargetEntry>>>,
 }
 
 impl AuditDetail {
@@ -76,15 +92,142 @@ impl AuditDetail {
     /// 仍会返回 5xx 而丢掉摘要——那个方向是**少记**，不是**错记**，
     /// 本模块宁可少说也不肯说错，与 v0.10.0「停止说谎」一致。
     pub fn push(&self, line: impl Into<String>) {
+        self.push_inner(line, None);
+    }
+
+    /// 追加一条摘要，**同时**声明它对应的结构化对象
+    ///
+    /// 这是 v0.26.0 之后写 handler 的**首选入口**：`push` 与结构化声明
+    /// 一次调用完成，两者不会因为"改了其中一个忘了另一个"而漂移。
+    ///
+    /// 去重按 `(target_type, target_id, change_type)`：一次请求里
+    /// 同一个对象被同一类变更反复 push 时只留一条 target，
+    /// 而 `result` 文本照旧保留全部——文本是给人读的，重复叙述不算错。
+    pub fn push_targeted(
+        &self,
+        line: impl Into<String>,
+        target_type: TargetType,
+        target_id: uuid::Uuid,
+        change_type: ChangeType,
+        target_label: Option<String>,
+    ) {
+        self.push_inner(
+            line,
+            Some(AuditTargetEntry::by_id(
+                target_type,
+                target_id,
+                change_type,
+                target_label.map(|l| truncate(&l, MAX_TARGET_LABEL_LEN)),
+            )),
+        );
+    }
+
+    fn push_inner(&self, line: impl Into<String>, target: Option<AuditTargetEntry>) {
         let line = line.into();
-        if line.trim().is_empty() {
-            return;
+        // 空文本只跳过**文本**累加，不跳过 target：
+        // `add_target` 传的正是空串，它要的就是"不要文本、只要结构化"。
+        // 这里若连带 return 掉 target，`add_target` 就会静默变成空操作——
+        // 而症状是"筛选查不到"，排查起来极难想到是这一行。
+        if !line.trim().is_empty() {
+            // 加锁失败（上一位持有者 panic）时静默丢弃这一条：
+            // 审计摘要是旁路能力，为它 panic 等于让一个提示信息拖垮业务请求
+            match self.lines.lock() {
+                Ok(mut lines) => lines.push(line),
+                Err(_) => tracing::warn!("审计摘要锁已中毒，丢弃本条摘要"),
+            }
         }
-        // 加锁失败（上一位持有者 panic）时静默丢弃这一条：
-        // 审计摘要是旁路能力，为它 panic 等于让一个提示信息拖垮业务请求
-        match self.lines.lock() {
-            Ok(mut lines) => lines.push(line),
-            Err(_) => tracing::warn!("审计摘要锁已中毒，丢弃本条摘要"),
+        if let Some(t) = target {
+            match self.targets.lock() {
+                Ok(mut targets) => {
+                    let dup = targets.iter().any(|e| {
+                        e.target_type == t.target_type
+                            && e.target_id == t.target_id
+                            && e.target_key == t.target_key
+                            && e.change_type == t.change_type
+                    });
+                    if !dup {
+                        targets.push(t);
+                    }
+                }
+                Err(_) => tracing::warn!("审计对象锁已中毒，丢弃本条结构化对象"),
+            }
+        }
+    }
+
+    /// **只**声明一个结构化对象，不追加任何摘要文本
+    ///
+    /// 用于"这次操作还牵涉到这些对象，但它们不值得各占一行摘要"的场景。
+    /// 典型是角色授权：一次可能动几十个菜单，逐个写进 `result`
+    /// 会把一条审计撑成长到没法看，而结构化查询要的只是
+    /// "这些按钮被谁动过"，文本里那句 `权限码变更：授予 X、撤销 Y` 已经说清了。
+    ///
+    /// 没有它就只能用 `push_targeted` 硬塞，于是 `result` 里堆满
+    /// `菜单权限码 "system:user:list"` 这类重复行——机器能筛了，人却读不了了。
+    pub fn add_target(
+        &self,
+        target_type: TargetType,
+        target_id: uuid::Uuid,
+        change_type: ChangeType,
+        target_label: Option<String>,
+    ) {
+        self.push_inner(
+            String::new(),
+            Some(AuditTargetEntry::by_id(
+                target_type,
+                target_id,
+                change_type,
+                target_label.map(|l| truncate(&l, MAX_TARGET_LABEL_LEN)),
+            )),
+        );
+    }
+
+    /// 以**字符串键**声明一个结构化对象，不追加摘要文本
+    ///
+    /// 给主键不是 UUID 的资源用，目前只有系统参数
+    /// （`security.password.min_length` 这类参数名）。
+    pub fn add_key_target(
+        &self,
+        target_type: TargetType,
+        key: &str,
+        change_type: ChangeType,
+        target_label: Option<String>,
+    ) {
+        self.push_inner(
+            String::new(),
+            Some(AuditTargetEntry::by_key(
+                target_type,
+                truncate(key, MAX_TARGET_KEY_LEN),
+                change_type,
+                target_label.map(|l| truncate(&l, MAX_TARGET_LABEL_LEN)),
+            )),
+        );
+    }
+
+    /// 追加一条摘要并以字符串键声明其对象（系统参数用）
+    pub fn push_key_targeted(
+        &self,
+        line: impl Into<String>,
+        target_type: TargetType,
+        key: &str,
+        change_type: ChangeType,
+        target_label: Option<String>,
+    ) {
+        self.push_inner(
+            line,
+            Some(AuditTargetEntry::by_key(
+                target_type,
+                truncate(key, MAX_TARGET_KEY_LEN),
+                change_type,
+                target_label.map(|l| truncate(&l, MAX_TARGET_LABEL_LEN)),
+            )),
+        );
+    }
+
+    /// 取出结构化对象引用；没有则返回空 `Vec`
+    pub fn targets(&self) -> Vec<AuditTargetEntry> {
+        match self.targets.lock() {
+            Ok(targets) => targets.clone(),
+            Err(_) => Vec::new(),
         }
     }
 
@@ -159,6 +302,14 @@ pub async fn audit_log_middleware(
 
     // **只对 2xx 合并摘要**（理由见 [`summary_for`]）
     let result = summary_for(response.status().is_success(), &detail);
+    // 结构化对象引用走**同一道门禁**：失败的请求不能声称它改过什么，
+    // 文本与结构化必须一致——否则会出现"没有变更摘要、却查得到
+    // 这个对象被改过"的矛盾记录，而矛盾记录比缺记录更难排查。
+    let targets = if response.status().is_success() {
+        detail.targets()
+    } else {
+        Vec::new()
+    };
 
     let pool = state.auth_service.user_repo.pool().clone();
 
@@ -174,11 +325,14 @@ pub async fn audit_log_middleware(
         // 截断至少留下一条可检索的记录。
         let action = truncate(&format!("{method} {path}"), MAX_ACTION_LEN);
 
-        let result = sqlx::query(
+        // 必须 `RETURNING id`：target 行要挂在这一条审计下面，
+        // 而 id 是数据库生成的，插入前拿不到
+        let result = sqlx::query_scalar::<_, uuid::Uuid>(
             r#"
             INSERT INTO audit_logs
                 (user_id, username, action, method, path, params, result, status_code, client_ip, duration_ms)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id
             "#,
         )
         .bind(user_id)
@@ -191,11 +345,40 @@ pub async fn audit_log_middleware(
         .bind(status_code)
         .bind(&client_ip)
         .bind(duration_ms)
-        .execute(&pool)
+        .fetch_one(&pool)
         .await;
 
-        if let Err(e) = result {
-            tracing::warn!("写入操作日志失败: {e}");
+        let audit_log_id = match result {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("写入操作日志失败: {e}");
+                return;
+            }
+        };
+
+        for t in targets {
+            // 单条 target 写失败**不放弃整条审计**：审计行已经落库了，
+            // 丢掉它换一个"对象标注没写上"的缺口，代价大得多。
+            // 这里只告警——和主写入路径同样的取舍。
+            let res = sqlx::query(
+                r#"
+                INSERT INTO audit_log_targets
+                    (audit_log_id, target_type, target_id, target_key, change_type, target_label)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(audit_log_id)
+            .bind(t.target_type.as_str())
+            .bind(t.target_id)
+            .bind(t.target_key)
+            .bind(t.change_type.as_str())
+            .bind(t.target_label)
+            .execute(&pool)
+            .await;
+            if let Err(e) = res {
+                tracing::warn!("写入审计对象引用失败（{audit_log_id}）: {e}");
+            }
         }
     });
 

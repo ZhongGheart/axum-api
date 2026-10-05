@@ -15,7 +15,7 @@ use crate::middleware::permission::{
     codes_of_roles, ensure_can_grant_roles, PermRoleCreate, PermRoleDelete, PermRoleList,
     PermRoleUpdate, PermUserList, PermUserUpdate,
 };
-use crate::model::{normalize_role_name, ApiResponse, BUILTIN_ROLES};
+use crate::model::{normalize_role_name, ApiResponse, ChangeType, TargetType, BUILTIN_ROLES};
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
 use crate::utils::audit;
@@ -198,10 +198,31 @@ pub async fn assign_user_role(
             .revoke_all_sessions(&state.redis_client, user_id)
             .await?;
         // 已持有时不写：重复追加什么都没发生，记成"已授予"是假阳性
-        audit.push(format!(
-            "为用户 \"{}\" 追加角色 \"{role_name}\"（{user_id}）",
-            target_user.username
-        ));
+        // 两个对象都要记：这次动的是**这个用户的角色集合**，
+        // 而角色本身没被改。只记用户 → 问"这个角色被谁加过"答不出来；
+        // 只记角色 → 问"这个用户被人动过吗"答不出来。
+        audit.push_targeted(
+            format!(
+                "为用户 \"{}\" 追加角色 \"{role_name}\"（{user_id}）",
+                target_user.username
+            ),
+            TargetType::User,
+            user_id,
+            ChangeType::Grant,
+            Some(target_user.username.clone()),
+        );
+        // 角色 ID 要多查一次（入参只有角色名）。**这 1 次查询是有代价的**，
+        // 换来的是"这个角色被加给过谁"能被结构化筛出来；
+        // 拒绝它的理由只能是"少一次查询"，而那等于让这条查询永远答不出来。
+        // 查不到（角色在并发里被删）就只记用户 target，不硬凑。
+        if let Ok(Some(role)) = state.auth_service.role_repo.find_by_name(&role_name).await {
+            audit.add_target(
+                TargetType::Role,
+                role.id,
+                ChangeType::Grant,
+                Some(role.name),
+            );
+        }
     }
     Ok(Json(ApiResponse::success("角色分配成功")))
 }
@@ -242,7 +263,13 @@ pub async fn create_role(
             }
             AppError::InternalServerError(format!("创建角色失败: {e}"))
         })?;
-    audit.push(format!("新建角色 \"{name}\"（{id}）"));
+    audit.push_targeted(
+        format!("新建角色 \"{name}\"（{id}）"),
+        TargetType::Role,
+        id,
+        ChangeType::Create,
+        Some(name.clone()),
+    );
     Ok(Json(ApiResponse::success(RoleItem {
         id,
         name,
@@ -353,12 +380,23 @@ pub async fn update_role(
     // 改名要**两个名字都记**：事后只看到新名字，仍然答不出
     // "这个角色原来叫什么"——而角色名是 user_roles 之外唯一的人类可读标识
     if row.1 != current_name {
-        audit.push(format!(
-            "角色 \"{current_name}\" 改名为 \"{}\"（{id}）",
-            row.1
-        ));
+        audit.push_targeted(
+            format!("角色 \"{current_name}\" 改名为 \"{}\"（{id}）", row.1),
+            TargetType::Role,
+            id,
+            ChangeType::Update,
+            // 存**新**名：这条记录回答的是"它现在叫什么"，
+            // 旧名已经留在上面那句摘要文本里了
+            Some(row.1.clone()),
+        );
     } else {
-        audit.push(format!("更新角色 \"{}\"（{id}）", row.1));
+        audit.push_targeted(
+            format!("更新角色 \"{}\"（{id}）", row.1),
+            TargetType::Role,
+            id,
+            ChangeType::Update,
+            Some(row.1.clone()),
+        );
     }
 
     Ok(Json(ApiResponse::success(RoleItem {
@@ -456,10 +494,25 @@ pub async fn delete_role(
         .map_err(|e| AppError::InternalServerError(format!("事务提交失败: {e}")))?;
     // 名字只在 `roles` 行里，删掉就永久没有了（`role_menus` 已被外键级联清掉）
     let revoked = audit::codes("随之撤销的权限码", &granted_codes);
-    audit.push(match revoked.is_empty() {
-        true => format!("删除角色 \"{name}\"（{id}）"),
-        false => format!("删除角色 \"{name}\"（{id}）；{revoked}"),
-    });
+    audit.push_targeted(
+        match revoked.is_empty() {
+            true => format!("删除角色 \"{name}\"（{id}）"),
+            false => format!("删除角色 \"{name}\"（{id}）；{revoked}"),
+        },
+        TargetType::Role,
+        id,
+        ChangeType::Delete,
+        // **删除后唯一能答出"删的是什么"的东西**：角色行已经没了，
+        // 名字只存在于这一列与摘要文本里
+        Some(name.clone()),
+    );
+    // 这里**故意不给那些被撤销的权限码对应的菜单记 target**。
+    // 菜单还在，别的角色也还可能持有着同一个码——"这个角色不再授予它了"
+    // 与"这个按钮的权限被撤了"是两回事。记成 `menu/revoke` 会让
+    // "这个按钮的权限被谁撤过"出现一条**不成立的**记录，
+    // 而假的正面命中比查不到更难发现。
+    // 对照：`assign_role_menus` 里记 menu/revoke 是对的，
+    // 因为那里的操作本身就是"把这个角色的这些菜单的授权去掉"。
     Ok(Json(ApiResponse::success("角色删除成功")))
 }
 

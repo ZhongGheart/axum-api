@@ -51,6 +51,31 @@
           clearable
           style="width:120px"
         />
+        <!--
+          按「涉及对象」筛选（v0.26.0）。
+          这是回答"谁改过 role:3 的权限"的入口：此前只能按 `action` 模糊筛，
+          而一个请求常常碰多个对象（批量删 N 个用户、删角色连带撤销 N 个权限码），
+          动作名里并不含任何对象标识。
+        -->
+        <n-select
+          v-model:value="filters.target_type"
+          :options="targetTypeOptions"
+          placeholder="对象类型"
+          clearable
+          style="width:130px"
+        />
+        <n-input
+          v-model:value="filters.target_id"
+          placeholder="对象ID"
+          clearable
+          style="width:180px"
+        />
+        <n-input
+          v-model:value="filters.target_key"
+          placeholder="参数名"
+          clearable
+          style="width:180px"
+        />
         <n-date-picker
           v-model:value="filters.range"
           type="datetimerange"
@@ -78,7 +103,7 @@
 
 <script setup lang="ts">
 import { computed, ref, reactive, onMounted, h } from 'vue'
-import { NTag } from 'naive-ui'
+import { NSpace, NTag } from 'naive-ui'
 import type { DataTableColumn } from 'naive-ui'
 import { auditApi } from '@/api/audit'
 import type { AuditLogItem, AuditLogListParams, AuditRetentionInfo } from '@/api/audit'
@@ -88,6 +113,11 @@ import {
   formatTime,
   rangeStartsBeforeOldest,
 } from '@/utils/auditRetention'
+import {
+  changeTypeColor,
+  describeTargets,
+  TARGET_TYPE_OPTIONS,
+} from '@/utils/auditTargets'
 import { showSuccess, showError, showWarning } from '@/utils/message'
 import { formatDateTime } from '@/utils/time'
 import { PERM } from '@/constants/permission'
@@ -102,8 +132,15 @@ const filters = reactive({
   action: '',
   username: '',
   status_code: null as number | null,
+  // 对象筛选三个字段。`target_id` 与 `target_key` 只能填一个：
+  // 系统参数没有 UUID，只能按 `target_key`（参数名）查
+  target_type: null as string | null,
+  target_id: '',
+  target_key: '',
   range: null as [number, number] | null,
 })
+
+const targetTypeOptions = TARGET_TYPE_OPTIONS
 
 // 保留策略。取不到时保持 `null`，界面**不显示任何说明**——
 // 宁可不说，也不能显示一个猜出来的"保留 90 天"：
@@ -133,6 +170,9 @@ function buildParams(): Omit<AuditLogListParams, 'page' | 'page_size'> {
   if (filters.action.trim()) params.action = filters.action.trim()
   if (filters.username.trim()) params.username = filters.username.trim()
   if (filters.status_code !== null) params.status_code = filters.status_code
+  if (filters.target_type) params.target_type = filters.target_type
+  if (filters.target_id.trim()) params.target_id = filters.target_id.trim()
+  if (filters.target_key.trim()) params.target_key = filters.target_key.trim()
   if (filters.range) {
     const [from, to] = filters.range
     params.start_time = new Date(from).toISOString()
@@ -180,6 +220,37 @@ const columns: DataTableColumn[] = [
       return r.result?.trim() ? r.result : '—'
     },
   },
+  {
+    // v0.26.0：这一列是"谁改过 role:3 的权限"的答案。
+    // 摘要文本能回答"改了什么"，但答不出"改的是**哪个对象**"——
+    // 而一个请求常同时碰多个对象，摘要只写得下一个也放不下全部
+    title: '涉及对象',
+    key: 'targets',
+    width: 320,
+    ellipsis: { tooltip: true },
+    render(row: Record<string, unknown>) {
+      const r = row as unknown as AuditLogItem
+      const targets = r.targets
+      if (!targets || targets.length === 0) {
+        // 历史行（结构化上线前）如实说明，不能显示成空白或破折号
+        return h('span', { class: 'targets-none' }, describeTargets(targets))
+      }
+      // 逐个渲染成标签而不是拼成一行：批量操作动辄十几个对象，
+      // 拼成一行会挤成一坨，而"这次到底动了哪几个"需要一眼能数清
+      return h(
+        NSpace,
+        { size: 4, wrap: true },
+        () =>
+          targets.map((t) =>
+            h(
+              NTag,
+              { type: changeTypeColor(t.change_type), size: 'small' },
+              { default: () => describeTargets([t]) },
+            ),
+          ),
+      )
+    },
+  },
 ]
 
 // 文案与判定都在 `utils/auditRetention` 里：这两件事很容易在边界情况下
@@ -225,6 +296,9 @@ function resetFilters() {
   filters.action = ''
   filters.username = ''
   filters.status_code = null
+  filters.target_type = null
+  filters.target_id = ''
+  filters.target_key = ''
   filters.range = null
   page.value = 1
   fetchLogs()
@@ -261,6 +335,15 @@ onMounted(() => {
 /* 次要那行用次要颜色，不与主信息抢注意力，但也不能弱到读不清 */
 .retention-sub {
   opacity: 0.75;
+  font-size: 12px;
+}
+
+/*
+ * 历史行的"早于结构化上线"要弱一档：它是背景说明不是主要信息，
+ * 但也不能弱到读不清（这正是 `.retention-sub` 用 0.75 而不是隐藏的原因）
+ */
+.targets-none {
+  opacity: 0.7;
   font-size: 12px;
 }
 </style>

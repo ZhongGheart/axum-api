@@ -212,9 +212,17 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 ⚠️ **保留策略不是只写在文档里**：`GET /api/admin/audit-logs/retention` 会返回
 当前部署的真实保留天数、现存最早一条日志的时刻，以及最近一次清理的
 `cutoff_at` / 删除行数 / 是否撞上批数上限。系统日志页顶部也如实展示这些。
-原因是 v0.13.0 起「改了什么」这一层**只存在 `audit_logs.result`**，
+原因是 v0.13.0 起「改了什么」这一层进了 `audit_logs.result`，
 删掉的不只是流水，而是复盘能力本身——而"日志为什么从某天起就查不到了"
 与"那天什么都没发生过"在管理员眼里必须能被区分开。
+
+⚠️ **v0.26.0 起了结构化的「涉及对象」**：写操作除了 `result` 文本，
+还会写一行行 `audit_log_targets`（对象类型 / 对象 ID / 变更类型 / 当时的名字），
+列表与导出都能按对象筛。**存量数据不回填**——从中文摘要反解 UUID 会张冠李戴
+（`为用户 "X" 追加角色 "Y"（<uuid>）` 里那个 UUID 是用户的），
+而错误的结构化数据比没有更危险：它看起来可信、会被直接引用，而答案是错的。
+因此 v0.26.0 之前的历史行 `targets` 为空数组，界面与导出都如实说明
+「该记录早于结构化上线」，而不是显示成空白让人以为那次操作没碰任何对象。
 
 前端（`frontend/.env.*`）：
 
@@ -283,8 +291,8 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | PUT | `/api/admin/settings/{key}` | 修改单个参数（写入前校验类型与范围，并检查跨字段约束；越界或与另一参数冲突即 400） |
 | POST | `/api/admin/settings/{key}/reset` | 复位参数。有部署配置兜底的参数会**交还控制权给环境变量**，而不是钉死在代码默认值上 |
 | POST | `/api/admin/settings/refresh-cache` | 清理参数缓存 |
-| GET | `/api/admin/audit-logs?page=&username=&action=&status_code=&start_time=&end_time=` | 操作日志查询（分页 + 真筛选） |
-| GET | `/api/admin/logs/audit/export`（同上筛选参数） | 操作日志导出；响应头带 `x-export-row-count` / `x-export-truncated` / `x-export-max-rows` |
+| GET | `/api/admin/audit-logs?page=&username=&action=&status_code=&start_time=&end_time=&target_type=&target_id=&target_key=` | 操作日志查询（分页 + 真筛选）。**v0.26.0 起支持按「涉及对象」筛**：`target_type` + `target_id` 回答"谁改过 role:3 的权限"，`target_key` 用于系统参数（主键是字符串，没有 UUID）。看不懂的 `target_type` 回 400 而不是静默查不到 |
+| GET | `/api/admin/logs/audit/export`（同上筛选参数） | 操作日志导出；响应头带 `x-export-row-count` / `x-export-truncated` / `x-export-max-rows`。**v0.26.0 起多了「涉及对象」列** |
 | GET | `/api/admin/export/users` | 导出用户列表 |
 | GET | `/api/admin/monitor/system`、`/api/admin/monitor/api-metrics`、`/api/admin/monitor/alerts` | 系统与接口监控 |
 | GET | `/api/openapi.json`、`/api/swagger-ui/index.html` | OpenAPI 规范与 Swagger UI |

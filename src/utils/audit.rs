@@ -43,6 +43,81 @@ pub fn label_or_id(kind: &str, name: Option<&str>, id: Uuid) -> String {
 }
 
 /// 角色名（删除/改名前查一次）
+/// 导出 Excel 里「涉及对象」一格的文字（v0.26.0）
+///
+/// 格式 `角色 "admin" · 撤销`，多个对象用 `;` 分隔。
+/// 与 [`label`] 用 ASCII 双引号同理由：导出内容会被粘进工单与 SQL。
+///
+/// **空列表返回明确的说明而不是空串**：空数组绝大多数是 v0.26.0 上线前的
+/// 历史行。若留空，取证的人看到一整列空白，只能猜是"没改东西"还是
+/// "这个版本的导出不支持"——而这两种猜测会导向完全不同的结论。
+/// 这里的措辞刻意比界面上的更短：Excel 是拿去存证的，不是拿来读的界面。
+pub fn targets_summary(targets: &[crate::model::AuditLogTarget]) -> String {
+    if targets.is_empty() {
+        return "该记录早于结构化上线，未记录涉及对象".to_string();
+    }
+    targets
+        .iter()
+        .map(|t| {
+            let kind = target_kind_label(t.target_type.as_str());
+            let name = t
+                .target_label
+                .clone()
+                .or_else(|| t.target_key.clone())
+                .or_else(|| t.target_id.map(|id| id.to_string()))
+                .unwrap_or_else(|| "(未命名)".to_string());
+            // 自己拼而**不复用** [`label`]：那个函数签名是 `(kind, name)`，
+            // 这里 kind 已经单独成词、name 还带 `· 变更`，硬套会拼出双空格
+            format!(
+                "{} \"{name}\" · {}",
+                kind,
+                change_type_label(t.change_type.as_str())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// 对象类型在导出里的中文名
+///
+/// 与 `TargetType::as_str()` 一一对应。
+/// **未知类型显示成"未知对象"而不是留空**：后端加了新类型而这里没跟上时，
+/// 一整列空白没人看得出是"没改东西"还是"这里不认识"，
+/// 而这份文件是要拿去存证的，静默丢失比显示一个占位词糟得多。
+fn target_kind_label(t: &str) -> &'static str {
+    match t {
+        "user" => "用户",
+        "role" => "角色",
+        "menu" => "菜单",
+        "dict_type" => "字典类型",
+        "dict_item" => "字典项",
+        "department" => "部门",
+        "setting" => "系统参数",
+        "user_two_factor" => "两步验证",
+        _ => "未知对象",
+    }
+}
+
+/// 变更类型在导出里的中文名
+///
+/// `revoke_session` 与 `revoke` 刻意分开：前者是"下线了一个登录会话"，
+/// 后者是"撤销了一项授权"。合成一个"撤销"会把两种事件混进同一条时间线。
+fn change_type_label(c: &str) -> &'static str {
+    match c {
+        "create" => "新增",
+        "update" => "修改",
+        "delete" => "删除",
+        "grant" => "授予",
+        "revoke" => "撤销",
+        "enable" => "启用",
+        "disable" => "停用",
+        "status" => "状态变更",
+        "revoke_session" => "下线会话",
+        "login" => "登录",
+        _ => "未知变更",
+    }
+}
+
 pub async fn role_label(state: &AppState, id: Uuid) -> String {
     match state.auth_service.role_repo.find_name_by_id(id).await {
         Ok(Some(name)) => label("角色", &name),
@@ -130,6 +205,24 @@ pub fn diff_summary(
     granted_prefix: &str,
     revoked_prefix: &str,
 ) -> String {
+    let (added, removed) = diff_sets(before, after);
+    let granted = codes(granted_prefix, &added);
+    let revoked = codes(revoked_prefix, &removed);
+    [granted, revoked]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
+/// 求出两个集合的差异：`(新增, 移除)`
+///
+/// v0.26.0 抽出：结构化审计要拿**集合本身**去反查对象，
+/// 而 [`diff_summary`] 只要排好的文本。两者若各写一遍求差逻辑，
+/// 迟早会有一边改了另一边没改——于是摘要说"授予了 A"、
+/// 结构化列里却没有 A，两边对不上且没人发现。
+/// 现在文本与结构化共用这一份求差结果，不可能漂移。
+pub fn diff_sets(before: &[String], after: &[String]) -> (Vec<String>, Vec<String>) {
     let added = after
         .iter()
         .filter(|c| !before.contains(c))
@@ -140,13 +233,7 @@ pub fn diff_summary(
         .filter(|c| !after.contains(c))
         .cloned()
         .collect::<Vec<_>>();
-    let granted = codes(granted_prefix, &added);
-    let revoked = codes(revoked_prefix, &removed);
-    [granted, revoked]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("；")
+    (added, removed)
 }
 
 /// 权限码变化的摘要：`菜单 "x" 的权限码由 "a" 改为 "b"`
@@ -184,9 +271,121 @@ pub fn permission_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ChangeType, TargetType};
 
     fn v(code: &str) -> String {
         code.to_string()
+    }
+
+    fn tg(
+        ty: TargetType,
+        ct: ChangeType,
+        id: Option<Uuid>,
+        key: Option<&str>,
+        label: Option<&str>,
+    ) -> crate::model::AuditLogTarget {
+        // 直接构造读出侧的 `AuditLogTarget`：写入侧的 `AuditTargetEntry`
+        // 用的是枚举，而导出拿到的已经是没有类型约束的字符串形态
+        crate::model::AuditLogTarget {
+            target_type: ty.as_str().to_string(),
+            target_id: id,
+            target_key: key.map(str::to_string),
+            change_type: ct.as_str().to_string(),
+            target_label: label.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn targets_summary_reads_as_one_cell_of_plain_text() {
+        let t = tg(
+            TargetType::Role,
+            ChangeType::Revoke,
+            Some(Uuid::nil()),
+            None,
+            Some("admin"),
+        );
+        assert_eq!(targets_summary(&[t]), "角色 \"admin\" · 撤销");
+    }
+
+    #[test]
+    fn targets_summary_separates_revoking_a_grant_from_dropping_a_session() {
+        // 这两种事件混成同一个"撤销"，时间线就答不出"权限被撤了"还是"有人被踢了"
+        let a = tg(
+            TargetType::Menu,
+            ChangeType::Revoke,
+            Some(Uuid::nil()),
+            None,
+            Some("删除"),
+        );
+        let b = tg(
+            TargetType::UserTwoFactor,
+            ChangeType::RevokeSession,
+            Some(Uuid::nil()),
+            None,
+            Some("某设备"),
+        );
+        assert!(targets_summary(std::slice::from_ref(&a)).contains("撤销"));
+        assert!(targets_summary(std::slice::from_ref(&b)).contains("下线会话"));
+        assert_ne!(
+            targets_summary(std::slice::from_ref(&a)),
+            targets_summary(std::slice::from_ref(&b))
+        );
+    }
+
+    #[test]
+    fn targets_summary_falls_back_to_key_then_id() {
+        let setting = tg(
+            TargetType::Setting,
+            ChangeType::Update,
+            None,
+            Some("security.password.min_length"),
+            None,
+        );
+        assert_eq!(
+            targets_summary(&[setting]),
+            "系统参数 \"security.password.min_length\" · 修改"
+        );
+
+        let bare = tg(
+            TargetType::User,
+            ChangeType::Delete,
+            Some(Uuid::nil()),
+            None,
+            None,
+        );
+        assert!(targets_summary(&[bare]).contains(&Uuid::nil().to_string()));
+    }
+
+    #[test]
+    fn empty_targets_say_so_instead_of_leaving_a_blank_cell() {
+        // 空白的一整列在取证文件里分不清"没改东西"与"导出不支持"
+        let s = targets_summary(&[]);
+        assert!(s.contains("早于结构化上线"), "{s}");
+        assert!(!s.trim().is_empty());
+    }
+
+    #[test]
+    fn targets_summary_keeps_every_target_in_a_batch() {
+        // 回归单列方案：批量删 3 个用户，导出里必须能数出 3 个名字，
+        // 而不是只留下第一个
+        let ids = [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
+        let targets: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                tg(
+                    TargetType::User,
+                    ChangeType::Delete,
+                    Some(*id),
+                    None,
+                    Some(&format!("u{id}")),
+                )
+            })
+            .collect();
+        let s = targets_summary(&targets);
+        for id in ids {
+            assert!(s.contains(&id.to_string()), "{id} 丢失: {s}");
+        }
+        assert_eq!(s.matches('·').count(), 3, "{s}");
     }
 
     #[test]

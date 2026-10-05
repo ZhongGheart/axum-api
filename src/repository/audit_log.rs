@@ -15,7 +15,9 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::error::AppError;
-use crate::model::AuditLog;
+use crate::model::{
+    AuditLog, AuditLogTarget, AuditLogTargetRow, AuditLogWithTargets, AuditTargetEntry,
+};
 use crate::utils::pagination::{PaginatedResponse, PaginationParams};
 
 /// 一条待写入的审计记录
@@ -44,6 +46,8 @@ pub struct AuditEntry {
     pub client_ip: Option<String>,
     /// 耗时（毫秒）
     pub duration_ms: Option<i32>,
+    /// 结构化对象引用（v0.26.0）
+    pub targets: Vec<AuditTargetEntry>,
 }
 
 impl AuditEntry {
@@ -64,7 +68,28 @@ impl AuditEntry {
             status_code: Some(status_code),
             client_ip: Some(ip.to_string()),
             duration_ms: None,
+            targets: Vec::new(),
         }
+    }
+
+    /// 附上一个结构化对象引用
+    ///
+    /// 登录/注册这类语义 action 也要能回答"这次登录动的是哪个账号"——
+    /// 它不走审计中间件，因此只能在这里声明。
+    pub fn with_target(
+        mut self,
+        target_type: crate::model::TargetType,
+        target_id: Uuid,
+        change_type: crate::model::ChangeType,
+        target_label: Option<String>,
+    ) -> Self {
+        self.targets.push(AuditTargetEntry::by_id(
+            target_type,
+            target_id,
+            change_type,
+            target_label,
+        ));
+        self
     }
 
     /// 附上身份信息
@@ -98,6 +123,13 @@ pub struct AuditLogFilter {
     pub status_code: Option<i32>,
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
+    /// 对象种类，如 `role`。**与 `target_id` 配对使用**
+    pub target_type: Option<String>,
+    /// 被操作对象 ID。单独给 `target_id` 而不给 `target_type` 是**允许**的，
+    /// 语义是"这个对象被谁动过"，不限定它是哪一类
+    pub target_id: Option<Uuid>,
+    /// 字符串主键的对象（系统参数名）。与 `target_id` 二选一
+    pub target_key: Option<String>,
 }
 
 impl AuditLogFilter {
@@ -108,6 +140,9 @@ impl AuditLogFilter {
             && self.status_code.is_none()
             && self.start_time.is_none()
             && self.end_time.is_none()
+            && self.target_type.is_none()
+            && self.target_id.is_none()
+            && self.target_key.is_none()
     }
 }
 
@@ -151,6 +186,34 @@ fn push_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, f: &'a AuditLogFilter) 
     if let Some(t) = f.end_time {
         qb.push(" AND created_at <= ").push_bind(t);
     }
+    // target 条件走 `EXISTS` 子查询而不是 JOIN：
+    // JOIN 会让一条审计行出现 N 次（N 个 target），
+    // 于是 COUNT 与列表的 total 对不上、分页还会漏行。
+    // EXISTS 只回答"有没有"，天然不放大行数。
+    if let Some(tt) = norm(f.target_type.as_ref()) {
+        qb.push(
+            " AND EXISTS (SELECT 1 FROM audit_log_targets t \
+             WHERE t.audit_log_id = audit_logs.id AND t.target_type = ",
+        )
+        .push_bind(tt)
+        .push(")");
+    }
+    if let Some(tid) = f.target_id {
+        qb.push(
+            " AND EXISTS (SELECT 1 FROM audit_log_targets t \
+             WHERE t.audit_log_id = audit_logs.id AND t.target_id = ",
+        )
+        .push_bind(tid)
+        .push(")");
+    }
+    if let Some(tk) = norm(f.target_key.as_ref()) {
+        qb.push(
+            " AND EXISTS (SELECT 1 FROM audit_log_targets t \
+             WHERE t.audit_log_id = audit_logs.id AND t.target_key = ",
+        )
+        .push_bind(tk)
+        .push(")");
+    }
 }
 
 const SELECT_COLS: &str = "id, user_id, username, action, method, path, params, result, \
@@ -174,11 +237,12 @@ impl AuditLogRepository {
     pub async fn record(&self, entry: &AuditEntry) -> Result<(), AppError> {
         let clip = |v: &str, max: usize| -> String { v.chars().take(max).collect::<String>() };
 
-        sqlx::query(
+        let audit_log_id = sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO audit_logs
                 (user_id, username, action, method, path, params, result, status_code, client_ip, duration_ms)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id
             "#,
         )
         .bind(entry.user_id)
@@ -191,9 +255,29 @@ impl AuditLogRepository {
         .bind(entry.status_code)
         .bind(entry.client_ip.as_deref().map(|ip| clip(ip, 50)))
         .bind(entry.duration_ms)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("写入审计日志失败: {e}")))?;
+
+        for t in &entry.targets {
+            sqlx::query(
+                r#"
+                INSERT INTO audit_log_targets
+                    (audit_log_id, target_type, target_id, target_key, change_type, target_label)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(audit_log_id)
+            .bind(t.target_type.as_str())
+            .bind(t.target_id)
+            .bind(t.target_key.as_deref().map(|k| clip(k, 200)))
+            .bind(t.change_type.as_str())
+            .bind(t.target_label.as_deref().map(|l| clip(l, 200)))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("写入审计对象引用失败: {e}")))?;
+        }
         Ok(())
     }
 
@@ -209,7 +293,7 @@ impl AuditLogRepository {
         &self,
         params: &PaginationParams,
         filter: &AuditLogFilter,
-    ) -> Result<PaginatedResponse<AuditLog>, AppError> {
+    ) -> Result<PaginatedResponse<AuditLogWithTargets>, AppError> {
         const ALLOWED_SORT_FIELDS: [&str; 4] = ["created_at", "username", "action", "status_code"];
 
         let page = params.get_page();
@@ -241,7 +325,56 @@ impl AuditLogRepository {
             .await
             .map_err(|e| AppError::InternalServerError(format!("查询日志失败: {e}")))?;
 
-        Ok(PaginatedResponse::new(items, total.0, page, page_size))
+        let targets = self.targets_for(&items).await?;
+
+        Ok(PaginatedResponse::new(
+            items
+                .into_iter()
+                .map(|log| {
+                    let mut row = AuditLogWithTargets::from(log.clone());
+                    row.targets = targets.get(&log.id).cloned().unwrap_or_default();
+                    row
+                })
+                .collect(),
+            total.0,
+            page,
+            page_size,
+        ))
+    }
+
+    /// 批量取一批审计行的结构化对象引用，返回 `audit_log_id -> targets`
+    ///
+    /// **一次查询而不是每行一次**：列表页一页 20 条，逐行查就是 20 次往返。
+    /// 空列表直接返回空 map，不发查询——`WHERE id = ANY('{}')` 虽合法但无意义。
+    /// 批量取一批日志的 target，返回 `audit_log_id → targets`
+    ///
+    /// **对外公开**是因为导出处点也要用：Excel 里少一列「涉及对象」，
+    /// 就等于结构化数据只在一半的读路径上存在——和 v0.13.0
+    /// 「`result` 只在库里、界面与导出都读不到」是同一类失效。
+    pub async fn targets_for(
+        &self,
+        logs: &[AuditLog],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<AuditLogTarget>>, AppError> {
+        if logs.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids = logs.iter().map(|l| l.id).collect::<Vec<_>>();
+        let rows = sqlx::query_as::<_, AuditLogTargetRow>(
+            "SELECT audit_log_id, target_type, target_id, target_key, change_type, target_label \
+             FROM audit_log_targets WHERE audit_log_id = ANY($1) \
+             ORDER BY target_type, COALESCE(target_key, target_id::text)",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("查询审计对象引用失败: {e}")))?;
+
+        let mut map: std::collections::HashMap<Uuid, Vec<AuditLogTarget>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            map.entry(row.audit_log_id).or_default().push(row.target);
+        }
+        Ok(map)
     }
 
     /// 按筛选条件取日志用于导出，返回 `(导出的行, 是否被上限截断)`

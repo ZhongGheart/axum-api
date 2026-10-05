@@ -13,8 +13,8 @@ use crate::middleware::audit_log::AuditDetail;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::client_ip::ClientIp;
 use crate::model::{
-    ApiResponse, DisableTwoFactorRequest, EnableTwoFactorRequest, LoginResponse,
-    RecoveryCodesResponse, TwoFactorSetup, TwoFactorStatus, VerifyTwoFactorRequest,
+    ApiResponse, ChangeType, DisableTwoFactorRequest, EnableTwoFactorRequest, LoginResponse,
+    RecoveryCodesResponse, TargetType, TwoFactorSetup, TwoFactorStatus, VerifyTwoFactorRequest,
 };
 use crate::router::AppState;
 use crate::utils::api_extractor::ApiJson;
@@ -60,7 +60,15 @@ pub async fn setup(
         .two_factor_service
         .setup(&state.redis_client, auth_user.user_id, &user.username)
         .await?;
-    audit.push("开始绑定两步验证：生成新密钥（尚未生效）".to_string());
+    audit.push_targeted(
+        "开始绑定两步验证：生成新密钥（尚未生效）".to_string(),
+        TargetType::UserTwoFactor,
+        auth_user.user_id,
+        // 此刻密钥还没生效，说它"已启用"是谎报。`create` 只表示
+        // "为这个账号新建了一条两步验证配置"，不声称 2FA 已经在起作用。
+        ChangeType::Create,
+        Some(auth_user.username.clone()),
+    );
     Ok(Json(ApiResponse::success(setup)))
 }
 
@@ -86,7 +94,13 @@ pub async fn enable(
         .two_factor_service
         .enable(&state.redis_client, auth_user.user_id, &req.code)
         .await?;
-    audit.push("启用两步验证（已生成恢复码）".to_string());
+    audit.push_targeted(
+        "启用两步验证（已生成恢复码）".to_string(),
+        TargetType::UserTwoFactor,
+        auth_user.user_id,
+        ChangeType::Enable,
+        Some(auth_user.username.clone()),
+    );
     Ok(Json(ApiResponse::success(RecoveryCodesResponse {
         recovery_codes: resp.recovery_codes,
     })))
@@ -114,7 +128,13 @@ pub async fn disable(
         .two_factor_service
         .disable(auth_user.user_id, &state.auth_service.user_repo, &req)
         .await?;
-    audit.push("关闭两步验证（已出示当前口令）".to_string());
+    audit.push_targeted(
+        "关闭两步验证（已出示当前口令）".to_string(),
+        TargetType::UserTwoFactor,
+        auth_user.user_id,
+        ChangeType::Disable,
+        Some(auth_user.username.clone()),
+    );
     Ok(Json(ApiResponse::success("两步验证已关闭".to_string())))
 }
 
@@ -138,7 +158,13 @@ pub async fn regenerate_recovery_codes(
         .two_factor_service
         .regenerate_recovery_codes(auth_user.user_id)
         .await?;
-    audit.push("重新生成两步验证恢复码（旧码已作废）".to_string());
+    audit.push_targeted(
+        "重新生成两步验证恢复码（旧码已作废）".to_string(),
+        TargetType::UserTwoFactor,
+        auth_user.user_id,
+        ChangeType::Update,
+        Some(auth_user.username.clone()),
+    );
     Ok(Json(ApiResponse::success(resp)))
 }
 

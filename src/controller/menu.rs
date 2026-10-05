@@ -14,8 +14,8 @@ use crate::middleware::permission::{
     PermMenuCreate, PermMenuDelete, PermMenuGrant, PermMenuList, PermMenuUpdate,
 };
 use crate::model::{
-    ApiResponse, AssignMenuRequest, CreateMenuRequest, Menu, MenuNode, UnreachableMenu,
-    UpdateMenuRequest,
+    ApiResponse, AssignMenuRequest, ChangeType, CreateMenuRequest, Menu, MenuNode, TargetType,
+    UnreachableMenu, UpdateMenuRequest,
 };
 use crate::router::AppState;
 use crate::utils::api_extractor::{ApiJson, ApiPath};
@@ -188,7 +188,7 @@ pub async fn create_menu(
         prev_permission_cleared_by: None,
     };
     let saved = state.menu_repo.create(&menu).await?;
-    audit.push(
+    audit.push_targeted(
         match saved.permission.as_deref().filter(|p| !p.is_empty()) {
             Some(code) => format!(
                 "新建菜单 \"{}\"（{}），声明权限码 \"{code}\"",
@@ -196,6 +196,10 @@ pub async fn create_menu(
             ),
             None => format!("新建菜单 \"{}\"（{}），不携带权限码", saved.name, saved.id),
         },
+        TargetType::Menu,
+        saved.id,
+        ChangeType::Create,
+        Some(saved.name.clone()),
     );
     Ok(Json(ApiResponse::success(MenuNode::from(saved))))
 }
@@ -267,12 +271,18 @@ pub async fn update_menu(
         .as_deref()
         .filter(|p| !p.is_empty())
         .map(str::to_string);
-    audit.push(audit::permission_change(
-        &audit::label("菜单", &saved.name),
+    audit.push_targeted(
+        audit::permission_change(
+            &audit::label("菜单", &saved.name),
+            saved.id,
+            before_code.as_deref(),
+            after_code.as_deref(),
+        ),
+        TargetType::Menu,
         saved.id,
-        before_code.as_deref(),
-        after_code.as_deref(),
-    ));
+        ChangeType::Update,
+        Some(saved.name.clone()),
+    );
 
     // 父级变更是**结构性**变更，此前审计完全不留痕：
     // 把一个目录挪到别处，它整棵子树的导航归属就变了，而审计里只有一行
@@ -295,17 +305,33 @@ pub async fn update_menu(
                     .unwrap_or_else(|_| old.to_string()),
                 None => "根".to_string(),
             };
-            audit.push(format!(
-                "移动菜单 \"{}\"（{}）：上级从 {} 改为 \"{}\"（{}）",
-                saved.name, saved.id, old_parent_desc, parent_name, new_parent
-            ));
+            // `Menu/Update` 这个 target 会被去重合并成一条——
+            // 上面那条 `permission_change` 已经声明过它了。
+            // 两条摘要文本都留着（一条说改码、一条说挪位置），但结构化侧
+            // 只需要"这个菜单被更新过"这一个事实。
+            audit.push_targeted(
+                format!(
+                    "移动菜单 \"{}\"（{}）：上级从 {} 改为 \"{}\"（{}）",
+                    saved.name, saved.id, old_parent_desc, parent_name, new_parent
+                ),
+                TargetType::Menu,
+                saved.id,
+                ChangeType::Update,
+                Some(saved.name.clone()),
+            );
         }
     } else if let Some(old_parent) = before.parent_id {
         // `parent_id: null` 现在真的生效了（此前返回 200 却什么也没做）
-        audit.push(format!(
-            "移动菜单 \"{}\"（{}）：摘成根菜单，不再挂在上级 {} 下",
-            saved.name, saved.id, old_parent
-        ));
+        audit.push_targeted(
+            format!(
+                "移动菜单 \"{}\"（{}）：摘成根菜单，不再挂在上级 {} 下",
+                saved.name, saved.id, old_parent
+            ),
+            TargetType::Menu,
+            saved.id,
+            ChangeType::Update,
+            Some(saved.name.clone()),
+        );
     }
     Ok(Json(ApiResponse::success(MenuNode::from(saved))))
 }
@@ -356,10 +382,16 @@ pub async fn restore_menu_permission(
         )));
     }
     let restored = state.menu_repo.restore_permission(id).await?;
-    audit.push(format!(
-        "恢复菜单 \"{}\"（{}）的权限码 \"{restorable}\"",
-        restored.name, restored.id
-    ));
+    audit.push_targeted(
+        format!(
+            "恢复菜单 \"{}\"（{}）的权限码 \"{restorable}\"",
+            restored.name, restored.id
+        ),
+        TargetType::Menu,
+        restored.id,
+        ChangeType::Grant,
+        Some(restored.name.clone()),
+    );
     tracing::info!("管理员恢复菜单权限码: {} (码: {restorable})", restored.name);
     Ok(Json(ApiResponse::success(MenuNode::from(restored))))
 }
@@ -407,10 +439,17 @@ pub async fn delete_menu(
         .unwrap_or_else(|_| format!("<{id}>"));
     state.menu_repo.delete(id).await?;
     let revoked = audit::codes("随之从角色收回的权限码", &granted_codes);
-    audit.push(match revoked.is_empty() {
-        true => format!("删除菜单 \"{name}\"（{id}）"),
-        false => format!("删除菜单 \"{name}\"（{id}）；{revoked}"),
-    });
+    audit.push_targeted(
+        match revoked.is_empty() {
+            true => format!("删除菜单 \"{name}\"（{id}）"),
+            false => format!("删除菜单 \"{name}\"（{id}）；{revoked}"),
+        },
+        TargetType::Menu,
+        id,
+        ChangeType::Delete,
+        // 菜单行已随级联删除消失，这一列是"删的是哪个按钮"的最后存档
+        Some(name.clone()),
+    );
     Ok(Json(ApiResponse::success("删除成功")))
 }
 
@@ -478,10 +517,45 @@ pub async fn assign_role_menus(
         .clone()
         .unwrap_or_else(|| format!("<{role_id}>"));
     let diff = audit::diff_summary(&before_codes, &after_codes, "授予权限码", "撤销权限码");
-    audit.push(match diff.is_empty() {
+    // 结构化对象：角色本身 + 这次真正动过的那些菜单（v0.26.0）
+    //
+    // 菜单 target 取自**求差后的权限码**反查，而不是提交的 `req.menu_ids`：
+    // 全量替换语义下，提交上来的集合里绝大多数菜单本来就有权限，
+    // 拿它当 target 会让"这个按钮被谁动过"答出一堆没动过的按钮。
+    let (added_codes, removed_codes) = audit::diff_sets(&before_codes, &after_codes);
+    let touched = state
+        .menu_repo
+        .find_menu_ids_by_permission_codes(&[added_codes.clone(), removed_codes.clone()].concat())
+        .await?;
+
+    let line = match diff.is_empty() {
         // 重复提交同一份集合：什么都没变，如实记成"无变化"而不是伪造一次授权
         true => format!("角色 \"{role_name}\"（{role_id}）的权限码无变化"),
         false => format!("角色 \"{role_name}\"（{role_id}）权限码变更：{diff}"),
-    });
+    };
+    // 无变化时不声明任何 target：这次什么都没动，
+    // 往 target 表里写一行会让"这个按钮被改过"出现假阳性。
+    if diff.is_empty() {
+        audit.push(line);
+    } else {
+        audit.push_targeted(
+            line,
+            TargetType::Role,
+            role_id,
+            // 授予与撤销同时发生时记 `grant`：这一条回答的是
+            // "这个角色的权限被谁动过"，而动它的**动作**就是授权变更。
+            // 逐菜单的授予/撤销方向由下面每个菜单 target 自己表达。
+            ChangeType::Grant,
+            Some(role_name.clone()),
+        );
+        for (menu_id, code) in touched {
+            let change = if added_codes.contains(&code) {
+                ChangeType::Grant
+            } else {
+                ChangeType::Revoke
+            };
+            audit.add_target(TargetType::Menu, menu_id, change, Some(code));
+        }
+    }
     Ok(Json(ApiResponse::success("权限分配成功")))
 }

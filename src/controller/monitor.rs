@@ -115,6 +115,8 @@ pub async fn reset_metrics(
     state.metrics_collector.reset().await;
     // 指标清零会抹掉"此前谁在高频调用"的证据，
     // 因此这条本身必须是可审计的，否则清零就是一次无痕擦除
+    // **不声明结构化 target**：指标是进程内的计数器，重置不改动任何
+    // 业务对象。硬挂一个 target 只会让"这个用户被谁改过"平白多出一条。
     audit.push("重置全部接口指标（耗时与调用计数清零）");
     Ok(Json(ApiResponse::success("指标已重置")))
 }
