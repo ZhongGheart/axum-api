@@ -83,12 +83,40 @@ jobs:
       # 集成测试需要真实 Postgres + Redis，故标记为 #[ignore] 并在此显式运行
       - name: Install moto (S3 mock)
         run: |
-          pip install --quiet "moto[server]"
-          moto_server -p 59000 -H 127.0.0.1 &
+          # 必须装进独立 venv，不能直接 `pip install moto[server]`。
+          #
+          # GitHub runner 镜像自带 apt 版 boto3/botocore
+          # （/usr/lib/python3/dist-packages），而裸 pip 装的 moto 落在
+          # ~/.local。pip 认为 "boto3 已满足" 而不再装一份，于是形成错配：
+          # 新 moto → 系统老 botocore → urllib3.contrib.pyopenssl
+          # → 系统老 pyOpenSSL，ABI 不匹配直接报
+          # `AttributeError: module 'lib' has no attribute 'GEN_EMAIL'`。
+          # moto_server 起不来，后续建 bucket 的 curl 连接被拒（退出码 7）。
+          #
+          # 难查的地方在于 pip 全程绿灯：错配发生在解释器的 import 期，
+          # 不在安装器里，所以安装日志里看不到任何异常。
+          # venv 里系统包彻底不可见，依赖由 pip 自己解析成一致的一套。
+          # （本地实测：venv 中 pyOpenSSL 压根没装，那条崩溃路径就不存在。）
+          python3 -m venv /tmp/moto-venv
+          /tmp/moto-venv/bin/pip install --quiet --upgrade pip
+          /tmp/moto-venv/bin/pip install --quiet "moto[server]~=5.2"
+
+          /tmp/moto-venv/bin/moto_server -p 59000 -H 127.0.0.1 &
           for i in $(seq 1 40); do
-            curl -sf http://127.0.0.1:59000/ && break
+            curl -sf http://127.0.0.1:59000/ > /dev/null && break
             sleep 0.5
           done
+
+          # 就绪必须**断言**。原来的写法里 `for` 循环即使一次都没成功，
+          # 循环体结束后的退出码仍是 0，于是流程继续往下走，
+          # 直到建 bucket 的 curl 才以"退出码 7"失败——
+          # 报出来的是一个连接错误，真正的原因（moto 压根没起来）被埋掉了。
+          if ! curl -sf http://127.0.0.1:59000/ > /dev/null; then
+            echo "::error::moto_server 未能在 20 秒内就绪，服务日志如下："
+            jobs -l || true
+            exit 1
+          fi
+
           # 建 bucket：程序不建 bucket（那是部署方的责任），
           # 但集成测试自己得准备好，否则第一个上传用例就会失败
           curl -sf -X PUT http://127.0.0.1:59000/axum-test

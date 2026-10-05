@@ -90,6 +90,24 @@
 变成站内相对路径 `/uploads/{key}`——那正是修复目标，那个地址在私有 bucket 上本来就取不到。
 存量数据不迁移。
 
+### CI 修复（v0.28.0 推送后）
+
+首次推送 CI 挂在 `Install moto` 步骤，**与 Rust 代码无关**，是 runner 环境依赖错配：
+
+- GitHub runner 镜像自带 apt 版 boto3/botocore（`/usr/lib/python3/dist-packages`），
+  而裸 `pip install moto[server]` 把 moto 装进 `~/.local`。
+  pip 认为"boto3 已满足"不再装一份，于是新 moto 导入系统老 botocore，
+  再经 `urllib3.contrib.pyopenssl` 拉到系统老 pyOpenSSL，ABI 不匹配报
+  `AttributeError: module 'lib' has no attribute 'GEN_EMAIL'`
+- `moto_server` 起不来 → 建 bucket 的 curl 连接被拒 → 退出码 7
+- **难查点**：pip 全程绿灯，错配发生在解释器 import 期而非安装器，
+  所以安装日志里看不到任何异常
+- **修法**：moto 装进独立 venv（系统包彻底不可见）+ 就绪必须断言。
+  原写法里 `for` 循环一次都没成功时退出码仍是 0，流程继续走到建 bucket 才炸，
+  报出来的是连接错误，真正原因被埋掉
+- 本地实测验证过两条路径：venv 里 moto 5.2.3 起得来、bucket 建得成；
+  失败场景给出 `::error::` 注解 + 服务日志，退出码 1
+
 ### 交付状态
 
 **本地提交，未推送、未打 tag**（用户先前指令：全部工作完成或收到指令再统一推送）。
