@@ -1,6 +1,6 @@
 [package]
 name = "axum-api"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2021"
 description = "Production-grade Rust backend API with Axum, SQLx, JWT auth"
 authors = ["dev"]
@@ -9,6 +9,9 @@ license = "MIT"
 [dev-dependencies]
 # 集成测试通过 tower::ServiceExt::oneshot 直接驱动路由
 tower = { version = "0.5", features = ["util"] }
+# 只为在集成测试里建 S3 mock 的 bucket（opendal 不提供 create_bucket）。
+# reqwest 已由 opendal 传递引入，不额外增加编译产物。
+reqwest = { version = "0.13", default-features = false }
 
 [dependencies]
 # Web框架
@@ -76,3 +79,5 @@ aes-gcm = "0.10"
 base32 = "0.5.1"
 getrandom = "0.3"
 base64 = "0.22"
+opendal = { version = "0.59.3", default-features = false, features = ["services-s3", "http-transport-reqwest"] }
+async-trait = "0.1"

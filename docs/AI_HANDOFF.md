@@ -3,6 +3,126 @@
 本文件是跨会话的交接日志。任何非平凡改动在**动手前**先写这里，达成里程碑后更新。
 接手者必须先把它与 `git status` / `git diff` / 实际文件系统对账。
 
+## v0.27.0 对象存储抽象 D2（2026-10-05 会话 · 🚧 进行中）
+
+### 当前目标
+
+用户指令：**继续下一版 v0.27.0**。ROADMAP 定的 v0.27.0 = **D2 对象存储抽象**，
+兑现 v0.20.0 记下的技术债（头像写死在本地磁盘 `UPLOAD_DIR`）。
+
+### 起始 git 状态
+
+- 分支 `master`，`HEAD == 112c80ba`（v0.26.0），**v0.26.0 未推送、未打 tag**
+- 本地 `v0.25.0` tag 仍未推送，指向 `41ded0a9`
+- Rust 1.99.0 已是全局默认
+- **工作区已被上一段调研弄脏**：`Cargo.toml` 末行加了 opendal，`Cargo.lock` 343→424 包。
+  这是本版要用的依赖，故**不回退**；干净副本留在 `/tmp/Cargo.toml.v26`、`/tmp/Cargo.lock.v26`
+
+### 调研结论（动手前已确认，不是猜测）
+
+1. **前端天然兼容绝对 URL**。`frontend/src/utils/avatar.ts` 的 `resolveAvatarUrl`
+   已有 `^(https?:)?\/\//` 与 `data:` 的提前返回，所以 S3/CDN 地址不需要动前端。
+2. **真正的阻塞在 DB**。`migrations/014` 的 `users_avatar_url_relative_path`
+   硬编码 `avatar_url ~ '^/uploads/[A-Za-z0-9._/-]+$'`，绝对 URL 存不进去。
+   014 注释里还记着一条踩坑：单条正则不够，`.` 与 `/` 同在一个字符类会让 `..` 天然合法，
+   实测 `/uploads/../etc/passwd` 被直接接受。所以放宽时**必须保留**那条
+   `..` 完整路径段的独立约束。
+3. **opendal 0.59.3 + moto 能真测**，不必盲发（本机无 docker、无 minio、无云凭据）。
+   `moto[server]` 已装（5.2.3），探针已在 `127.0.0.1:59000` 跑通
+   write/read/exists/delete。踩过的 API 坑见下。
+4. **依赖代价已量化**：`opendal`（`services-s3,http-transport-reqwest`）带 +78 个传递依赖，
+   其中含 `aws-lc-sys`（**需要 cmake + C 编译器**）。本机与 CI（ubuntu-latest）都有，
+   风险可接受，但要在 CHANGELOG 里写明。
+
+### opendal 0.59 的 API 坑（务必照抄，否则编译不过）
+
+- `S3` 是 **builder**：`.root(..).bucket(..).endpoint(..)…` 链式，**不是字段赋值**
+- **`.bucket()` 必须给**，否则 `ConfigInvalid: The bucket is misconfigured`
+- `Operator::new(b)?` 直接返回 `Operator`，**没有 `.finish()`**
+- 必须显式 `opendal::install_default()`，否则报 "default HTTP transport is not installed"
+- feature 必须用 umbrella 名 **`http-transport-reqwest`**，
+  不能用 `-rustls-no-provider` 子 feature，否则 `install_default()` 的 cfg 不生效
+
+### 本版的核心设计决策（与直觉相反的一处，理由充分）
+
+**用户自助改资料的 `avatar_url` 校验不放宽，只有 DB 约束放宽。**
+
+`normalize_avatar_url` 只挂在 `UpdateProfileRequest` 的 serde 反序列化器上
+（`controller/auth.rs:197`），而上传端点 `update_profile(..., Some(Some(&saved.url)))`
+走 service→repo 直连，**本来就不经过这个校验**。所以：
+
+- DB CHECK 放宽到接受 `https?://...`：为了能存对象存储地址
+- `normalize_avatar_url` **保持只认 `/uploads/`**：用户输入若能填任意绝对 URL，
+  任何用户都能让管理员的浏览器在用户列表页加载攻击者指定的地址（Referer 泄露 / 追踪像素）。
+  对象存储地址由服务端生成，不需要让用户手填
+
+### 落地结果（已完成，待提交）
+
+**新增**
+
+- `src/storage/mod.rs` — `Storage` trait（`put`/`delete`/`get`/`public_url`/`key_of_url`）
+  + `key_of_url_under`（两个后端共用的反解，删除路径上唯一的越权防线）
+- `src/storage/local.rs` — 本地磁盘，**默认后端**，v0.20.0 的逻辑原样搬过来
+- `src/storage/s3.rs` — opendal S3 兼容后端
+- `migrations/021_avatar_url_object_storage.sql` — 放宽 `users_avatar_url_relative_path`
+  接受 `https?://`，新增长度 CHECK；**保留 014 的 `..` 段约束不动**
+- 集成用例 5 条（3 条打 moto）+ 单元测试 22 条
+- `scripts/test_env.sh` 起 moto；CI 加 `moto[server]` 步骤
+
+**删除**：`src/utils/upload.rs`（逻辑搬进 `storage::local`，含原 4 个单测）
+
+**改名**：`UploadConfig` → `StorageConfig`，`Config.upload` → `Config.storage`，
+`AppState.upload_config` → `storage_config`，并新增 `AppState.storage: Arc<dyn Storage>`
+
+### 落地时改的三处设计（与原计划不同，理由已写进代码注释）
+
+1. **object key 与对外 URL 分开，删除只按 key 走。**
+   ROADMAP 只说"存储抽象"。只存 URL 的话删除要从 URL 反解 key，
+   等于把 v0.20.0 的"校验路径前缀"防护再手写一遍正则，而输入来自数据库、
+   跨两个后端的形态。反解不出就跳过，**绝不猜**（猜错就是删别人的对象）。
+2. **只放宽 DB，不放宽用户输入的校验。**（原计划未提，见上）
+3. **`S3_KEY_PREFIX` 默认空，不是 `avatars`。** key 已含 `avatars/`，
+   默认再叠加会得到 `avatars/avatars/x.png` —— **实测发现的**，
+   第一版 S3 集成测试就是被这条绊倒的。
+
+### 三个值得记的实测结论
+
+1. **moto 的 bucket 默认私有，匿名 GET 返回 403 而对象好好地在那里。**
+   第一版测试用匿名 GET 验证"对象写进去了"，结果对着 403 判失败。
+   差点让人去给 bucket 开公共读——那正是文档里说最不该用的配置。
+   现在改走**带签名的存储层 `state.storage.get()`**，顺带也验证了生产读路径。
+2. **"对着空目录断言 404"是恒真的。** S3 后端下 `/uploads` 必须 404 这条，
+   第一版注入"所有后端都挂 ServeDir"的缺陷时**照样全绿**——
+   因为 ServeDir 挂着但目录里没东西时同样回 404。
+   改成先在本地目录**真放一个文件**再断言，缺陷才咬得住（left: 200, right: 404）。
+3. **`make_plain_user` 自己生成用户名并返回**，传前缀进去再拿自己的
+   `unique()` 去登录必然 401。写测试时踩了一次。
+
+### 改了 v0.20.0 的一条既有断言（不是删测试）
+
+`the_database_refuses_avatar_paths_that_escape_the_uploads_prefix`
+原先把 `https://evil.example/x.png` 列为"DB 必须拒绝"。v0.27.0 必须接受绝对 URL，
+故移到接受清单。**拦外链的职责上移到应用层**（`normalize_avatar_url`），
+分工变成：DB 挡形状与穿越，应用层挡用户能否自填外链。
+已在函数文档与用例注释里写明，并另立一条用例守住应用层那道防线。
+
+### 门禁
+
+- `cargo fmt --all --check` ✓
+- `cargo clippy --all-targets --all-features -D warnings` ✓ 0 warning
+- `cargo test --locked --lib` **152 passed**（原 130，+22）
+- `cargo test --locked --test api_integration -- --ignored --test-threads=1`
+  全量在跑；单独跑过新增 6 条与被改的 1 条，均通过
+- 版号已抬到 0.27.0（Cargo.toml / frontend/package.json / Cargo.lock）
+- CHANGELOG `[0.27.0]`、README 环境变量表、ROADMAP v0.27.0 章节均已补
+
+### 门禁后待办
+
+前端 `pnpm lint / typecheck / test / build` 未跑（本版未动前端代码，
+但版号改了 package.json）。然后本地提交，**不推送、不打 tag**（沿用用户先前指令）。
+
+---
+
 ## v0.26.0 审计明细结构化查询 D1（2026-10-05 会话 · ✅ 已完成，已本地提交未推送）
 
 ### 当前目标

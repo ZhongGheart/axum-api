@@ -275,7 +275,7 @@ pub async fn upload_avatar(
     // 调用方没法只靠 `code` 分支处理。
     multipart: Result<axum::extract::Multipart, axum::extract::multipart::MultipartRejection>,
 ) -> Result<Json<ApiResponse<AvatarUploadResponse>>, AppError> {
-    let cfg = state.upload_config.clone();
+    let cfg = state.storage_config.clone();
 
     let mut multipart = multipart
         .map_err(|e| AppError::BadRequest(format!("请求必须是 multipart/form-data: {e}")))?;
@@ -325,7 +325,7 @@ pub async fn upload_avatar(
         )));
     }
 
-    let saved = crate::utils::upload::save_avatar_bytes(&cfg, &mime, &bytes).await?;
+    let saved = state.storage.put(&mime, &bytes).await?;
 
     // 旧头像必须在**写入新值之前**读出来：写完之后库里已经指向新文件，
     // 回头再读只能读到新路径，"替换掉旧文件"这件事就悄悄失效了。
@@ -345,20 +345,26 @@ pub async fn upload_avatar(
         .update_profile(auth_user.user_id, None, Some(Some(&saved.url)))
         .await
     {
-        if let Err(cleanup_err) =
-            crate::utils::upload::delete_uploaded_avatar(&cfg, &saved.url).await
-        {
-            tracing::warn!("头像写入用户失败后清理文件也失败了: {cleanup_err}");
+        if let Err(cleanup_err) = state.storage.delete(&saved.key).await {
+            tracing::warn!("头像写入用户失败后清理对象也失败了: {cleanup_err}");
         }
         return Err(e);
     }
 
-    // 替换掉旧头像：不清的话磁盘上会累积用户的每一版头像，
+    // 替换掉旧头像：不清的话存储里会累积用户的每一版头像，
     // 而界面上永远只显示最新那一版。
+    //
+    // 旧值的形态取决于**当初上传时用的后端**（v0.27.0 之后可能是 S3 绝对 URL），
+    // 所以删除走 `storage.key_of_url`：反解不出 key 就跳过，
+    // 而不是硬把 URL 当成本地路径——那样会在切后端后开始报错或误删。
     if let Some(old) = old_avatar.as_deref() {
         if old != saved.url {
-            if let Err(e) = crate::utils::upload::delete_uploaded_avatar(&cfg, old).await {
-                tracing::warn!("删除旧头像失败（不影响本次上传结果）: {e}");
+            if let Some(old_key) = state.storage.key_of_url(old) {
+                if let Err(e) = state.storage.delete(&old_key).await {
+                    tracing::warn!("删除旧头像失败（不影响本次上传结果）: {e}");
+                }
+            } else {
+                tracing::info!("旧头像不属于当前存储后端，跳过删除: {old}");
             }
         }
     }

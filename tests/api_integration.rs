@@ -16,12 +16,13 @@ use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tower::ServiceExt;
 
 use axum_api::config::{
-    AuditLogConfig, Config, DatabaseConfig, MetricsConfig, RateLimitConfig, RedisConfig,
-    SecurityConfig, UploadConfig,
+    AuditLogConfig, Config, DatabaseConfig, MetricsConfig, RateLimitConfig, RedisConfig, S3Config,
+    SecurityConfig, StorageBackend, StorageConfig,
 };
 use axum_api::middleware::api_metrics::{EndpointMetric, MetricsCollector};
 use axum_api::repository::audit_log::AuditLogRepository;
@@ -84,7 +85,8 @@ fn test_config(login_max_failures: u64) -> Config {
             key_ttl_seconds: 600,
             max_buffered_endpoints: 1000,
         },
-        upload: UploadConfig {
+        storage: StorageConfig {
+            backend: StorageBackend::Local,
             // 每个用例一个独立目录：头像上传会真的写盘，
             // 共用目录会让用例之间互相看到对方的文件，
             // "旧头像被删掉了"这类断言就会因为上一条用例而假绿。
@@ -99,6 +101,7 @@ fn test_config(login_max_failures: u64) -> Config {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            s3: None,
         },
         migrate_on_startup: true,
     }
@@ -10555,6 +10558,22 @@ async fn the_profile_endpoint_refuses_fields_it_does_not_own() {
 /// 于是 `/uploads/../etc/passwd` 被直接接受（UPDATE 1，不是报错）。
 /// 应用层有逐段检查所以 HTTP 路径拦得住，但绕过应用直写库的路径会穿透，
 /// 而这一列的 CHECK 存在的意义恰恰就是那条路径。
+///
+/// ── v0.27.0 改了这条断言，理由是防线换了地方而不是被删了 ──
+///
+/// 本用例原先把 `https://evil.example/x.png` 也列为"必须被 DB 拒绝"。
+/// v0.27.0 引入对象存储后**必须**接受绝对 URL（否则 S3 后端存不进头像地址），
+/// 所以它从拒绝清单移到了接受清单。
+///
+/// 拦外链的职责**没有消失，只是上移到了应用层**：
+/// `normalize_avatar_url` 只挂在 `UpdateProfileRequest` 的反序列化器上，
+/// 用户手填的外链被它以 400 拒掉（由
+/// `a_profile_update_still_refuses_a_hand_written_external_avatar_url` 覆盖）；
+/// 而上传端点走 service→repo 直连、**本来就不经过它**，写进去的都是服务端
+/// 自己生成的地址，不需要再查一遍。
+///
+/// 分工变成：DB 挡**形状与穿越**（`..`、协议相对 URL、非 http(s) 协议、超长），
+/// 应用层挡**用户能不能自己指定一个外链**。
 #[tokio::test]
 #[ignore = "需要真实 Postgres + Redis"]
 async fn the_database_refuses_avatar_paths_that_escape_the_uploads_prefix() {
@@ -10564,7 +10583,13 @@ async fn the_database_refuses_avatar_paths_that_escape_the_uploads_prefix() {
 
     // 合法值必须先确认能写进去，否则下面的"被拒"可能只是约束写得太严，
     // 而一条过严的约束同样会挡住合法上传——那样测出来的是"被拒"，不是"被正确挡住"
-    for ok in ["/uploads/a.png", "/uploads/a..b.png", "/uploads/x/y/z.jpg"] {
+    for ok in [
+        "/uploads/a.png",
+        "/uploads/a..b.png",
+        "/uploads/x/y/z.jpg",
+        // v0.27.0：对象存储的绝对地址必须能存进去
+        "https://cdn.example.com/avatars/x.png",
+    ] {
         let res = sqlx::query("UPDATE users SET avatar_url = $2 WHERE id = $1")
             .bind(id)
             .bind(ok)
@@ -10573,14 +10598,18 @@ async fn the_database_refuses_avatar_paths_that_escape_the_uploads_prefix() {
         assert!(res.is_ok(), "合法头像路径 {ok} 不该被拒: {:?}", res.err());
     }
 
+    // 注意 `https://evil.example/x.png` 已不在这里：v0.27.0 起 DB 接受
+    // 任何 http(s) 绝对地址，拦外链的职责在应用层（见上方说明与函数文档）
     for bad in [
         "/uploads/../etc/passwd",
         "/uploads/a/../../b",
         "/uploads/a/..",
         "/uploads/..",
-        "https://evil.example/x.png",
+        // 协议相对 URL：浏览器会当成外域，而它既不是站内路径也不是 http(s)
         "//evil.example/x.png",
         "/static/x.png",
+        // 非 http(s) 协议
+        "javascript:alert(1)",
     ] {
         let res: Result<_, sqlx::Error> =
             sqlx::query("UPDATE users SET avatar_url = $2 WHERE id = $1")
@@ -16216,4 +16245,412 @@ fn every_bare_audit_push_explains_why_it_declares_no_target() {
          确实没改任何持久对象的话，请在附近注释里写明「不声明 target」及理由。",
         offenders.join("\n  ")
     );
+}
+
+// ============================================================
+// v0.27.0（D2 对象存储抽象）：S3 后端的真实行为
+// ============================================================
+//
+// 这些用例打的是 moto（见 scripts/test_env.sh），**不是 mock**：
+// opendal 真的发 HTTP、真的做 SigV4 签名、真的解析 S3 的状态码。
+// 之所以能做到这一点，是 v0.27.0 开工前先探过 opendal 0.59 ↔ moto 的连通性——
+// 本机没有 docker、没有 minio（官方下载地址已全部 410）、没有云凭据，
+// moto 是唯一能在 CI 里真跑 S3 协议的选项。
+//
+// 需要 `TEST_S3_ENDPOINT` 等变量，缺了就跳过而不是假绿：
+// 一个"因为没配环境变量所以没跑"的测试比没有测试更糟。
+fn s3_endpoint() -> Option<String> {
+    std::env::var("TEST_S3_ENDPOINT")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+fn s3_bucket() -> String {
+    std::env::var("TEST_S3_BUCKET").unwrap_or_else(|_| "axum-test".to_string())
+}
+
+/// 建 bucket（幂等）
+///
+/// opendal 没有 create_bucket，所以这里直接发一次 S3 的 PUT bucket。
+/// 建 bucket 是**部署方**的责任——生产上忘了建的表现是第一次上传头像报 500，
+/// 集成测试自己建是为了不把这件事混进被测行为。
+async fn ensure_s3_bucket(endpoint: &str, bucket: &str) {
+    let client = reqwest::Client::new();
+    for code in [404, 409] {
+        let res = client
+            .put(format!("{endpoint}/{bucket}"))
+            .send()
+            .await
+            .expect("moto 不可达：集成测试需要 scripts/test_env.sh start 起的 moto_server");
+        if res.status().as_u16() != code {
+            // 200 = 已存在（moto 对已存在 bucket 也回 200），其他都视为失败
+            continue;
+        }
+        return;
+    }
+}
+
+/// 配好 S3 后端的测试配置
+fn s3_test_config(prefix: &str) -> Config {
+    let endpoint = s3_endpoint().expect("TEST_S3_ENDPOINT 未设置");
+    let mut cfg = test_config(1_000);
+    cfg.storage = StorageConfig {
+        backend: StorageBackend::S3,
+        // S3 后端不用它，但字段得给值——留着本地路径是为了
+        // 万一断言写错时能看出"读的是本地目录"而不是 S3
+        dir: format!(
+            "{}/axum-api-it-s3-must-not-be-used-{}-{}",
+            std::env::temp_dir().display(),
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ),
+        max_file_size: cfg.storage.max_file_size,
+        allowed_mime_types: cfg.storage.allowed_mime_types.clone(),
+        s3: Some(S3Config {
+            endpoint: Some(endpoint.clone()),
+            bucket: s3_bucket(),
+            region: "us-east-1".to_string(),
+            access_key_id: std::env::var("TEST_S3_ACCESS_KEY_ID")
+                .unwrap_or_else(|_| "testkey".to_string()),
+            secret_access_key: std::env::var("TEST_S3_SECRET_ACCESS_KEY")
+                .unwrap_or_else(|_| "testsecret".to_string()),
+            // 指向 moto 自己的 HTTP 地址 + bucket 段。
+            // 直连 S3 时对外地址**必须含 bucket**（除非前面挂了 CDN
+            // 抹掉这一层），少一段的话头像 URL 少了 bucket，
+            // 表现是"上传成功但 404"——所以这里刻意不省这一段。
+            public_base_url: Some(format!("{endpoint}/{}", s3_bucket())),
+            key_prefix: prefix.to_string(),
+        }),
+    };
+    cfg
+}
+
+/// 经**带签名的存储层**读回对象，验证"服务端真的写了"
+///
+/// 不能用匿名 HTTP GET 去验：moto 的 bucket 默认私有，匿名请求拿到 403
+/// 而对象其实好好地在那里（实测过）。拿 403 当"对象不存在"会把
+/// "bucket 私有"误判成"写丢了"，于是有人去给 bucket 开公共读——
+/// 那正是文档里说最不该用的配置。
+///
+/// 顺带这也是**我们自己那条读路径**的真实执行，
+/// 比在测试里另写一份 S3 客户端更能说明生产行为。
+async fn s3_read_back(state: &axum_api::router::AppState, key: &str) -> Option<Vec<u8>> {
+    state
+        .storage
+        .get(key)
+        .await
+        .expect("读对象失败")
+        .map(|o| o.bytes)
+}
+
+/// S3 后端上传成功后，`avatar_url` 必须是对象存储的绝对地址且真能读回
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis + moto(S3 mock)"]
+async fn an_avatar_uploaded_to_s3_lands_in_the_bucket_and_is_readable() {
+    let Some(_) = s3_endpoint() else {
+        eprintln!("跳过：未设置 TEST_S3_ENDPOINT");
+        return;
+    };
+    let prefix = format!("it-{}", unique("pfx"));
+    let endpoint = s3_endpoint().unwrap();
+    ensure_s3_bucket(&endpoint, &s3_bucket()).await;
+
+    let (app, state) = create_router(s3_test_config(&prefix)).await.unwrap();
+    let admin_tok = admin_token(&app).await;
+    let username = unique("s3_avatar");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let (status, body) = send(
+        &app,
+        multipart_request(
+            &tok,
+            "file",
+            "../../../etc/pwn.png",
+            "image/png",
+            &tiny_png(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "上传失败: {body}");
+    let url = body["data"]["url"].as_str().unwrap().to_string();
+
+    assert!(
+        url.starts_with(&format!("{endpoint}/{}/", s3_bucket())),
+        "S3 后端必须返回对象存储上的绝对地址，而不是站内相对路径: {url}"
+    );
+    assert!(
+        url.contains(&format!("/{prefix}/avatars/")),
+        "key 必须落在配置的 key_prefix 下: {url}"
+    );
+    assert!(
+        !url.contains("..") && !url.contains("pwn"),
+        "对象名绝不能来自客户端文件名: {url}"
+    );
+
+    // 库里写的是同一个地址
+    let (_, me) = send(&app, request("GET", "/api/auth/me", Some(&tok), None)).await;
+    assert_eq!(me["data"]["avatar_url"], url, "对象地址必须写入当前用户");
+
+    // 对象真的进了 bucket，且字节一致
+    let key = url
+        .split(&format!("/{prefix}/"))
+        .nth(1)
+        .expect("URL 里应含 key_prefix");
+    let stored = s3_read_back(&state, key).await;
+    assert!(
+        stored.is_some(),
+        "上传返回的地址在 bucket 里必须真的存在，否则头像存得进却显示不出来"
+    );
+    assert_eq!(
+        stored.unwrap().as_slice(),
+        tiny_png().as_slice(),
+        "落进 bucket 的字节必须与上传一致"
+    );
+}
+
+/// 换头像时旧对象必须从 bucket 里消失
+///
+/// 这是 v0.27.0 唯一一处**行为在 S3 下与本地不同**的地方：
+/// 本地后端删文件，S3 后端发 DELETE。断言钉的是"bucket 里旧对象 404"，
+/// 而不是"某个 delete 被调用过"——后者对空实现也成立。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis + moto(S3 mock)"]
+async fn replacing_an_avatar_removes_the_previous_object_from_the_bucket() {
+    if s3_endpoint().is_none() {
+        eprintln!("跳过：未设置 TEST_S3_ENDPOINT");
+        return;
+    }
+    let prefix = format!("it-{}", unique("pfx"));
+    let (app, state) = create_router(s3_test_config(&prefix)).await.unwrap();
+    let admin_tok = admin_token(&app).await;
+    let username = unique("s3_swap");
+    send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let (_, first) = send(
+        &app,
+        multipart_request(&tok, "file", "a.png", "image/png", &tiny_png()),
+    )
+    .await;
+    let first_url = first["data"]["url"].as_str().unwrap().to_string();
+    let first_key = first_url
+        .split(&format!("/{prefix}/"))
+        .nth(1)
+        .unwrap()
+        .to_string();
+
+    let (_, second) = send(
+        &app,
+        multipart_request(&tok, "file", "b.png", "image/jpeg", &tiny_png()),
+    )
+    .await;
+    let second_url = second["data"]["url"].as_str().unwrap().to_string();
+    assert_ne!(second_url, first_url, "两次上传必须是两个不同对象");
+    assert!(
+        second_url.ends_with(".jpg"),
+        "扩展名必须跟着 MIME 变: {second_url}"
+    );
+
+    assert!(
+        s3_read_back(&state, &first_key).await.is_none(),
+        "旧头像必须从 bucket 里删掉，否则会无限累积用户的每一版头像"
+    );
+    let second_key = second_url.split(&format!("/{prefix}/")).nth(1).unwrap();
+    assert!(
+        s3_read_back(&state, second_key).await.is_some(),
+        "新头像必须还在"
+    );
+}
+
+/// S3 后端下 `/uploads` 静态路由**不存在**
+///
+/// 留着它会返回 200 但内容是切后端前的本地旧图，
+/// 表现为"配了 S3 但头像不更新"——比直接 404 难查得多。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis + moto(S3 mock)"]
+async fn the_uploads_static_route_is_absent_under_the_s3_backend() {
+    if s3_endpoint().is_none() {
+        eprintln!("跳过：未设置 TEST_S3_ENDPOINT");
+        return;
+    }
+    let prefix = format!("it-{}", unique("pfx"));
+    let cfg = s3_test_config(&prefix);
+
+    // 关键：**先在本地目录里真放一个文件**。
+    //
+    // 只对着一个空目录断言 404 是恒真的——ServeDir 挂着但目录里没东西时
+    // 一样回 404，于是"S3 后端下也挂了 ServeDir"这个缺陷照样全绿。
+    // （实测：把路由判断改成"任何后端都挂"后，不放文件的版本依然通过。）
+    // 放上文件后，正确实现回 404，而挂错路由的实现会回 200，
+    // 断言才真的咬得住。
+    let planted = PathBuf::from(&cfg.storage.dir).join("avatars");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(
+        planted.join("planted.png"),
+        b"local-file-that-must-not-be-served",
+    )
+    .unwrap();
+
+    let local_dir = cfg.storage.dir.clone();
+    let (app, _state) = create_router(cfg).await.unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/uploads/avatars/planted.png")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "S3 后端下 /uploads 必须 404：文件明明在本地目录里，回 200 就说明 \
+         ServeDir 还挂着，浏览器会拿到切后端前的旧图而不是 S3 上的新图"
+    );
+
+    let _ = std::fs::remove_dir_all(&local_dir);
+}
+
+/// 库里存过的**绝对 URL** 必须能被 `PUT /api/auth/profile` 原样带回
+///
+/// 这一条覆盖的是 v0.27.0 的核心契约变化：`avatar_url` 现在可能是对象存储地址，
+/// 而 profile 端点的反序列化器仍只认 `/uploads/` 开头——两者不冲突，
+/// 因为该校验只管**用户手填的值**，不校验服务端自己写进去的地址。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_profile_update_still_refuses_a_hand_written_external_avatar_url() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (username, id) = make_plain_user(&app, &admin_tok, "avatar_ext").await;
+    let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    // 用户手填外链必须被拒：放开它等于让任何用户
+    // 都能让管理员的浏览器在用户列表页加载攻击者指定的地址
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/profile",
+            Some(&tok),
+            Some(json!({ "avatar_url": "https://evil.example.com/x.png" })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "用户手填的绝对 URL 必须被拒: {body}"
+    );
+
+    let (_, me) = send(&app, request("GET", "/api/auth/me", Some(&tok), None)).await;
+    assert!(
+        me["data"]["avatar_url"].is_null(),
+        "被拒的请求不该写进 avatar_url: {me}"
+    );
+
+    // 而库里存过的对象存储地址不该被后续的 profile 更新弄坏
+    sqlx::query("UPDATE users SET avatar_url = $2 WHERE id = $1")
+        .bind(id)
+        .bind("https://cdn.example.com/avatars/x.png")
+        .execute(&pool().await)
+        .await
+        .expect("直写库模拟历史数据失败");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "PUT",
+            "/api/auth/profile",
+            Some(&tok),
+            Some(json!({ "display_name": "改名就好" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["avatar_url"], "https://cdn.example.com/avatars/x.png",
+        "只改展示名时，已有的对象存储地址必须原样保留"
+    );
+}
+
+/// DB 层必须接受对象存储地址，但仍挡住路径穿越
+///
+/// 014 已记过一次坑：`.` 与 `/` 同在一个字符类里会让 `..` 天然合法，
+/// 实测 `/uploads/../etc/passwd` 被直接接受。所以这里同时验正反两面——
+/// 只测"绝对 URL 能存进去"的话，把 `..` 检查误删了这个版本照样全绿。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn the_database_accepts_object_storage_urls_but_still_refuses_traversal() {
+    let app = app().await;
+    let admin_tok = admin_token(&app).await;
+    let (_username, id) = make_plain_user(&app, &admin_tok, "avatarurlck").await;
+
+    let accepted = [
+        "https://cdn.example.com/avatars/x.png",
+        "http://minio.internal:9000/bucket/avatars/x.webp",
+        "/uploads/avatars/x.png",
+    ];
+    for url in accepted {
+        let res = sqlx::query("UPDATE users SET avatar_url = $2 WHERE id = $1")
+            .bind(id)
+            .bind(url)
+            .execute(&pool().await)
+            .await;
+        assert!(res.is_ok(), "{url} 必须能存进 avatar_url: {res:?}");
+    }
+
+    let refused = [
+        // 路径穿越（014 的老坑，形状放宽后最容易复发）
+        "/uploads/../etc/passwd",
+        "https://cdn.example.com/avatars/../../etc/passwd",
+        "/uploads/avatars/../../../secret",
+        // 协议相对 URL：浏览器会当成外域
+        "//evil.example.com/x.png",
+        // 非 http(s) 协议：javascript: 在 img src 上不生效，但不该进库
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        // 超长（列宽 512，静默截断会产生半条 URL）
+        "https://cdn.example.com/avatars/x.png?pad=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ];
+    for url in refused {
+        let res = sqlx::query("UPDATE users SET avatar_url = $2 WHERE id = $1")
+            .bind(id)
+            .bind(url)
+            .execute(&pool().await)
+            .await;
+        assert!(res.is_err(), "{url} 必须被 DB 约束拒掉，却存进去了");
+    }
 }

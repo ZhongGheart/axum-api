@@ -65,7 +65,7 @@
 | 角色与授权 | ✅ | 角色增删改（**分页**）+ 菜单/权限码授权树；授权**要么完整成功、要么整体回滚**；内置角色不可删除、不可改名；自定义角色可直接分配给用户 |
 | 用户管理 | ✅ | 增删改查（分页 + `keyword` 真搜索，另可按 `role` / `is_active` 筛选）、批量删除、状态切换、重置密码；**多角色分配**；含"最后一个管理员"保护 |
 | 个人资料 | ✅ | `PUT /api/auth/profile` 自助改**展示名**与头像路径，字段级**三态**语义（不带 = 不改 / `null` = 清空 / 带值 = 设置），前端不必先读旧值再原样回写（那是典型的丢失更新） |
-| 头像上传 | ✅ | `POST /api/auth/profile/avatar`（multipart，字段名 `file`）：**文件名由服务端生成 UUID**、扩展名由 MIME 白名单推导（绝不用客户端文件名拼路径）；替换时删旧文件，写库失败删新文件；`/uploads` 静态路由挂在鉴权之外。**落盘目录需挂卷**，见 `UPLOAD_DIR` |
+| 头像上传 | ✅ | `POST /api/auth/profile/avatar`（multipart，字段名 `file`）：**文件名由服务端生成 UUID**、扩展名由 MIME 白名单推导（绝不用客户端文件名拼路径）；替换时删旧文件，写库失败删新文件；`/uploads` 静态路由挂在鉴权之外。**落盘目录需挂卷**，见 `UPLOAD_DIR`。v0.27.0 起后端可切到 S3 兼容对象存储，见 `STORAGE_BACKEND` |
 | 管理员解锁 | ✅ | `POST /api/admin/users/{id}/unlock` + **独立权限码 `system:user:unlock`**（不被 `system:user:update` 顺带放行）。清的是**用户名与邮箱两个桶**，刻意不碰 IP 桶——那是跨账号共享的，清了等于给爆破地址发新额度 |
 | 在线会话 | ✅ | 登录时登记会话，`GET /api/admin/users/{id}/sessions` 列举、**单会话吊销** + 权限码 `system:session:manage`。登记靠 **JWT 自身 TTL** 自过期；**登记失败不放行登录**（漏掉一次登录记录比登录失败更危险：用户毫无察觉） |
 | 批量导入用户 | ✅ | `POST /api/admin/users/import`（CSV，必需列 `username,email,password,roles`）：**逐行成败并带行号**（含表头上限），授权下界整批前置校验，`dry_run` 预览**绝不落库**；**口令一个字都不进审计** |
@@ -208,6 +208,22 @@ postgres / redis 默认**不向宿主机暴露端口**，仅在同网络内可�
 | `METRICS_MAX_BUFFERED_ENDPOINTS` | 否 | `10000` | 单次刷写最多覆盖多少个不同端点，用来给内存占用封顶 |
 | `UPLOAD_DIR` | 否 | `./uploads` | 头像落盘根目录。**容器部署必须挂卷**，否则重建容器会丢掉所有已上传的头像（compose 已配 `uploads:/app/uploads`） |
 | `UPLOAD_MAX_FILE_SIZE` | 否 | `2097152` | 单张头像大小上限（字节，默认 2MB），超出回 413 |
+| `STORAGE_BACKEND` | 否 | `local` | **v0.27.0 新增**：头像存储后端，`local`（落 `UPLOAD_DIR`）或 `s3`。不设置即 `local`，行为与 v0.26.0 完全一致 |
+| `S3_BUCKET` | `s3` 时必填 | — | bucket 名。**程序不会替你建 bucket**，没建的表现是第一次上传头像报 500 |
+| `S3_REGION` | 否 | `us-east-1` | 区域 |
+| `S3_ENDPOINT` | 否 | AWS 默认 | 自建或第三方（MinIO / OSS / COS）**必须显式设置**，否则请求会打到 AWS 官方端点上去 |
+| `S3_ACCESS_KEY_ID` | `s3` 时必填 | — | 访问密钥 ID |
+| `S3_SECRET_ACCESS_KEY` | `s3` 时必填 | — | 访问密钥 |
+| `S3_PUBLIC_BASE_URL` | 否 | `{endpoint}/{bucket}` | 头像的对外访问基地址。**私有 bucket 必须显式给 CDN 或签名网关地址**，否则头像存得进去、显示不出来。直连 S3 时要含 bucket 段（除非 CDN 抹掉了这一层） |
+| `S3_KEY_PREFIX` | 否 | 空 | bucket 内的 key 前缀。key 本身已以 `avatars/` 开头，所以默认不再叠加（叠加会得到 `avatars/avatars/x.png`）。与别的应用共用 bucket 时用它隔开，如 `axum-api/prod` |
+
+**关于 S3 后端的两件事，部署前请先读**：
+
+1. **bucket 必须私有。** 私有 bucket 配 `S3_PUBLIC_BASE_URL` 指向 CDN 是正确用法；
+   把 bucket 设成公共读虽然更省事，但那些 URL 一旦泄露就永久可访问，且无法收回。
+2. **`/uploads` 静态路由在 S3 后端下不存在。** 头像地址是对象存储上的绝对 URL，
+   浏览器直接去那边取。切后端前已存的头像（`/uploads/...` 开头）仍然能用，
+   但**不会**再显示——它们还在本地磁盘上，只是不再被服务。换后端后让用户重传一次即可。
 
 ⚠️ **保留策略不是只写在文档里**：`GET /api/admin/audit-logs/retention` 会返回
 当前部署的真实保留天数、现存最早一条日志的时刻，以及最近一次清理的

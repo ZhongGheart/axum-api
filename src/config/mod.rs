@@ -91,14 +91,59 @@ pub struct MetricsConfig {
     pub max_buffered_endpoints: usize,
 }
 
-/// 头像上传配置
+/// 存储后端选择
 ///
-/// 头像落在**本地磁盘**，由 `tower_http::services::ServeDir` 挂在 `/uploads` 下。
-/// 这是 v0.20.0 的有意取舍：admin 后台不是社交产品，头像丢失可接受，
-/// 而对象存储会引入一整套与"账号自持"主线无关的配置面。替换方案见 ROADMAP v0.22.0。
+/// 由 `STORAGE_BACKEND` 决定，**默认 `local`**——
+/// 未设置任何新环境变量时行为与 v0.26.0 逐字一致，不给存量部署增加任何前置条件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageBackend {
+    /// 本地磁盘（`UPLOAD_DIR`）
+    Local,
+    /// S3 兼容对象存储（S3 / MinIO / OSS / COS 等）
+    S3,
+}
+
+/// S3 兼容后端配置
+///
+/// 只在 `STORAGE_BACKEND=s3` 时读取。
 #[derive(Debug, Clone)]
-pub struct UploadConfig {
-    /// 落盘根目录（相对路径按进程工作目录解析）
+pub struct S3Config {
+    /// endpoint。AWS 官方可留空走 `https://s3.<region>.amazonaws.com`；
+    /// MinIO / OSS / COS 这类自建或第三方必须显式给。
+    pub endpoint: Option<String>,
+    /// bucket 名
+    pub bucket: String,
+    /// 区域
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    /// 对外访问用的基地址，如 CDN 域名 `https://cdn.example.com`
+    ///
+    /// **要包含 bucket 段**（除非前面挂了 CDN 抹掉了 bucket 这一层）：
+    /// 直连 S3 时应是 `{endpoint}/{bucket}`，挂 CDN 时是 CDN 根域名。
+    ///
+    /// 留空则按 `{endpoint}/{bucket}` 推导（AWS 则推导到
+    /// `https://{bucket}.s3.{region}.amazonaws.com`）——
+    /// 那只在 bucket 公开读时成立。私有 bucket 必须显式给 CDN
+    /// 或签名网关地址，否则头像存得进去、显示不出来。
+    pub public_base_url: Option<String>,
+    /// bucket 内的 key 前缀（默认空）
+    ///
+    /// key 本身已经以 `avatars/` 开头，所以默认不再加前缀——
+    /// 默认值若也是 `avatars`，URL 会变成 `avatars/avatars/x.png`，
+    /// 看着像笔误而实际能工作，排查时很费时间。
+    ///
+    /// 一个 bucket 常与别的应用共用时，用它隔开
+    /// （如 `axum-api/prod`），别人的清理脚本就不会把头像一起删掉。
+    pub key_prefix: String,
+}
+
+/// 头像存储配置（v0.27.0 由 `UploadConfig` 改名而来）
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    /// 后端选择
+    pub backend: StorageBackend,
+    /// 本地落盘根目录（仅 `backend = local` 时使用，相对路径按进程工作目录解析）
     ///
     /// 容器里必须挂卷到此处，否则重启即丢图。见 docker-compose.yml 的 volume 配置。
     pub dir: String,
@@ -109,6 +154,8 @@ pub struct UploadConfig {
     pub max_file_size: usize,
     /// 允许的图片 MIME 白名单
     pub allowed_mime_types: Vec<String>,
+    /// S3 参数（仅 `backend = s3` 时有意义）
+    pub s3: Option<S3Config>,
 }
 
 /// 应用全局配置
@@ -142,9 +189,55 @@ pub struct Config {
     /// 接口耗时指标聚合配置
     pub metrics: MetricsConfig,
     /// 头像上传配置
-    pub upload: UploadConfig,
+    pub storage: StorageConfig,
     /// 启动时是否自动执行数据库迁移
     pub migrate_on_startup: bool,
+}
+
+/// 读 S3 参数，只在 `STORAGE_BACKEND=s3` 时校验
+///
+/// **启动期就 panic，而不是等到第一次上传头像**：
+/// 配错 endpoint/bucket 的故障如果拖到运行时才发现，表现是"用户传头像报 500"，
+/// 而日志里只有一行 opendal 的英文错误，没人知道是环境变量少写了。
+fn read_s3_config() -> Option<S3Config> {
+    let backend = env::var("STORAGE_BACKEND")
+        .unwrap_or_else(|_| "local".to_string())
+        .to_lowercase();
+    if backend != "s3" {
+        return None;
+    }
+    let required = |name: &str| -> String {
+        env::var(name).unwrap_or_else(|_| {
+            panic!("STORAGE_BACKEND=s3 时必须设置 {name}（S3 兼容后端的连接参数）")
+        })
+    };
+    let bucket = required("S3_BUCKET");
+    let region = env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let access_key_id = required("S3_ACCESS_KEY_ID");
+    let secret_access_key = required("S3_SECRET_ACCESS_KEY");
+    // AWS 官方可以不给 endpoint（由 region 推导），MinIO / OSS / COS 必须给
+    let endpoint = env::var("S3_ENDPOINT")
+        .ok()
+        .map(|v| v.trim_end_matches('/').to_string());
+    if endpoint.is_none() {
+        tracing::warn!(
+            "S3_ENDPOINT 未设置，将按 AWS 默认端点推导；用 MinIO / OSS / COS 时必须显式设置"
+        );
+    }
+    Some(S3Config {
+        endpoint,
+        bucket,
+        region,
+        access_key_id,
+        secret_access_key,
+        public_base_url: env::var("S3_PUBLIC_BASE_URL")
+            .ok()
+            .map(|v| v.trim_end_matches('/').to_string()),
+        key_prefix: env::var("S3_KEY_PREFIX")
+            .unwrap_or_default()
+            .trim_matches('/')
+            .to_string(),
+    })
 }
 
 impl Config {
@@ -308,7 +401,17 @@ impl Config {
                 .expect("LOGIN_FAILURE_WINDOW 必须是有效的数字"),
         };
 
-        let upload = UploadConfig {
+        let storage = StorageConfig {
+            backend: match env::var("STORAGE_BACKEND")
+                .unwrap_or_else(|_| "local".to_string())
+                .to_lowercase()
+                .as_str()
+            {
+                // 留空视作 local：有人在 compose 里写了 `STORAGE_BACKEND=` 却以为没生效
+                "local" | "" => StorageBackend::Local,
+                "s3" => StorageBackend::S3,
+                other => panic!("STORAGE_BACKEND 只能是 local 或 s3，当前是 {other:?}"),
+            },
             dir: env::var("UPLOAD_DIR").unwrap_or_else(|_| "./uploads".to_string()),
             max_file_size: env::var("UPLOAD_MAX_FILE_SIZE")
                 .unwrap_or_else(|_| "2097152".to_string())
@@ -320,6 +423,7 @@ impl Config {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            s3: read_s3_config(),
         };
 
         Self {
@@ -334,7 +438,7 @@ impl Config {
             database,
             audit_log,
             metrics,
-            upload,
+            storage,
             migrate_on_startup,
         }
     }

@@ -49,6 +49,14 @@ jobs:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/axum_api_it
       TEST_REDIS_URL: redis://127.0.0.1:6379
       TEST_JWT_SECRET: integration-test-secret-value-0123456789
+      # S3 mock（v0.27.0）：对象存储后端的集成测试打的是 moto，
+      # 它是 S3 协议的 wire-level 实现，opendal 会真的签名并解析状态码。
+      # 不用 minio 容器是因为 CI 里再拉一层容器慢且脆；
+      # 不用 minio 二进制是因为官方下载地址已全部 410。
+      TEST_S3_ENDPOINT: http://127.0.0.1:59000
+      TEST_S3_BUCKET: axum-test
+      TEST_S3_ACCESS_KEY_ID: testkey
+      TEST_S3_SECRET_ACCESS_KEY: testsecret
 
     steps:
       - name: Checkout
@@ -73,6 +81,18 @@ jobs:
         run: cargo test --locked --all-targets --all-features
 
       # 集成测试需要真实 Postgres + Redis，故标记为 #[ignore] 并在此显式运行
+      - name: Install moto (S3 mock)
+        run: |
+          pip install --quiet "moto[server]"
+          moto_server -p 59000 -H 127.0.0.1 &
+          for i in $(seq 1 40); do
+            curl -sf http://127.0.0.1:59000/ && break
+            sleep 0.5
+          done
+          # 建 bucket：程序不建 bucket（那是部署方的责任），
+          # 但集成测试自己得准备好，否则第一个上传用例就会失败
+          curl -sf -X PUT http://127.0.0.1:59000/axum-test
+
       - name: Integration tests
         run: cargo test --locked --test api_integration -- --ignored --test-threads=1
 

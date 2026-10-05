@@ -13,7 +13,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 // Swagger UI 通过前端 iframe + CDN 渲染
 
-use crate::config::{AuditLogConfig, Config, UploadConfig};
+use crate::config::{AuditLogConfig, Config, StorageConfig};
 use crate::controller::{
     auth, demo, department, dict, menu, monitor, rbac, role, setting, two_factor, user,
 };
@@ -38,7 +38,6 @@ use crate::service::rbac::RbacService;
 use crate::service::setting::SettingService;
 use crate::utils::jwt::JwtUtil;
 use crate::utils::redis::RedisClient;
-use crate::utils::upload;
 
 /// 应用共享状态
 #[derive(Debug, Clone)]
@@ -63,13 +62,37 @@ pub struct AppState {
     /// 当前部署的真实保留天数，而重新读一次环境变量在测试里可能被改过、
     /// 或在多副本部署下与实际跑的清理任务不一致。
     pub audit_log_config: AuditLogConfig,
-    /// 头像上传配置（v0.20.0）
-    pub upload_config: UploadConfig,
+    /// 头像存储配置（v0.27.0 起由 `UploadConfig` 改名）
+    pub storage_config: StorageConfig,
+    /// 存储后端（v0.27.0）
+    ///
+    /// 存 `Arc<dyn Storage>` 而不是枚举：调用方只依赖 trait，
+    /// 将来加第三个后端（OSS 直连、GCS、本地加密盘）不需要改 controller。
+    pub storage: std::sync::Arc<dyn crate::storage::Storage>,
     /// 系统参数服务（v0.22.0）
     ///
     /// 口令策略与登录防护阈值从这里读，**不再**从 `Config` 读常量——
     /// 那样改一次要重启进程，且容器编排里根本没法改。
     pub setting_service: SettingService,
+}
+
+/// 头像的静态访问路由（v0.27.0）
+///
+/// **只有本地后端才有这条路由。** S3 后端把 `avatar_url` 写成对象存储上的
+/// 绝对 URL，浏览器直接去那边取，本进程不参与——此时若仍挂 `ServeDir`，
+/// 读本地目录会返回 200 但内容是上一次切后端前的旧图，
+/// 表现为"改了配置但头像不更新"，比直接 404 更难查。
+fn avatar_static_routes(
+    storage: &Arc<dyn crate::storage::Storage>,
+    config: &StorageConfig,
+) -> Router<AppState> {
+    if storage.backend_name() != "local" {
+        return Router::new();
+    }
+    Router::new().nest_service(
+        crate::storage::UPLOAD_URL_PREFIX,
+        tower_http::services::ServeDir::new(&config.dir),
+    )
 }
 
 /// 构建应用路由
@@ -154,19 +177,10 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         db_pool,
         metrics_collector: metrics_collector.clone(),
         audit_log_config: config.audit_log.clone(),
-        upload_config: config.upload.clone(),
+        storage_config: config.storage.clone(),
+        storage: crate::storage::build(&config.storage)?,
         setting_service: setting_service.clone(),
     };
-
-    // 上传目录必须在挂 ServeDir 之前存在：ServeDir 只在请求到达时才去解析路径，
-    // 目录缺失时的表现是首次访问拿到 404，而不是启动期报错——
-    // 那意味着"部署漏了挂卷"要等到第一个用户传头像时才被发现。
-    if let Err(e) = tokio::fs::create_dir_all(&config.upload.dir).await {
-        return Err(AppError::InternalServerError(format!(
-            "创建上传目录 {} 失败: {e}",
-            config.upload.dir
-        )));
-    }
 
     // ── 配置 CORS ──────────────────────────────────────────────
     let mut cors = CorsLayer::new()
@@ -530,14 +544,14 @@ pub async fn create_router(config: Config) -> Result<(Router, AppState), AppErro
         .merge(dict_read_routes)
         .merge(monitor_routes)
         .merge(setting_routes)
-        // 上传目录的静态访问。**刻意挂在鉴权之外**：
+        // 头像的静态访问。**刻意挂在鉴权之外**：
         // 头像要能被 `<img src>` 直接取，而 `<img>` 无法附带 Authorization 头。
         // 换来的是这些图是公开可读的——头像本来就在用户列表页展示，
         // 这与"用户列表要登录才能看"不是同一个承诺。
-        .nest_service(
-            upload::UPLOAD_URL_PREFIX,
-            tower_http::services::ServeDir::new(&config.upload.dir),
-        )
+        //
+        // S3 后端返回的是对象存储/CDN 上的绝对 URL，浏览器直接去那边取，
+        // 所以这条路由**只对本地后端存在**：留着它只会让人以为配了 S3 也走本地目录。
+        .merge(avatar_static_routes(&state.storage, &config.storage))
         // OpenAPI JSON 端点
         .route(
             "/api/openapi.json",
