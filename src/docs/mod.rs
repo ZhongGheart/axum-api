@@ -231,6 +231,19 @@ mod tests {
     /// 文档页面/规范端点自身不属于业务 API，不纳入覆盖检查
     const META_ENDPOINTS: [&str; 2] = ["/api/openapi.json", "/api/swagger-ui/{*path}"];
 
+    /// 头像字节出口：不作为业务 API 写进 OpenAPI
+    ///
+    /// 同一条路径 `/uploads/{*key}` 在两种后端下是**同一个对外承诺**，
+    /// 只是实现不同：本地后端用 `ServeDir` 直接服务目录，
+    /// S3 私有 bucket 用 handler 从桶里读出来代理回给浏览器
+    /// （见 [`ServeMode`](crate::storage::ServeMode)）。
+    ///
+    /// 把它写进 OpenAPI 只会记下其中一种实现——规范就变成后端相关的了，
+    /// 换后端时文档开始说谎。而它是图片字节不是业务数据，
+    /// 本地那条经 `nest_service` 注册，本来也不在这个检查的视野里，
+    /// 强制补注解只会逼出一份"只对 S3 成立"的文档。
+    const AVATAR_ASSET_ENDPOINT: [&str; 1] = ["/uploads/{*key}"];
+
     /// 路由注册表里出现的路径必须全部同步到 OpenAPI 文档
     ///
     /// 这是反向检查：集成测试只覆盖"文档里有、实现里没有"，
@@ -252,7 +265,10 @@ mod tests {
                 }
             }
         }
-        registered.retain(|path| !META_ENDPOINTS.contains(&path.as_str()));
+        registered.retain(|path| {
+            !META_ENDPOINTS.contains(&path.as_str())
+                && !AVATAR_ASSET_ENDPOINT.contains(&path.as_str())
+        });
         registered.sort();
         registered.dedup();
 

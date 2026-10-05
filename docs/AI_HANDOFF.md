@@ -3,6 +3,101 @@
 本文件是跨会话的交接日志。任何非平凡改动在**动手前**先写这里，达成里程碑后更新。
 接手者必须先把它与 `git status` / `git diff` / 实际文件系统对账。
 
+## v0.28.0 对象存储三缺陷修复（2026-10-05 会话 · ✅ 完成，已本地提交未推送）
+
+### 当前目标
+
+用户指令：**继续开发后续版本**。v0.27.0 收尾时功能缺口已清零，
+本轮改为**拿 v0.27.0 的实现逐处对读它自己写下的契约**，找出代码与文档不符之处。
+查出三处，都有实测依据，不是推测出来的需求。
+
+### 起始 git 状态
+
+- 分支 `master`，`HEAD == 0745f962`（v0.27.0），**v0.26.0 与 v0.27.0 均未推送**
+- 本地 `v0.25.0` tag 仍未推送（指向 `41ded0a9`）
+- PG 55432 / Redis 56379 / moto 59000 由 `./scripts/test_env.sh start` 起，moto bucket 默认私有
+
+### 三个真缺陷（本版修的）
+
+1. **私有 bucket 配 S3 时头像全裂（死锁）**。
+   `Storage::get()` 的文档注释称"私有 bucket 由本进程代理读（见 router）"，
+   **而 router 里没有这条路由**，`get()` 生产代码零调用（只有测试用）。
+   同时 `S3_PUBLIC_BASE_URL` 缺省时退回 `{endpoint}/{bucket}`，
+   把一个需要签名的直连地址写进 `avatar_url`——私有 bucket 上匿名 GET 是 403（moto 实测）。
+   于是"私有 bucket + 没 CDN"头像全裂，唯一"解法"是开公共读，恰是文档说最不该做的配置。
+2. **S3 `put` 漏了体积上限**。`local.rs` 查了 `bytes.len() > max_file_size`，`s3.rs` 没查，
+   而 trait 文档承诺两后端都查。controller 层也查了所以**当时不可外部利用**，
+   但两后端对同一契约行为不一致，绕过 controller 直接调 `storage.put()` 就能写进超大对象。
+3. **删用户不删头像对象 → 孤儿对象永久堆积**。`users` 表是硬删除（无 `deleted_at`），
+   行删后 `avatar_url` 一起没了，对象 key **永久不可恢复**。
+   v0.20.0 时只是磁盘多文件；支持对象存储后是按量计费又无法回收的对象。
+
+### 关键设计决策
+
+- **`ServeMode` 枚举取代字符串比 `backend_name`**。路由挂载原先靠
+  `storage.backend_name() != "local"`；新增后端时那串比较会静默失配，
+  于是新后端悄悄走"什么都不挂"、头像全裂而没人知道。
+  三种模式：`LocalDir`（ServeDir）/ `AppProxy`（handler 代理读）/ `External`（不挂路由）
+- **不设 `S3_PUBLIC_BASE_URL` = AppProxy**（站内相对路径 `/uploads/{key}`），
+  这是私有 bucket 的默认正确姿势；显式给 base = External（浏览器直连，需 CDN 或公共读）。
+- **删用户的头像清理失败只记日志不失败删除**。用户已删，此时报错会让调用方重试，
+  重试撞"用户不存在"，把成功报成失败。
+- **`check_payload` 抽成共享函数**，让"漏掉体积/MIME 校验"不可能发生而不只是没发生。
+
+### 落地时发现并修掉的额外问题
+
+- **`key_of_url` 在 AppProxy 模式下剥错了前缀**（我自己在实现中引入的）。
+  AppProxy 的 `public_url` 是 `/uploads/{key}`，**不含 `key_prefix`**（prefix 只活在桶内部），
+  但 `key_of_url` 照抄 External 分支去剥它 → 配了 `S3_KEY_PREFIX` 时反解必然失败，
+  表现为"换了头像但旧对象永不删除"，静默堆积。单测
+  `the_proxy_mode_round_trips_a_key_despite_a_non_empty_prefix` 钉住这一点。
+- **OpenAPI 路由文档检查被新路由触发**。`src/docs/mod.rs` 的
+  `every_registered_route_is_documented` 解析源码里的 `.route("...")` 字面量。
+  最初用 `format!("{}/{{*key}}")` 拼路径，解析器抓到假路径 `{}/{{*key}}`。
+  改为字面量 `/uploads/{*key}`，并加 `AVATAR_ASSET_ENDPOINT` 豁免——
+  写进 OpenAPI 只会记下 S3 那一种实现，规范会变成后端相关的。
+- **一个测试隔离缺陷（先前就存在，本轮暴露）**：
+  `audit_log_retention_deletes_in_bounded_batches` 断言"第二轮正好删 5 条"，
+  前提是表里只有它自己造的 25 条过期行。复用的测试库堆着上轮残留
+  （本地实测 5188 条过期行），于是删出 50 条、测试变红，与被测逻辑无关。
+  CI 每次全新库所以从未暴露——**只在库被复用时发作的假信号测试**。已改为先清过期行。
+
+### 门禁结果（全部本地实跑）
+
+| 检查 | 结果 |
+|---|---|
+| `cargo fmt --all --check` | ✅ |
+| `cargo clippy --all-targets --all-features -- -D warnings` | ✅ 0 warning |
+| `cargo test --locked --lib` | ✅ 156（基线 152，+4 新单测） |
+| 集成 `cargo test --locked --test api_integration -- --ignored --test-threads=1` | ✅ 232（基线 228，+4 新用例） |
+| `pnpm lint` / `typecheck` / `test` / `build` | ✅ 0 error（1 个既有 warning）/ ✅ / 237 passed / ✅ |
+
+**集成测试必须带环境变量**：`eval "$(./scripts/test_env.sh env)"`。
+
+### 缺陷注入验证（新测试确实咬得住）
+
+两处实现各摘一次，确认对应用例变红后已恢复：
+
+- 注释掉 `delete_user` 里的 `cleanup_avatar(...)` →
+  `deleting_a_user_also_removes_their_avatar_object` 红
+- 把 `AppProxy` 分支的 `.route(...)` 改成 `Router::new()` →
+  `a_private_bucket_still_serves_avatars_through_the_app_itself` 红（404 vs 200）
+
+### 兼容性
+
+默认路径逐字不变（不设 `STORAGE_BACKEND` 仍是本地磁盘，`avatar_url` 仍以 `/uploads/` 开头）。
+唯一行为变化：**S3 后端且没配 `S3_PUBLIC_BASE_URL`** 时，`avatar_url` 从直连绝对地址
+变成站内相对路径 `/uploads/{key}`——那正是修复目标，那个地址在私有 bucket 上本来就取不到。
+存量数据不迁移。
+
+### 交付状态
+
+**本地提交，未推送、未打 tag**（用户先前指令：全部工作完成或收到指令再统一推送）。
+下一个版本起应做的是继续"读代码找假缺口"，而不是排期表往下走——
+排期表保证"该做的都做了"，不保证"做过的事没有假缺口"。
+
+---
+
 ## v0.27.0 对象存储抽象 D2（2026-10-05 会话 · 🚧 进行中）
 
 ### 当前目标
@@ -120,6 +215,58 @@
 
 前端 `pnpm lint / typecheck / test / build` 未跑（本版未动前端代码，
 但版号改了 package.json）。然后本地提交，**不推送、不打 tag**（沿用用户先前指令）。
+
+---
+
+## v0.28.0 存储层三个真缺陷（2026-10-05 会话 · 🚧 进行中）
+
+### 当前目标
+
+用户指令：**继续开发后续版本**。
+
+上一版收尾时说"缺口清零、不该硬凑版本"，用户仍要求继续。
+于是改为**从代码里查真问题**，不凭感觉造需求。查出来三个，**全部有实测依据**，
+且都不是"新功能"，是 v0.27.0 与更早版本留下的实际缺陷。
+
+### 起始 git 状态
+
+- 分支 `master`，`HEAD == 0745f962`（v0.27.0），工作区干净
+- **v0.26.0 与 v0.27.0 两个提交均未推送**；本地 `v0.25.0` tag 仍未推送
+- Rust 1.99.0 全局默认
+
+### 三个缺陷（按严重度）
+
+**A. 私有 bucket 配 S3 时头像**根本显示不出来**，而文档把它写成了"部署前置条件"**
+
+README 与 CHANGELOG 都说"私有 bucket 必须显式给 CDN 或签名网关地址"，
+`s3.rs` 的注释也说"把 endpoint 拼出来的地址直发浏览器只在 bucket 公开读时成立"。
+这在 **v0.27.0 集成测试里被直接观测到**：对 moto 的私有 bucket 发匿名 GET
+拿到的是 **403，而对象好好地在那里**（当时差点误判成"写丢了"）。
+
+也就是说当前状态是：配了私有 bucket 又没 CDN → 头像存得进去、全部裂图，
+唯一的"解法"是开公共读——而那正是文档说最不该做的配置。
+**这是个死锁，不是一条部署须知。**
+
+而 `Storage::get()` 的文档注释写着「S3 后端在 bucket 私有时由本进程代理读（见 router）」，
+**router 里根本没有这条路由**，`get()` 在生产代码里零调用点（只有测试用）。
+即"注释承诺的能力不存在"——本仓反复批驳的那类假完成。
+
+**B. S3 后端的 `put` 不校验体积上限，本地后端校验**
+
+`local.rs:58` 有 `bytes.len() > max_file_size` → 413，`s3.rs` 没有。
+trait 文档承诺「MIME 白名单与体积上限在这里**再查一遍**」。
+controller 那一层确实查了，所以**当前不可被外部利用**；
+但两个后端对同一契约的行为不一致，将来任何人绕过 controller 直接调
+`storage.put()` 就会写进超大对象。
+
+**C. 删除用户不删除其头像对象 → 孤儿对象永久堆积**
+
+`delete_user` 与 `batch_delete_users` 都不碰 `avatar_url`。
+而 `users` 表是**硬删除**（无 `deleted_at`），所以行删掉后
+**对象 key 永久不可恢复**——没有任何地方还知道那个对象存在。
+
+v0.20.0 时这只是"磁盘上多个文件"；v0.27.0 之后是**对象存储里永久留存、
+按量计费、且无法回收**的对象。用户反复建删账号会无上限地推高存储账单。
 
 ---
 

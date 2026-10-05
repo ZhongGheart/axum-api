@@ -45,6 +45,20 @@ pub struct LoadedObject {
     pub content_type: &'static str,
 }
 
+/// 对象由谁提供给浏览器
+///
+/// 决定 router 在 `/uploads` 下挂什么，也决定 [`Storage::public_url`]
+/// 返回站内相对路径还是绝对地址。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeMode {
+    /// 本进程用 `ServeDir` 直接服务本地目录
+    LocalDir,
+    /// 本进程用 handler 从后端读出来再回给浏览器（私有 bucket 且没有 CDN）
+    AppProxy,
+    /// 浏览器直接去对象存储/CDN 取，本进程不参与
+    External,
+}
+
 /// 存储后端
 ///
 /// `Debug` 是**超 trait** 而不是可有可无的便利：`AppState` derive 了 `Debug`，
@@ -73,6 +87,9 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
 
     /// 本后端把 key 渲染成什么 URL
     fn public_url(&self, key: &str) -> String;
+
+    /// 对象由谁提供给浏览器
+    fn serve_mode(&self) -> ServeMode;
 
     /// 从库里存的 URL 反解出 key，用于删除旧对象
     ///
@@ -118,6 +135,39 @@ pub fn content_type_for(key: &str) -> &'static str {
         "gif" => "image/gif",
         _ => "application/octet-stream",
     }
+}
+
+/// 两个后端共用的入参校验
+///
+/// v0.28.0 抽出它是因为 **S3 后端此前漏了体积上限**：
+/// `local.rs` 查了 `bytes.len() > max_file_size`，`s3.rs` 没查，
+/// 而 trait 文档承诺"MIME 白名单与体积上限在这里再查一遍"。
+/// controller 那一层确实也查了，所以当时并**不可被外部利用**——
+/// 但两个后端对同一契约行为不一致，将来任何人绕过 controller
+/// 直接调 `storage.put()` 就会写进超大对象。
+///
+/// 抽出来是为了让"漏掉"这件事不再可能：新增后端不写这行就编译不过。
+pub(crate) fn check_payload(
+    config: &StorageConfig,
+    mime: &str,
+    bytes: &[u8],
+) -> Result<(), AppError> {
+    if bytes.is_empty() {
+        return Err(AppError::BadRequest("图片内容为空".into()));
+    }
+    if bytes.len() > config.max_file_size {
+        return Err(AppError::PayloadTooLarge(format!(
+            "图片不超过 {} 字节，当前 {}",
+            config.max_file_size,
+            bytes.len()
+        )));
+    }
+    if !config.allowed_mime_types.iter().any(|m| m == mime) {
+        return Err(AppError::BadRequest(format!(
+            "不支持的图片类型：{mime}（仅接受 JPEG / PNG / WebP / GIF）"
+        )));
+    }
+    Ok(())
 }
 
 /// 生成一个头像 key

@@ -8,15 +8,17 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 
-use super::{avatar_key, content_type_for, LoadedObject, SavedObject, Storage, UPLOAD_URL_PREFIX};
+use super::{
+    avatar_key, content_type_for, LoadedObject, SavedObject, ServeMode, Storage, UPLOAD_URL_PREFIX,
+};
 use crate::config::StorageConfig;
 use crate::error::AppError;
 
 #[derive(Debug)]
 pub struct LocalStorage {
     root: String,
-    max_file_size: usize,
-    allowed_mime_types: Vec<String>,
+    /// 整份配置保留下来，让体积/MIME 校验与 S3 后端走**同一个**函数
+    config: StorageConfig,
 }
 
 impl LocalStorage {
@@ -31,8 +33,7 @@ impl LocalStorage {
         })?;
         Ok(Self {
             root: root.to_string_lossy().to_string(),
-            max_file_size: config.max_file_size,
-            allowed_mime_types: config.allowed_mime_types.clone(),
+            config: config.clone(),
         })
     }
 
@@ -53,23 +54,10 @@ impl LocalStorage {
 #[async_trait]
 impl Storage for LocalStorage {
     async fn put(&self, mime: &str, bytes: &[u8]) -> Result<SavedObject, AppError> {
-        // 再确认一次体积：调用方可能来自不同的读取路径，
-        // 而"类型过了、体积没过"这种组合必须在这里被拦下，而不是写满磁盘才发现。
-        if bytes.len() > self.max_file_size {
-            return Err(AppError::PayloadTooLarge(format!(
-                "图片不超过 {} 字节，当前 {}",
-                self.max_file_size,
-                bytes.len()
-            )));
-        }
-        if bytes.is_empty() {
-            return Err(AppError::BadRequest("图片内容为空".into()));
-        }
-        if !self.allowed_mime_types.iter().any(|m| m == mime) {
-            return Err(AppError::BadRequest(format!(
-                "不支持的图片类型：{mime}（仅接受 JPEG / PNG / WebP / GIF）"
-            )));
-        }
+        // 再确认一次体积与类型：调用方可能来自不同的读取路径，
+        // 而"类型过了、体积没过"这种组合必须在这里被拦下，
+        // 而不是写满磁盘才发现。与 S3 后端共用同一个函数（见 check_payload 的文档）。
+        super::check_payload(&self.config, mime, bytes)?;
         let key = avatar_key(mime)?;
         let path = self
             .resolve(&key)
@@ -127,6 +115,10 @@ impl Storage for LocalStorage {
 
     fn public_url(&self, key: &str) -> String {
         format!("{UPLOAD_URL_PREFIX}/{key}")
+    }
+
+    fn serve_mode(&self) -> ServeMode {
+        ServeMode::LocalDir
     }
 
     fn key_of_url(&self, url: &str) -> Option<String> {

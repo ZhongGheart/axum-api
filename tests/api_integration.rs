@@ -3242,6 +3242,22 @@ async fn audit_log_retention_removes_only_expired_rows() {
 #[ignore]
 async fn audit_log_retention_deletes_in_bounded_batches() {
     ensure_schema().await;
+    // 先把**过期**行清空，否则下面"删 20 剩 5"根本无从谈起。
+    //
+    // `delete_older_than` 是按 cutoff 全表删的，不只删本测试造的行。
+    // 这条测试断言"第二轮正好删 5 条"，前提是表里除了自己那 25 条
+    // 再没有别的过期数据。而复用的测试库（本地/CI 的缓存实例）里
+    // 往往堆着几千条上一轮跑剩的过期行——实测本地跑到这里会删出 50 条，
+    // 断言直接红，而这与被测逻辑毫无关系。
+    //
+    // CI 每次都是全新库，所以这个缺陷以前从没暴露过：
+    // 它只在"库被复用"时发作，属于典型的假信号测试。
+    // 只删过期的（1 天前），不影响其他测试断言的近期审计内容。
+    sqlx::query("DELETE FROM audit_logs WHERE created_at < now() - interval '1 day'")
+        .execute(&pool().await)
+        .await
+        .unwrap();
+
     let repo = AuditLogRepository::new(pool().await);
     let now = chrono::Utc::now();
     let cutoff = now - chrono::Duration::days(1);
@@ -16325,6 +16341,18 @@ fn s3_test_config(prefix: &str) -> Config {
     cfg
 }
 
+/// **代理模式**的 S3 配置：不配 `S3_PUBLIC_BASE_URL`
+///
+/// 这是私有 bucket 的真实部署形态，也是 v0.27.0 留下的死锁现场——
+/// 那时 `avatar_url` 会被写成 `{endpoint}/{bucket}/...` 这种直连地址，
+/// 私有 bucket 上匿名 GET 是 403，于是头像全裂，而唯一"解法"是开公共读。
+/// v0.28.0 让它退回站内相对路径，由本进程代理读。
+fn s3_proxy_test_config(prefix: &str) -> Config {
+    let mut cfg = s3_test_config(prefix);
+    cfg.storage.s3.as_mut().unwrap().public_base_url = None;
+    cfg
+}
+
 /// 经**带签名的存储层**读回对象，验证"服务端真的写了"
 ///
 /// 不能用匿名 HTTP GET 去验：moto 的 bucket 默认私有，匿名请求拿到 403
@@ -16498,7 +16526,7 @@ async fn replacing_an_avatar_removes_the_previous_object_from_the_bucket() {
 /// 表现为"配了 S3 但头像不更新"——比直接 404 难查得多。
 #[tokio::test]
 #[ignore = "需要真实 Postgres + Redis + moto(S3 mock)"]
-async fn the_uploads_static_route_is_absent_under_the_s3_backend() {
+async fn the_local_dir_static_route_is_absent_under_the_s3_backend() {
     if s3_endpoint().is_none() {
         eprintln!("跳过：未设置 TEST_S3_ENDPOINT");
         return;
@@ -16542,6 +16570,278 @@ async fn the_uploads_static_route_is_absent_under_the_s3_backend() {
     );
 
     let _ = std::fs::remove_dir_all(&local_dir);
+}
+
+/// 私有 bucket 且不配 CDN 时，头像**必须仍然能显示**（v0.28.0 补上的死锁出口）
+///
+/// v0.27.0 的行为：没给 `S3_PUBLIC_BASE_URL` 就退回 `{endpoint}/{bucket}`，
+/// 把这个直连地址写进 `avatar_url`。私有 bucket 上匿名 GET 是 403（实测），
+/// 于是这个部署形态的头像是**全裂**的，而文档给出的唯一"解法"是
+/// 把 bucket 开成公共读——恰是最不该做的配置。两头堵死。
+///
+/// 现在改成：`avatar_url` 退回站内相对路径 `/uploads/{key}`，
+/// 本进程用 handler 从 bucket 读出来再回给浏览器。
+///
+/// 这条测试锁的是**用户看得见的那个结果**：上传返回的地址
+/// 拿过去裸 GET 必须拿到字节和正确的 Content-Type。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis + moto(S3 mock)"]
+async fn a_private_bucket_still_serves_avatars_through_the_app_itself() {
+    let Some(endpoint) = s3_endpoint() else {
+        eprintln!("跳过：未设置 TEST_S3_ENDPOINT");
+        return;
+    };
+    ensure_s3_bucket(&endpoint, &s3_bucket()).await;
+    let prefix = format!("it-{}", unique("pfx"));
+    let (app, _state) = create_router(s3_proxy_test_config(&prefix)).await.unwrap();
+    let admin_tok = admin_token(&app).await;
+    let username = unique("proxy_avatar");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let (status, body) = send(
+        &app,
+        multipart_request(&tok, "file", "me.png", "image/png", &tiny_png()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "上传失败: {body}");
+    let url = body["data"]["url"].as_str().unwrap().to_string();
+
+    assert!(
+        url.starts_with("/uploads/"),
+        "私有 bucket 的地址不能直连浏览器（那会 403），必须退回站内路径: {url}"
+    );
+    assert!(
+        !url.contains(&prefix),
+        "prefix 只活在 bucket 内部，不该出现在对外 URL 里: {url}"
+    );
+
+    // 用户真正会做的那一步：把这个地址塞进 <img src>。
+    // 不带 Authorization —— <img> 没法带。
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(&url).body(Body::empty()).unwrap())
+        .await
+        .expect("请求执行失败");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "头像地址必须真能读出字节，否则私有 bucket 的部署方头像全裂: {url}"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("image/png"),
+        "Content-Type 必须按扩展名给准，否则浏览器按 octet-stream 处理，点了变成下载"
+    );
+    assert!(
+        response.headers().contains_key(header::ETAG),
+        "头像内容不可变（文件名含 UUID），应带 ETag 让浏览器别反复回源"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        tiny_png().as_slice(),
+        "回给浏览器的字节必须与上传的一致"
+    );
+}
+
+/// 代理模式下不存在的 key 必须 404，而不是把桶里的任意东西吐出来
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis + moto(S3 mock)"]
+async fn the_proxy_route_answers_404_for_keys_it_never_generated() {
+    if s3_endpoint().is_none() {
+        eprintln!("跳过：未设置 TEST_S3_ENDPOINT");
+        return;
+    }
+    let prefix = format!("it-{}", unique("pfx"));
+    let (app, _state) = create_router(s3_proxy_test_config(&prefix)).await.unwrap();
+
+    for path in [
+        "/uploads/avatars/does-not-exist.png",
+        // 目录不合法：key 只由 avatar_key 生成，形状恒为 avatars/<uuid>.<ext>
+        "/uploads/not-avatars/x.png",
+        // 穿越尝试
+        "/uploads/avatars/../../etc/passwd",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .expect("请求执行失败");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} 必须 404：反解不出 key 就不该去读桶"
+        );
+    }
+}
+
+/// 删用户必须把头像对象一起删掉（v0.28.0 补）
+///
+/// `users` 表是**硬删除**，行消失后 `avatar_url` 跟着没了，
+/// 那个对象的 key 于是**永久不可恢复**。v0.20.0 时这只是磁盘上多个文件；
+/// 支持对象存储之后，它变成按量计费又无法回收的对象，
+/// 反复建删账号会无上限地推高存储账单。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis + moto(S3 mock)"]
+async fn deleting_a_user_also_removes_their_avatar_object() {
+    let Some(endpoint) = s3_endpoint() else {
+        eprintln!("跳过：未设置 TEST_S3_ENDPOINT");
+        return;
+    };
+    ensure_s3_bucket(&endpoint, &s3_bucket()).await;
+    let prefix = format!("it-{}", unique("pfx"));
+    let (app, state) = create_router(s3_test_config(&prefix)).await.unwrap();
+    let admin_tok = admin_token(&app).await;
+    let username = unique("del_avatar");
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users",
+            Some(&admin_tok),
+            Some(json!({
+                "username": username,
+                "email": format!("{username}@example.com"),
+                "password": "Str0ng!Pass",
+                "roles": ["user"],
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["data"]["id"].as_str().unwrap().to_string();
+    let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+
+    let (status, body) = send(
+        &app,
+        multipart_request(&tok, "file", "me.png", "image/png", &tiny_png()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "上传失败: {body}");
+    let url = body["data"]["url"].as_str().unwrap().to_string();
+    let key = url
+        .split(&format!("/{prefix}/"))
+        .nth(1)
+        .expect("URL 里应含 key_prefix")
+        .to_string();
+    assert!(
+        s3_read_back(&state, &key).await.is_some(),
+        "前置条件：头像对象这时必须在桶里"
+    );
+
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/users/{id}"),
+            Some(&admin_tok),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert!(
+        s3_read_back(&state, &key).await.is_none(),
+        "用户删掉后头像对象必须从桶里消失：users 表是硬删除，\
+         行没了就再没有地方知道这个 key 存在过"
+    );
+}
+
+/// 批量删除同理：头像地址必须在删行**之前**收集
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis + moto(S3 mock)"]
+async fn batch_deleting_users_also_removes_their_avatar_objects() {
+    let Some(endpoint) = s3_endpoint() else {
+        eprintln!("跳过：未设置 TEST_S3_ENDPOINT");
+        return;
+    };
+    ensure_s3_bucket(&endpoint, &s3_bucket()).await;
+    let prefix = format!("it-{}", unique("pfx"));
+    let (app, state) = create_router(s3_test_config(&prefix)).await.unwrap();
+    let admin_tok = admin_token(&app).await;
+
+    let mut ids = Vec::new();
+    let mut keys = Vec::new();
+    for _ in 0..2 {
+        let username = unique("batch_del");
+        let (status, body) = send(
+            &app,
+            request(
+                "POST",
+                "/api/admin/users",
+                Some(&admin_tok),
+                Some(json!({
+                    "username": username,
+                    "email": format!("{username}@example.com"),
+                    "password": "Str0ng!Pass",
+                    "roles": ["user"],
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        ids.push(body["data"]["id"].as_str().unwrap().to_string());
+        let tok = activated_token(&app, &username, "Str0ng!Pass").await;
+        let (status, body) = send(
+            &app,
+            multipart_request(&tok, "file", "me.png", "image/png", &tiny_png()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "上传失败: {body}");
+        keys.push(
+            body["data"]["url"]
+                .as_str()
+                .unwrap()
+                .split(&format!("/{prefix}/"))
+                .nth(1)
+                .expect("URL 里应含 key_prefix")
+                .to_string(),
+        );
+    }
+    for key in &keys {
+        assert!(s3_read_back(&state, key).await.is_some(), "前置条件");
+    }
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            "/api/admin/users/batch-delete",
+            Some(&admin_tok),
+            Some(json!({ "ids": ids })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for key in &keys {
+        assert!(
+            s3_read_back(&state, key).await.is_none(),
+            "批量删除也必须清掉头像对象"
+        );
+    }
 }
 
 /// 库里存过的**绝对 URL** 必须能被 `PUT /api/auth/profile` 原样带回

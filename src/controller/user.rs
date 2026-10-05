@@ -537,6 +537,15 @@ pub async fn delete_user(
         .revoke_all_sessions(&state.redis_client, id)
         .await?;
 
+    // 删掉这一行头像对象（v0.28.0 补）
+    //
+    // users 表是**硬删除**，行消失后 `avatar_url` 一起没了，
+    // 于是那个对象的 key **永久不可恢复**——没有任何地方还知道它存在。
+    // v0.20.0 时这只是磁盘上多个文件；v0.27.0 支持对象存储之后，
+    // 它变成对象存储里永久留存、按量计费、又无法回收的对象。
+    // 用户反复建删账号会无上限地推高存储账单。
+    cleanup_avatar(&state, user.avatar_url.as_deref(), &user.username).await;
+
     // 用户名与角色一起记：行删掉后 `user_roles` 也被级联清空，
     // 只留 UUID 的话，"删掉的是哪个账号、它原本是什么权限"都答不出来
     audit.push_targeted(
@@ -583,6 +592,7 @@ pub async fn batch_delete_users(
     // 先整体校验：逐个删除时无法发现"这一批会删掉全部管理员"
     let mut admins_in_batch = 0i64;
     let mut targets: Vec<(uuid::Uuid, String)> = Vec::with_capacity(req.ids.len());
+    let mut avatar_urls: Vec<(uuid::Uuid, Option<String>)> = Vec::with_capacity(req.ids.len());
     for id in &req.ids {
         let user = state.auth_service.user_repo.find_by_id(*id).await?;
         let roles = state
@@ -596,6 +606,8 @@ pub async fn batch_delete_users(
             admins_in_batch += 1;
         }
         targets.push((*id, user.username));
+        // 先记下头像地址：下一轮循环里行还在，但删完之后就找不回来了
+        avatar_urls.push((*id, user.avatar_url.clone()));
     }
 
     if admins_in_batch > 0 {
@@ -619,6 +631,11 @@ pub async fn batch_delete_users(
             .await?;
     }
 
+    // 同 delete_user：行删掉后 key 不可恢复，这里是唯一能清掉它的时机
+    for (id, avatar_url) in &avatar_urls {
+        cleanup_avatar(&state, avatar_url.as_deref(), &format!("{id}")).await;
+    }
+
     tracing::info!("管理员批量删除用户: {} 个", req.ids.len());
     // 逐个记名字而不是只记数量与 ID：批量操作的事后追溯最怕
     // "删了 3 个人"却不知道是哪 3 个
@@ -638,6 +655,27 @@ pub async fn batch_delete_users(
         );
     }
     Ok(Json(ApiResponse::success("批量删除成功")))
+}
+
+/// 删掉一个用户的头像对象（v0.28.0）
+///
+/// **清理失败只记日志，不影响删除结果**。用户已经被删掉了，
+/// 此时返回一个错误会让调用方以为"删除失败"从而重试——
+/// 而重试会撞上"用户不存在"，把一次成功的操作报成两次失败。
+/// 残留对象的代价是存储账单，误报删除失败的代价是让管理员以为系统坏了。
+///
+/// 也不去校验"这个 URL 是不是当前后端的"之外的东西：
+/// 反解由 `storage.key_of_url` 负责，解不出就跳过（见该方法的文档）。
+async fn cleanup_avatar(state: &AppState, avatar_url: Option<&str>, who: &str) {
+    let Some(url) = avatar_url else { return };
+    let Some(key) = state.storage.key_of_url(url) else {
+        // 历史数据可能是切后端前写的地址，当前后端不认它，跳过而不是硬解
+        tracing::info!("头像地址不属于当前存储后端，跳过清理（{who}）: {url}");
+        return;
+    };
+    if let Err(e) = state.storage.delete(&key).await {
+        tracing::warn!("删除用户头像对象失败（不影响删除结果，{who}）: {e}");
+    }
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]

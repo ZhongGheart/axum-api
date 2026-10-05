@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::State,
     middleware,
     routing::{get, post, put},
     Router,
@@ -76,23 +77,88 @@ pub struct AppState {
     pub setting_service: SettingService,
 }
 
-/// 头像的静态访问路由（v0.27.0）
+/// 头像的静态访问路由（v0.27.0 建，v0.28.0 补齐三种模式）
 ///
-/// **只有本地后端才有这条路由。** S3 后端把 `avatar_url` 写成对象存储上的
-/// 绝对 URL，浏览器直接去那边取，本进程不参与——此时若仍挂 `ServeDir`，
+/// 挂什么由后端的 [`ServeMode`](crate::storage::ServeMode) 决定，
+/// 而不是拿字符串比 `backend_name`——新增后端时那串比较会静默失配，
+/// 于是新后端悄悄走了"什么都不挂"那条路，头像全裂而没人知道。
+///
+/// - [`LocalDir`](crate::storage::ServeMode::LocalDir) → `ServeDir` 直接服务本地目录
+/// - [`AppProxy`](crate::storage::ServeMode::AppProxy) → handler 按 key 从后端读出来
+///   再回给浏览器（私有 bucket 且没配 `S3_PUBLIC_BASE_URL`）
+/// - [`External`](crate::storage::ServeMode::External) → **什么都不挂**
+///
+/// 最后一条是刻意的：外部出口下若还挂 `ServeDir`，
 /// 读本地目录会返回 200 但内容是上一次切后端前的旧图，
 /// 表现为"改了配置但头像不更新"，比直接 404 更难查。
 fn avatar_static_routes(
     storage: &Arc<dyn crate::storage::Storage>,
     config: &StorageConfig,
 ) -> Router<AppState> {
-    if storage.backend_name() != "local" {
-        return Router::new();
+    match storage.serve_mode() {
+        crate::storage::ServeMode::LocalDir => Router::new().nest_service(
+            crate::storage::UPLOAD_URL_PREFIX,
+            tower_http::services::ServeDir::new(&config.dir),
+        ),
+        crate::storage::ServeMode::AppProxy => {
+            Router::new().route("/uploads/{*key}", axum::routing::get(serve_stored_object))
+        }
+        crate::storage::ServeMode::External => Router::new(),
     }
-    Router::new().nest_service(
-        crate::storage::UPLOAD_URL_PREFIX,
-        tower_http::services::ServeDir::new(&config.dir),
-    )
+}
+
+/// GET /uploads/{key} —— 从存储后端读出一个对象（[`ServeMode::AppProxy`]）
+///
+/// **刻意挂在鉴权之外**，与本地后端的 `/uploads` 是同一个承诺：
+/// 头像要能被 `<img src>` 直接取，而 `<img>` 无法附带 Authorization 头。
+/// 这些图公开可读是可接受的——头像本来就在用户列表页展示，
+/// 这与"用户列表要登录才能看"不是同一个承诺。
+///
+/// 存在这个 handler 的理由（v0.28.0 补上，v0.27.0 缺了它）：
+/// 私有 bucket 的对象 URL **不能直接给浏览器**，没有签名就是 403。
+/// v0.27.0 把这件事只写进了文档的"部署前置条件"，
+/// 于是"私有 bucket 又没 CDN"的部署方陷入死锁——头像全裂，
+/// 而唯一的"解法"是开公共读，那恰是最不该做的配置。
+/// 有了它，私有 bucket **不配任何 CDN 也能正常显示头像**。
+async fn serve_stored_object(
+    State(state): State<AppState>,
+    axum::extract::Path(key): axum::extract::Path<String>,
+) -> Result<axum::response::Response, AppError> {
+    // 反解不出 key 说明这路径不归本后端管（穿越、别的 base 下的地址等）。
+    // 回 404 而不是 400：对外而言"不存在"与"不归我管"没有区别，
+    // 而把区别说出来等于告诉扫描器哪些路径形状是合法的。
+    let url = format!("{}/{}", crate::storage::UPLOAD_URL_PREFIX, key);
+    let Some(key) = state.storage.key_of_url(&url) else {
+        return Err(AppError::NotFound("头像不存在".to_string()));
+    };
+    let Some(object) = state.storage.get(&key).await? else {
+        return Err(AppError::NotFound("头像不存在".to_string()));
+    };
+
+    // Content-Type 必须按扩展名给准：opendal 读回来的只是字节，
+    // 不给头的话浏览器按 application/octet-stream 处理，头像点了变成下载。
+    Ok(axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, object.content_type)
+        // 头像不可变：文件名含随机 UUID，内容变了就是新对象。
+        // 让浏览器与中间 CDN 放心缓存，否则每进一次用户列表都要回源。
+        .header(axum::http::header::CACHE_CONTROL, "public, max-age=86400")
+        .header(axum::http::header::ETAG, etag_for(&object.bytes))
+        .body(axum::body::Body::from(object.bytes))
+        .expect("响应头都是静态字面量，构造失败只说明代码写错了"))
+}
+
+/// 按内容算一个弱 ETag
+///
+/// 用长度 + FNV-1a 而不是完整摘要：头像是几 KB 的小文件，
+/// 这里的收益只是"内容没变就别重传"，不值得为它引入摘要依赖。
+fn etag_for(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("W/\"{:x}-{}\"", hash, bytes.len())
 }
 
 /// 构建应用路由

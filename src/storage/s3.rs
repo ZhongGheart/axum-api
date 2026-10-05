@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use opendal::services::S3;
 use opendal::Operator;
 
-use super::{avatar_key, content_type_for, LoadedObject, SavedObject, Storage};
+use super::{
+    avatar_key, check_payload, content_type_for, LoadedObject, SavedObject, ServeMode, Storage,
+};
 use crate::config::{S3Config, StorageConfig};
 use crate::error::AppError;
 
@@ -24,8 +26,9 @@ pub struct S3Storage {
     op: Operator,
     /// bucket 内的 key 前缀，形如 `avatars` 或 `axum/prod`
     prefix: String,
-    /// 对外访问基地址
-    base: String,
+    /// 对外访问基地址；`None` 表示由本进程代理读（见 [`ServeMode::AppProxy`]）
+    base: Option<String>,
+    config: StorageConfig,
 }
 
 impl S3Storage {
@@ -59,20 +62,20 @@ impl S3Storage {
         let op = Operator::new(builder)
             .map_err(|e| AppError::InternalServerError(format!("初始化 S3 存储失败: {e}")))?;
 
-        let bucket = &s3.bucket;
-        let region = &s3.region;
-        let base = match s3.public_base_url.as_deref() {
-            Some(b) => b.to_string(),
-            None => match s3.endpoint.as_deref() {
-                Some(e) => format!("{e}/{bucket}"),
-                None => format!("https://{bucket}.s3.{region}.amazonaws.com"),
-            },
-        };
-
         Ok(Self {
             op,
             prefix: s3.key_prefix,
-            base,
+            // 没给 `S3_PUBLIC_BASE_URL` 时**不再从 endpoint 猜一个地址**。
+            //
+            // v0.27.0 的做法是退回 `{endpoint}/{bucket}`，但那只在 bucket 公开读时
+            // 才成立：私有 bucket 上匿名 GET 返回 403（实测），头像会全部裂图，
+            // 而唯一的"解法"是开公共读——恰是文档说最不该做的配置。那是个死锁。
+            //
+            // 现在改为：由本进程代理读，`avatar_url` 退回站内相对路径，
+            // 于是**私有 bucket 不配任何 CDN 也能正常显示头像**。
+            // 想要 CDN/直连的出口仍然显式给 `S3_PUBLIC_BASE_URL`。
+            base: s3.public_base_url.clone(),
+            config: config.clone(),
         })
     }
 
@@ -96,6 +99,7 @@ impl std::fmt::Debug for S3Storage {
         f.debug_struct("S3Storage")
             .field("prefix", &self.prefix)
             .field("base", &self.base)
+            .field("serve_mode", &self.serve_mode())
             .finish_non_exhaustive()
     }
 }
@@ -103,9 +107,8 @@ impl std::fmt::Debug for S3Storage {
 #[async_trait]
 impl Storage for S3Storage {
     async fn put(&self, mime: &str, bytes: &[u8]) -> Result<SavedObject, AppError> {
-        if bytes.is_empty() {
-            return Err(AppError::BadRequest("图片内容为空".into()));
-        }
+        // v0.28.0 补上此前缺失的体积与 MIME 校验，与本地后端同源
+        check_payload(&self.config, mime, bytes)?;
         let key = avatar_key(mime)?;
         self.op
             .write(&self.full_key(&key), bytes.to_vec())
@@ -142,12 +145,30 @@ impl Storage for S3Storage {
         }
     }
 
+    fn serve_mode(&self) -> ServeMode {
+        match self.base {
+            Some(_) => ServeMode::External,
+            None => ServeMode::AppProxy,
+        }
+    }
+
     fn public_url(&self, key: &str) -> String {
-        format!("{}/{}", self.base, self.full_key(key))
+        match self.base.as_deref() {
+            Some(base) => format!("{base}/{}", self.full_key(key)),
+            // 代理模式：与本地后端同一种站内相对路径，前端无需区分
+            None => format!("{}/{key}", super::UPLOAD_URL_PREFIX),
+        }
     }
 
     fn key_of_url(&self, url: &str) -> Option<String> {
-        super::key_of_url_under(url, &self.base, &self.prefix)
+        match self.base.as_deref() {
+            Some(base) => super::key_of_url_under(url, base, &self.prefix),
+            // 代理模式的 `public_url` 是 `/uploads/{key}`，**不含 prefix**
+            // （prefix 只活在 bucket 内部，对浏览器不可见），所以这里必须
+            // 按空前缀反解。照抄 External 分支去剥 prefix，配了
+            // `S3_KEY_PREFIX` 时会反解失败，表现为"头像换了但旧文件永不删除"。
+            None => super::key_of_url_under(url, super::UPLOAD_URL_PREFIX, ""),
+        }
     }
 
     fn backend_name(&self) -> &'static str {
@@ -191,16 +212,78 @@ mod tests {
         );
     }
 
-    /// 没给 `S3_PUBLIC_BASE_URL` 时退回 endpoint+bucket，
-    /// 但那只在 bucket 公开读时成立（见模块文档）
+    /// 没给 `S3_PUBLIC_BASE_URL` 时**不再退回 endpoint+bucket**
+    ///
+    /// v0.27.0 是退回 `{endpoint}/{bucket}`，那只在 bucket 公开读时成立。
+    /// 私有 bucket 上匿名 GET 是 403（实测），于是"私有 bucket 又没 CDN"
+    /// 的部署方只能去开公共读——恰是最不该做的配置。
     #[test]
-    fn the_base_falls_back_to_endpoint_and_bucket() {
+    fn without_a_public_base_url_it_stays_a_site_relative_path() {
         let mut c = cfg("avatars");
         c.s3.as_mut().unwrap().public_base_url = None;
         let s = S3Storage::new(&c).unwrap();
         assert_eq!(
             s.public_url("avatars/a.png"),
-            "http://127.0.0.1:59000/axum-test/avatars/avatars/a.png"
+            "/uploads/avatars/a.png",
+            "私有 bucket 的地址不能直连浏览器，必须退回站内路径由本进程代理读"
+        );
+        assert_eq!(s.serve_mode(), ServeMode::AppProxy);
+    }
+
+    /// 代理模式下 URL 里看不到 prefix，但反解时不能去剥它
+    ///
+    /// 两边不对称正是这里容易写错的地方：prefix 只活在 bucket 内部，
+    /// 而 `key_of_url_under` 不知道这个约定，会照着 External 分支去剥，
+    /// 结果配了 `S3_KEY_PREFIX` 时反解必然失败——
+    /// 表现为"换了头像但旧对象永不删除"，静默堆积。
+    #[test]
+    fn the_proxy_mode_round_trips_a_key_despite_a_non_empty_prefix() {
+        let mut c = cfg("axum/prod");
+        c.s3.as_mut().unwrap().public_base_url = None;
+        let s = S3Storage::new(&c).unwrap();
+        let url = s.public_url("avatars/a.png");
+        assert_eq!(url, "/uploads/avatars/a.png", "URL 里不该出现 prefix");
+        assert_eq!(
+            s.key_of_url(&url).as_deref(),
+            Some("avatars/a.png"),
+            "反解失败等于删不掉旧头像"
+        );
+    }
+
+    /// 代理模式下不该认领本地后端时期留下的旧地址——那属于 LocalDir
+    #[test]
+    fn the_proxy_mode_does_not_claim_external_addresses() {
+        let mut c = cfg("");
+        c.s3.as_mut().unwrap().public_base_url = None;
+        let s = S3Storage::new(&c).unwrap();
+        for foreign in [
+            "https://cdn.example.com/avatars/a.png",
+            "http://127.0.0.1:59000/axum-test/avatars/a.png",
+            "/uploads/other/a.png",
+            "/uploads/avatars/../../etc/passwd",
+        ] {
+            assert_eq!(s.key_of_url(foreign), None, "{foreign} 不该被认领");
+        }
+    }
+
+    #[test]
+    fn a_configured_base_switches_to_external_serving() {
+        let s = store("avatars");
+        assert_eq!(s.serve_mode(), ServeMode::External);
+    }
+
+    /// v0.27.0 的 S3 `put` **漏了体积上限**（`local.rs` 有）
+    ///
+    /// controller 那层也查了，所以当时不可被外部利用，
+    /// 但两个后端对同一契约行为不一致——绕过 controller 直接调
+    /// `storage.put()` 就能把超大对象写进桶里。
+    #[tokio::test]
+    async fn put_refuses_an_oversized_payload() {
+        let s = store("avatars"); // max_file_size = 1024
+        let err = s.put("image/png", &[0u8; 1025]).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::AppError::PayloadTooLarge(_)),
+            "超限应报 413，得到 {err:?}"
         );
     }
 
