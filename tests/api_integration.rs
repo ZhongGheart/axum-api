@@ -15788,6 +15788,101 @@ async fn every_user_of_a_bulk_delete_is_individually_findable() {
     }
 }
 
+/// 一次写审计时**不能**留下"主行已可见、targets 残缺"的中间态（v0.28.0 补）
+///
+/// 曾经主行与 targets 分两步写、不在一个事务里，读方可能在 targets 补完前
+/// 就看到那一行。后果是"一次授权碰了 3 个菜单，审计里只挂着 1~2 个"——
+/// 正是 v0.26.0 结构化审计要解决的核心问题。
+/// 本地复现不出来（写入窗口只有几毫秒，而轮询间隔 100ms），
+/// 是 CI 上两个审计 target 用例变红才暴露的。
+///
+/// 这里刻意**不用**"高频轮询去撞竞态"那种写法——那种测试要么长期绿、
+/// 要么偶尔红，当不了回归防线。改为**故意让一个 target 写失败**：
+/// 第三个 target 同时没有 `target_id` 与 `target_key`，
+/// 必然违反 `audit_log_targets_identity` 的 CHECK 约束。
+///
+/// 于是这条用例是确定性的，且直接钉住要的性质：
+/// 写入失败时，绝不允许"前两个 target 已经可见"这种残缺集合外泄。
+#[tokio::test]
+#[ignore = "需要真实 Postgres + Redis"]
+async fn a_failed_target_insert_never_leaves_a_partial_target_set_visible() {
+    ensure_schema().await;
+    let repo = AuditLogRepository::new(pool().await);
+
+    let action = format!("PARTIAL_TARGET_PROBE_{}", unique("p"));
+
+    let mut entry = axum_api::repository::audit_log::AuditEntry::auth(
+        &action,
+        "PUT",
+        "/api/probe",
+        200,
+        "127.0.0.1",
+    )
+    .with_target(
+        axum_api::model::TargetType::Menu,
+        uuid::Uuid::new_v4(),
+        axum_api::model::ChangeType::Grant,
+        Some("第一个菜单".to_string()),
+    );
+    entry.targets.push(axum_api::model::AuditTargetEntry::by_id(
+        axum_api::model::TargetType::Menu,
+        uuid::Uuid::new_v4(),
+        axum_api::model::ChangeType::Grant,
+        Some("第二个菜单".to_string()),
+    ));
+    // 必然失败的 target：两个标识都为空，CHECK 约束会拒绝它
+    entry.targets.push(axum_api::model::AuditTargetEntry {
+        target_type: axum_api::model::TargetType::Menu,
+        target_id: None,
+        target_key: None,
+        change_type: axum_api::model::ChangeType::Grant,
+        target_label: None,
+    });
+
+    assert!(
+        repo.record(&entry).await.is_err(),
+        "必然违反 CHECK 约束的 target 必须让写入报错，而不是被静默吞掉"
+    );
+
+    let p = pool().await;
+    let ids: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM audit_logs WHERE action = $1")
+        .bind(&action)
+        .fetch_all(&p)
+        .await
+        .expect("查询审计行失败");
+
+    // 先验"残缺集合"，再验重复行：这条才是本次修复的核心性质，
+    // 报错必须直指它。顺序反过来的话，注入缺陷时会先撞上重复行断言，
+    // 报错指向一个**次要**症状，把真正的根因藏起来了。
+    let target_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log_targets WHERE audit_log_id = ANY($1)")
+            .bind(&ids)
+            .fetch_one(&p)
+            .await
+            .expect("查询审计对象引用失败");
+    assert_eq!(
+        target_count, 0,
+        "写入失败后绝不允许残缺的 target 集合外泄：事务保证主行与它的 targets \
+         同生共死，而不是留下\"主行 + 半截 targets\""
+    );
+
+    assert_eq!(ids.len(), 1, "回滚后应只补写一行主行，不应留下重复审计");
+
+    // 补写的主行内容必须与原请求一致，不能因为走了回滚分支就变形
+    let row_action: String = sqlx::query_scalar("SELECT action FROM audit_logs WHERE id = $1")
+        .bind(ids[0])
+        .fetch_one(&p)
+        .await
+        .expect("查询审计行失败");
+    assert_eq!(row_action, action, "补写的主行内容必须与原请求一致");
+
+    sqlx::query("DELETE FROM audit_logs WHERE id = $1")
+        .bind(ids[0])
+        .execute(&p)
+        .await
+        .expect("清理测试数据失败");
+}
+
 /// 有多个 target 的审计行**只算一行**
 ///
 /// 用 JOIN 过滤会让一行审计出现 N 次，于是 `total` 与去重后的实际行数对不上，

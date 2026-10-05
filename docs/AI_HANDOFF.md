@@ -69,7 +69,7 @@
 | `cargo fmt --all --check` | ✅ |
 | `cargo clippy --all-targets --all-features -- -D warnings` | ✅ 0 warning |
 | `cargo test --locked --lib` | ✅ 156（基线 152，+4 新单测） |
-| 集成 `cargo test --locked --test api_integration -- --ignored --test-threads=1` | ✅ 232（基线 228，+4 新用例） |
+| 集成 `cargo test --locked --test api_integration -- --ignored --test-threads=1` | ✅ 233（基线 228，+5 新用例） |
 | `pnpm lint` / `typecheck` / `test` / `build` | ✅ 0 error（1 个既有 warning）/ ✅ / 237 passed / ✅ |
 
 **集成测试必须带环境变量**：`eval "$(./scripts/test_env.sh env)"`。
@@ -107,6 +107,45 @@
   报出来的是连接错误，真正原因被埋掉
 - 本地实测验证过两条路径：venv 里 moto 5.2.3 起得来、bucket 建得成；
   失败场景给出 `::error::` 注解 + 服务日志，退出码 1
+
+### 审计写入缺事务（CI 第二次暴露，v0.26.0 遗留）
+
+moto 修好后 CI 接着挂在两个**审计 target** 用例上，与本轮改动无关：
+
+- `an_audit_row_with_several_targets_is_counted_only_once`：3 个菜单 target 只读到 2 个
+- `audit_targets_answer_who_changed_a_roles_permissions`：menu target 完全缺失
+
+**根因**：两条写入路径（`middleware::audit_log` 与 `AuditLogRepository::record`）
+都是「主行先落 → targets 再逐条补」，**不在一个事务里**。读方能在 targets
+写完前看到这一行。而"一次请求碰了 N 个对象不能只记第一个"恰恰是 v0.26.0
+结构化审计立项要解决的核心问题——上一版把功能做出来了，原子性没跟上。
+
+**为什么本地一直绿**：写入窗口只有几毫秒，而 `wait_for_logs` 轮询间隔 100ms，
+大概率整个写入早已完成。这是典型的"竞态只在慢环境暴露"。
+
+**修法**：
+1. 主行与 targets 同处一个事务，两者同生共死
+2. 两条路径的 INSERT 抽成共享函数 `insert_audit_row` / `insert_audit_target`，
+   避免两份 SQL 字段不同步（泛型 `E` 同时接受 `&PgPool` 与 `&mut Transaction`）
+3. **保留原有取舍**：单条 target 写失败不放弃整条审计——
+   实现为回滚不完整事务后**单独补写主行**。
+   注意 `clip` 闭包必须 `Send + Sync`，否则 `tokio::spawn` 里 future 非 `Send`，
+   报错还会牵连出一串与本改动无关的 Handler 约束错误
+
+**踩过的坑**：`&dyn Fn(&str, usize) -> String` 让 future 变成非 `Send`，
+`cargo check` 报的是 `future cannot be sent between threads safely`
+加一串 `Handler` 约束不满足——后者全是级联噪音，根因只有第一条。
+
+### 确定性回归测试（重要经验）
+
+`a_failed_target_insert_never_leaves_a_partial_target_set_visible`
+刻意让第三个 target **必然违反** `audit_log_targets_identity` CHECK 约束
+（`target_id` 与 `target_key` 都为 `None`），于是"写失败时会不会漏出残缺集合"
+变成确定性断言，而不是靠高频轮询去撞竞态。
+
+**断言顺序踩过坑**：最初先断言"只有一行主行"，注入缺陷时报错指向
+"重复审计行"这个**次要**症状，把真正的根因（2 个残缺 target 外泄）藏起来了。
+改成先验残缺集合、再验重复行，注入时报错才直指要害（`left: 2, right: 0`）。
 
 ### 交付状态
 

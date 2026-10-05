@@ -51,9 +51,30 @@ v0.20.0 时这只是磁盘上多个文件；支持对象存储之后，它变成
 把一次成功的操作报成两次失败。残留对象的代价是账单，
 误报删除失败的代价是让管理员以为系统坏了。
 
+### 审计写入缺事务：读到"半截 targets"的审计行
+
+v0.28.0 首次推送后 CI 暴露，**与对象存储无关**，是 v0.26.0 留下的缺陷。
+
+两条审计写入路径（`middleware::audit_log` 与 `AuditLogRepository::record`）
+都是「主行先落 → targets 再逐条补」，**不在一个事务里**。读方因此能在
+targets 写完之前就看到这一行，于是"一次授权碰了 3 个菜单"这条审计
+被读成只挂着 1~2 个 menu target —— 而"一次请求碰了 N 个对象不能只记第一个"
+正是 v0.26.0 结构化审计立项时要解决的核心问题。
+
+本地复现不出来：写入窗口只有几毫秒，而测试轮询间隔是 100ms，
+大概率整个写入早已完成。CI 上稳定复现（两个审计 target 用例红）。
+
+**修法**：主行与 targets 放进同一个事务，两者同生共死。
+同时把两条路径的 INSERT 抽成共享函数（`insert_audit_row` /
+`insert_audit_target`），避免两份 SQL 字段不同步。
+
+保留了原有取舍：单条 target 写失败**不放弃整条审计**。
+实现为回滚不完整事务后**单独补写主行**——宁可少几个对象标注，
+也不能让审计行带着残缺的 targets 可见。
+
 ### 顺带修掉的
 
-- **`ServeMode` 取代字符串比后端名。** 路由挂载原先靠
+- **moto 装 CI 的方式（见下方"CI 修复"）。** 路由挂载原先靠
   `storage.backend_name() != "local"` 判断。新增后端时那串比较会静默失配，
   于是新后端悄悄走了"什么都不挂"那条路，头像全裂而没人知道。
   现在挂什么由枚举驱动，`LocalDir` / `AppProxy` / `External` 三种模式显式区分
@@ -62,6 +83,25 @@ v0.20.0 时这只是磁盘上多个文件；支持对象存储之后，它变成
   复用的测试库里往往堆着几千条上轮残留（本地实测 5188 条），于是删出 50 条、
   测试变红，而与被测逻辑毫无关系。CI 每次全新库所以从未暴露。
   现在先清过期行再断言
+
+### CI 修复：moto 必须装进独立 venv
+
+`Install moto (S3 mock)` 步骤在 runner 上失败，`moto_server` 起不来，
+报 `AttributeError: module 'lib' has no attribute 'GEN_EMAIL'`。
+
+原因是**环境依赖错配**：GitHub runner 镜像自带 apt 版 boto3/botocore
+（`/usr/lib/python3/dist-packages`），而裸 `pip install moto[server]`
+把 moto 装进 `~/.local`。pip 认为"boto3 已满足"而不再装一份，
+于是新 moto 导入系统老 botocore，再经 `urllib3.contrib.pyopenssl`
+拉到系统老 pyOpenSSL，ABI 不匹配。
+
+难查的地方在于 **pip 全程绿灯**：错配发生在解释器的 import 期而非安装器，
+安装日志里看不到任何异常，失败点却落在几步之后的 curl 上（退出码 7）。
+
+**修法**：moto 装进独立 venv（系统包彻底不可见，依赖由 pip 解析成一致的一套），
+并把就绪检查从"循环碰运气"改成**显式断言**——原来那个 `for` 循环
+一次都没成功时退出码仍是 0，流程继续往下走，直到建 bucket 的 curl 才失败，
+报出来的是连接错误，真正的原因被埋掉了。
 
 ### 兼容性
 

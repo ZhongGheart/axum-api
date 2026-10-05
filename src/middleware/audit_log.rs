@@ -33,6 +33,7 @@ use axum::{
 use crate::middleware::auth::AuthenticatedUser;
 use crate::middleware::client_ip;
 use crate::model::{AuditTargetEntry, ChangeType, TargetType};
+use crate::repository::audit_log::{insert_audit_row, insert_audit_target};
 use crate::router::AppState;
 
 /// 查询串入库前的最大长度
@@ -325,30 +326,48 @@ pub async fn audit_log_middleware(
         // 截断至少留下一条可检索的记录。
         let action = truncate(&format!("{method} {path}"), MAX_ACTION_LEN);
 
+        // 主行与 targets 必须在**同一个事务**里落库（v0.28.0 补）
+        //
+        // 曾经是"主行先落、targets 再逐条补"，两步之间没有事务，
+        // 于是读方可能在 targets 写完之前就看到这一行。
+        // 表现是"一次授权碰了 3 个菜单，审计里只挂着 1~2 个 target"——
+        // 而"一次请求碰了 N 个对象不能只记第一个"恰恰是 v0.26.0
+        // 结构化审计要解决的核心问题。
+        //
+        // 本地复现不出来：写入窗口只有几毫秒，而轮询间隔 100ms。
+        // CI 上稳定复现，也是这么暴露的。
+        let username = username.map(|u| truncate(&u, 50));
+        let action_for_row = truncate(&action, 100);
+        let method_for_row = truncate(&method, 10);
+        let path_for_row = truncate(&path, 500);
+        let client_ip_for_row = truncate(&client_ip, 50);
+
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!("审计事务开启失败: {e}");
+                return;
+            }
+        };
+
         // 必须 `RETURNING id`：target 行要挂在这一条审计下面，
         // 而 id 是数据库生成的，插入前拿不到
-        let result = sqlx::query_scalar::<_, uuid::Uuid>(
-            r#"
-            INSERT INTO audit_logs
-                (user_id, username, action, method, path, params, result, status_code, client_ip, duration_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id
-            "#,
+        let inserted = insert_audit_row(
+            &mut *tx,
+            user_id,
+            username.as_deref(),
+            &action_for_row,
+            &method_for_row,
+            &path_for_row,
+            params.as_deref(),
+            result.as_deref(),
+            Some(status_code),
+            Some(&client_ip_for_row),
+            Some(duration_ms),
         )
-        .bind(user_id)
-        .bind(username)
-        .bind(&action)
-        .bind(&method)
-        .bind(&path)
-        .bind(params)
-        .bind(result)
-        .bind(status_code)
-        .bind(&client_ip)
-        .bind(duration_ms)
-        .fetch_one(&pool)
         .await;
 
-        let audit_log_id = match result {
+        let audit_log_id = match inserted {
             Ok(id) => id,
             Err(e) => {
                 tracing::warn!("写入操作日志失败: {e}");
@@ -356,29 +375,44 @@ pub async fn audit_log_middleware(
             }
         };
 
-        for t in targets {
-            // 单条 target 写失败**不放弃整条审计**：审计行已经落库了，
-            // 丢掉它换一个"对象标注没写上"的缺口，代价大得多。
-            // 这里只告警——和主写入路径同样的取舍。
-            let res = sqlx::query(
-                r#"
-                INSERT INTO audit_log_targets
-                    (audit_log_id, target_type, target_id, target_key, change_type, target_label)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT DO NOTHING
-                "#,
-            )
-            .bind(audit_log_id)
-            .bind(t.target_type.as_str())
-            .bind(t.target_id)
-            .bind(t.target_key)
-            .bind(t.change_type.as_str())
-            .bind(t.target_label)
-            .execute(&pool)
-            .await;
-            if let Err(e) = res {
+        let clip = |v: &str, max: usize| truncate(v, max);
+        let mut target_failed = false;
+        for t in &targets {
+            if let Err(e) = insert_audit_target(&mut *tx, audit_log_id, t, &clip).await {
+                // 单条 target 写失败**不放弃整条审计**：审计行已经落库了，
+                // 丢掉它换一个"对象标注没写上"的缺口，代价大得多。
+                // 这里只告警——和主写入路径同样的取舍。
                 tracing::warn!("写入审计对象引用失败（{audit_log_id}）: {e}");
+                target_failed = true;
             }
+        }
+
+        if target_failed {
+            // 回滚这次不完整的事务，再**单独**补写主行：
+            // 宁可少几个对象标注，也不能让审计行带着残缺的 targets 可见。
+            let _ = tx.rollback().await;
+            if let Err(e) = insert_audit_row(
+                &pool,
+                user_id,
+                username.as_deref(),
+                &action_for_row,
+                &method_for_row,
+                &path_for_row,
+                params.as_deref(),
+                result.as_deref(),
+                Some(status_code),
+                Some(&client_ip_for_row),
+                Some(duration_ms),
+            )
+            .await
+            {
+                tracing::warn!("补写审计主行失败（对象标注已丢失）: {e}");
+            }
+            return;
+        }
+
+        if let Err(e) = tx.commit().await {
+            tracing::warn!("审计事务提交失败: {e}");
         }
     });
 

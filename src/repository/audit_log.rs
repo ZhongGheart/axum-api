@@ -106,6 +106,92 @@ impl AuditEntry {
     }
 }
 
+/// 插入一条审计主行，返回它的 id
+///
+/// 抽成自由函数是为了让 [`AuditLogRepository::record`] 与
+/// `middleware::audit_log` 复用**同一条 INSERT**。
+/// 两条路径以前各写一份，字段一旦不同步就会出现
+/// "某些审计行少记了某个字段"这种只在部分入口复现的偏差。
+///
+/// 泛型 `E` 同时接受 `&PgPool` 与 `&mut Transaction`：
+/// 主行既可能单独落库（target 写失败后的补写），
+/// 也可能与 targets 同处一个事务（正常路径）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_audit_row<'e, E>(
+    executor: E,
+    user_id: Option<Uuid>,
+    username: Option<&str>,
+    action: &str,
+    method: &str,
+    path: &str,
+    params: Option<&str>,
+    result: Option<&str>,
+    status_code: Option<i32>,
+    client_ip: Option<&str>,
+    duration_ms: Option<i32>,
+) -> Result<Uuid, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    sqlx::query_scalar::<_, Uuid>(
+        r#"
+        INSERT INTO audit_logs
+            (user_id, username, action, method, path, params, result, status_code, client_ip, duration_ms)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING id
+        "#,
+    )
+    .bind(user_id)
+    .bind(username)
+    .bind(action)
+    .bind(method)
+    .bind(path)
+    .bind(params)
+    .bind(result)
+    .bind(status_code)
+    .bind(client_ip)
+    .bind(duration_ms)
+    .fetch_one(executor)
+    .await
+}
+
+/// 插入一条审计对象引用
+///
+/// 与 [`insert_audit_row`] 同理，两条写入路径共用一份 SQL。
+/// `clip` 由调用方传入而不是在这里重建：两条路径的截断上限
+/// 本来就一致，但共用同一个闭包能保证**永远**一致。
+pub(crate) async fn insert_audit_target<'e, E, F>(
+    executor: E,
+    audit_log_id: Uuid,
+    t: &AuditTargetEntry,
+    clip: &F,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+    // 必须 `Send + Sync`：调用方之一在 `tokio::spawn` 里，
+    // 用裸 `&dyn Fn` 会让整个 future 变成非 Send，
+    // 报错还牵连出一串与本改动无关的 Handler 约束错误。
+    F: Fn(&str, usize) -> String + Send + Sync,
+{
+    sqlx::query(
+        r#"
+        INSERT INTO audit_log_targets
+            (audit_log_id, target_type, target_id, target_key, change_type, target_label)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(audit_log_id)
+    .bind(t.target_type.as_str())
+    .bind(t.target_id)
+    .bind(t.target_key.as_deref().map(|k| clip(k, 200)))
+    .bind(t.change_type.as_str())
+    .bind(t.target_label.as_deref().map(|l| clip(l, 200)))
+    .execute(executor)
+    .await
+    .map(|_| ())
+}
+
 /// 操作日志仓储
 #[derive(Debug, Clone)]
 pub struct AuditLogRepository {
@@ -237,47 +323,75 @@ impl AuditLogRepository {
     pub async fn record(&self, entry: &AuditEntry) -> Result<(), AppError> {
         let clip = |v: &str, max: usize| -> String { v.chars().take(max).collect::<String>() };
 
-        let audit_log_id = sqlx::query_scalar::<_, Uuid>(
-            r#"
-            INSERT INTO audit_logs
-                (user_id, username, action, method, path, params, result, status_code, client_ip, duration_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id
-            "#,
+        // 主行与它的 targets 必须在**同一个事务**里落库（v0.28.0 补）
+        //
+        // 曾经是"主行先落、targets 再逐条补"，两步之间没有事务，
+        // 于是读方可能在 targets 写完之前就看到这一行。
+        // 表现是"一次授权碰了 3 个菜单，审计里只挂着 1~2 个 target"——
+        // 而"一次请求碰了 N 个对象不能只记第一个"恰恰是 v0.26.0
+        // 结构化审计要解决的核心问题。
+        //
+        // 这个缺陷在本地跑不出来：写入窗口只有几毫秒，
+        // 而轮询间隔是 100ms，大概率整个写入早已完成。
+        // CI 上稳定复现（两个审计 target 用例红），也是这么暴露的。
+        let username = entry.username.as_deref().map(|u| clip(u, 50));
+        let action = clip(&entry.action, 100);
+        let method = clip(&entry.method, 10);
+        let path = clip(&entry.path, 500);
+        let client_ip = entry.client_ip.as_deref().map(|ip| clip(ip, 50));
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("审计事务开启失败: {e}")))?;
+
+        let audit_log_id = insert_audit_row(
+            &mut *tx,
+            entry.user_id,
+            username.as_deref(),
+            &action,
+            &method,
+            &path,
+            entry.params.as_deref(),
+            entry.result.as_deref(),
+            entry.status_code,
+            client_ip.as_deref(),
+            entry.duration_ms,
         )
-        .bind(entry.user_id)
-        .bind(entry.username.as_deref().map(|u| clip(u, 50)))
-        .bind(clip(&entry.action, 100))
-        .bind(clip(&entry.method, 10))
-        .bind(clip(&entry.path, 500))
-        .bind(entry.params.as_deref())
-        .bind(entry.result.as_deref())
-        .bind(entry.status_code)
-        .bind(entry.client_ip.as_deref().map(|ip| clip(ip, 50)))
-        .bind(entry.duration_ms)
-        .fetch_one(&self.pool)
         .await
         .map_err(|e| AppError::InternalServerError(format!("写入审计日志失败: {e}")))?;
 
         for t in &entry.targets {
-            sqlx::query(
-                r#"
-                INSERT INTO audit_log_targets
-                    (audit_log_id, target_type, target_id, target_key, change_type, target_label)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT DO NOTHING
-                "#,
-            )
-            .bind(audit_log_id)
-            .bind(t.target_type.as_str())
-            .bind(t.target_id)
-            .bind(t.target_key.as_deref().map(|k| clip(k, 200)))
-            .bind(t.change_type.as_str())
-            .bind(t.target_label.as_deref().map(|l| clip(l, 200)))
-            .execute(&self.pool)
-            .await
-            .map_err(|e| AppError::InternalServerError(format!("写入审计对象引用失败: {e}")))?;
+            if let Err(e) = insert_audit_target(&mut *tx, audit_log_id, t, &clip).await {
+                // 回滚后**单独**补写主行再报错，理由见函数末尾的说明：
+                // "审计行丢失"比"对象标注没写上"代价大得多。
+                tracing::warn!("写入审计对象引用失败，回滚后补写主行: {e}");
+                let _ = tx.rollback().await;
+                insert_audit_row(
+                    &self.pool,
+                    entry.user_id,
+                    username.as_deref(),
+                    &action,
+                    &method,
+                    &path,
+                    entry.params.as_deref(),
+                    entry.result.as_deref(),
+                    entry.status_code,
+                    client_ip.as_deref(),
+                    entry.duration_ms,
+                )
+                .await
+                .map_err(|e2| AppError::InternalServerError(format!("写入审计日志失败: {e2}")))?;
+                return Err(AppError::InternalServerError(format!(
+                    "写入审计对象引用失败: {e}"
+                )));
+            }
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("审计事务提交失败: {e}")))?;
         Ok(())
     }
 
