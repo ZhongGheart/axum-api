@@ -147,6 +147,32 @@ moto 修好后 CI 接着挂在两个**审计 target** 用例上，与本轮改�
 "重复审计行"这个**次要**症状，把真正的根因（2 个残缺 target 外泄）藏起来了。
 改成先验残缺集合、再验重复行，注入时报错才直指要害（`left: 2, right: 0`）。
 
+### 审计事务的代价：把一个靠赢竞态的测试推过了界
+
+上一条修复在 CI 上换来了新的失败：`every_write_operation_leaves_an_answerable_change_summary`
+报"改资料审计必须含账号"，而摘要里的账号是 `profset_*`——不是本用例的 `aud20_*`。
+
+**根因是测试隔离缺陷，不是产品缺陷**。helper `wait_for_audit_result` 只按
+method + path + 标记词匹配，取最新的那条。`PUT /api/auth/profile` 是**固定路径**，
+标记词"展示名"又很通用，而字母序靠前的
+`a_user_can_set_and_clear_their_own_display_name` 早就留下了一模一样的行。
+helper 第一次轮询就捞到那条**别人的**行并立即返回。
+
+**我引入的事务放大了这个窗口**：改之前主行 `autocommit` 落库即可见（1 条语句），
+改之后要等 `BEGIN + INSERT + N×target + COMMIT` 全走完才可见。
+原子性换来的延迟把一个"靠赢竞态"的测试推过了界。
+
+**修法**：新增 `wait_for_audit_result_since`，加 `created_at >= $4` 时间下界。
+这正是"我要的是**我刚才那次操作**产生的审计行"的直译，
+且与标记词是否唯一无关。给两个脆弱调用点用上：
+`PUT /api/auth/profile`（标记词"展示名"）与 `POST /api/admin/monitor/metrics/reset`
+（路径固定、别的测试也打同一端点）。`since` 往前挪 1 秒容忍时钟偏差。
+
+**验证方式**：psql 对照实验（比本地跑测试更有说服力——
+这个用例修复前后本地都过，本身证明不了什么）：
+插入一条 10 分钟前的 `decoy_user` 行后，
+不限定时间的查询捞到 `decoy_user`，限定时间的查询返回 0 行。
+
 ### 交付状态
 
 **本地提交，未推送、未打 tag**（用户先前指令：全部工作完成或收到指令再统一推送）。

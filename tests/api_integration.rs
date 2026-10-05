@@ -7622,6 +7622,51 @@ async fn wait_for_audit_result(method: &str, path: &str, marker: &str) -> String
     panic!("审计里查不到 {method} {path} 中含有「{marker}」的摘要");
 }
 
+/// 同 [`wait_for_audit_result`]，但**只看 `since` 之后产生的审计行**
+///
+/// [`wait_for_audit_result`] 只按 method+path+标记词匹配，取最新的那条。
+/// 对"标记词唯一"的调用没问题（角色名、权限码、头像 URL），
+/// 但对**固定路径 + 通用词**就不成立：别的测试留下的行同样匹配，
+/// 于是这个 helper 会在第一次轮询就把**别人的行**返回出去。
+///
+/// 实测踩过：`PUT /api/auth/profile` + 标记词"展示名"，
+/// 字母序靠前的 `a_user_can_set_and_clear_their_own_display_name`
+/// 早就留下了一模一样的行，于是本测试拿到的是那个账号的摘要，
+/// 断言"必须含自己的账号"直接红——而这与被测逻辑毫无关系。
+///
+/// 真正要表达的是"**我刚才那次操作**产生的审计行"。
+/// 时间下界正是这句话的直译，且与标记词是否唯一无关。
+///
+/// `since` 往前挪 1 秒：库的 `now()` 与进程时钟可能有毫秒级偏差，
+/// 而这里要排除的是几分钟前别的测试写的行，1 秒的余量足够安全。
+async fn wait_for_audit_result_since(
+    method: &str,
+    path: &str,
+    marker: &str,
+    since: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let sql = "SELECT result FROM audit_logs \
+                WHERE method = $1 AND path = $2 AND result LIKE '%' || $3 || '%' \
+                  AND created_at >= $4 \
+                ORDER BY created_at DESC, id DESC LIMIT 1";
+    let since = since - chrono::Duration::seconds(1);
+    for _ in 0..40 {
+        let found: Option<(String,)> = sqlx::query_as(sql)
+            .bind(method)
+            .bind(path)
+            .bind(marker)
+            .bind(since)
+            .fetch_optional(&pool().await)
+            .await
+            .expect("查询审计摘要失败");
+        if let Some((result,)) = found {
+            return result;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("{since:?} 之后的审计里查不到 {method} {path} 中含有「{marker}」的摘要");
+}
+
 /// `audit_logs` 全表中含有给定片段的行数（`params` 与 `result` 都查）
 ///
 /// 用来证明**口令没有落进审计**。只查 `result` 是不够的：
@@ -8075,6 +8120,7 @@ async fn every_write_operation_leaves_an_answerable_change_summary() {
         "刷新缓存的审计摘要应报出实际数量，实际：{refresh_audit}"
     );
 
+    let metrics_since = chrono::Utc::now();
     let (status, body) = send(
         &app,
         request(
@@ -8087,10 +8133,15 @@ async fn every_write_operation_leaves_an_answerable_change_summary() {
     .await;
     assert_eq!(status, StatusCode::OK, "重置指标失败: {body}");
     // 指标清零会抹掉"此前谁在高频调用"的证据，这条本身必须可审计
-    wait_for_audit_result(
+    //
+    // 用带时间下界的版本：这个端点路径固定、标记词通用，
+    // 而**别的测试也打同一个端点**（读指标的用例都自己先重置），
+    // 不限定时间就会捞到别人的那一条。
+    wait_for_audit_result_since(
         "POST",
         "/api/admin/monitor/metrics/reset",
         "重置全部接口指标",
+        metrics_since,
     )
     .await;
 
@@ -8105,6 +8156,12 @@ async fn every_write_operation_leaves_an_answerable_change_summary() {
         let who_tok = activated_token(&app, &who_username, "Str0ng!Pass").await;
 
         // 自助改资料：记下改了哪个字段、是谁
+        //
+        // `profile` 是**固定路径**且标记词"展示名"通用，
+        // 而字母序靠前的 `a_user_can_set_and_clear_their_own_display_name`
+        // 早就留下了一模一样的行。必须限定"本次操作之后"，
+        // 否则拿到的是那个账号的摘要，下面"必须含自己的账号"直接红。
+        let profile_since = chrono::Utc::now();
         let (status, body) = send(
             &app,
             request(
@@ -8118,7 +8175,8 @@ async fn every_write_operation_leaves_an_answerable_change_summary() {
         assert_eq!(status, StatusCode::OK, "改资料失败: {body}");
         // 标记用字段名而不是展示名内容：下面紧接着断言"内容不进摘要"，
         // 若这里拿内容当标记，那条断言就永远验不到自己
-        let summary = wait_for_audit_result("PUT", "/api/auth/profile", "展示名").await;
+        let summary =
+            wait_for_audit_result_since("PUT", "/api/auth/profile", "展示名", profile_since).await;
         assert!(
             summary.contains(&who_username),
             "改资料审计必须含账号，否则答不出是谁改的: {summary}"
